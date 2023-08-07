@@ -64,3 +64,7 @@ echo $g
 #echo $cmd
 
 echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
+
+sh /home/iudx/pulledcode/sgx-yolo-app/build.sh
+
+sh /home/iudx/pulledcode/sgx-yolo-app/run.sh
