@@ -12,13 +12,14 @@ function box_out()
   tput sgr 0
 }
 
-
+#box_out  'Starting externally accessible EnclaveManager-server..'
+#./em.sh &
 
 URL=$1
 REPO=$2
 BRANCH=$3
 ID=$4
-NAME=$4
+NAME=$5
 
 echo
 echo
@@ -65,6 +66,12 @@ echo $g
 
 echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 
+#Enclave has been deployed. Now run application inside it:
+
+box_out 'Building application..'
+#call build script
 sh /home/iudx/pulledcode/sgx-yolo-app/build.sh
 
+box_out 'Running application inside enclave..'
+#call run script
 sh /home/iudx/pulledcode/sgx-yolo-app/run.sh

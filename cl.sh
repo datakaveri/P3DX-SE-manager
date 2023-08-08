@@ -1,7 +1,12 @@
 #!/bin/bash
 
-echo Clearing flask servers...
-killall flask
-ps -ef | grep 'flask' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+#echo Clearing any previously recorded inferences..
+#rm /home/ubuntu/inferences/*.*
+
+#echo Terminating any running enclaves..
+#nitro-cli terminate-enclave --all
+
+#echo Clearing cache hit record
+#rm /home/ubuntu/cached/cachehit.txt
 
 echo done.
