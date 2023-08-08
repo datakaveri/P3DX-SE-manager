@@ -1,6 +1,6 @@
 #~/bin/bash
 
-echo Starting EnclaveManager modified for tokenized workflow
+echo Starting Enclave Manager for Intel SGX
 
 #virtualenv env
 source activate
