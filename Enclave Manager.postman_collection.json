@@ -1,0 +1,65 @@
+{
+	"info": {
+		"_postman_id": "8421c696-6f26-4831-a35f-3f72a7c6fc75",
+		"name": "Enclave Manager",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "28952518"
+	},
+	"item": [
+		{
+			"name": "Deploy enclave",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"id\":\"78888\",\n    \"repo\":\"sgx-yolo-app\",\n    \"branch\":\"main\",\n    \"url\":\"git@github.com:datakaveri/sgx-yolo-app.git\",\n    \"name\":\"test2\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "http://127.0.0.1:4000/enclave/deploy",
+					"protocol": "http",
+					"host": [
+						"127",
+						"0",
+						"0",
+						"1"
+					],
+					"port": "4000",
+					"path": [
+						"enclave",
+						"deploy"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get Inference",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://127.0.0.1:4000/enclave/inference",
+					"protocol": "http",
+					"host": [
+						"127",
+						"0",
+						"0",
+						"1"
+					],
+					"port": "4000",
+					"path": [
+						"enclave",
+						"inference"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}
