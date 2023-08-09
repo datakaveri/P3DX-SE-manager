@@ -5,7 +5,7 @@ from flask import request
 from subprocess import Popen
 import json
 import os
-import requests
+#import requests
 
 app = Flask(__name__)
 
@@ -29,7 +29,7 @@ def get_inference():
     fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
 
     if (os.path.isfile(fileName)==False):
-        inferenceString = "NO *INFERENCE"
+        inferenceString = "NO INFERENCE"
         return inferenceString, 403
 
     f=open("/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json", "r")
