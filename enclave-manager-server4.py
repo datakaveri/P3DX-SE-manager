@@ -5,7 +5,7 @@ from flask import request
 from subprocess import Popen
 import json
 import os
-#import requests
+import requests
 
 app = Flask(__name__)
 
@@ -23,16 +23,16 @@ def before_request():
 
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
-    api_url="http://127.0.0.1:4500/enclavecc/displayinference"
+    #api_url="http://127.0.0.1:4500/enclavecc/displayinference"
     #sponse = requests.get(api_url)
     #response = subprocess.call(["curl", api_url]
-    fileName = "/home/ubuntu/inferences/inferences.txt"
+    fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
 
     if (os.path.isfile(fileName)==False):
-        inferenceString = "NO INFERENCE"
+        inferenceString = "NO *INFERENCE"
         return inferenceString, 403
 
-    f=open("/home/ubuntu/inferences/inferences.txt", "r")
+    f=open("/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json", "r")
     response = f.read()
     #response = "Here is a temporary response for now.."
     print (response)
