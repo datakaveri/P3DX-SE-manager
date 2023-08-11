@@ -42,13 +42,13 @@ def get_inference():
 
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
-        #load output.txt, if it exists, into stateString
-        fName = "/home/ubuntu/output.txt"
+        #load state.json, if it exists
+        fName = "/home/iudx/yoloHelper/state.json"
         if (os.path.isfile(fName)==False):
             stateString = "No output log."
         else:
-            f=open(fName, "r")
-            stateString = f.read()
+            with open(fName,"r") as f:
+                stateString=json.load(f)
         return stateString
 
 @app.route("/enclave/pcrs", methods=["GET"])
