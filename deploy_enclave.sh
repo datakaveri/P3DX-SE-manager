@@ -70,8 +70,8 @@ echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 
 box_out 'Building application..'
 #call build script
-sh /home/iudx/pulledcode/sgx-yolo-app/build.sh
+sh /home/iudx/pulledcode/sgx-yolo-app/b.sh
 
 box_out 'Running application inside enclave..'
 #call run script
-sh /home/iudx/pulledcode/sgx-yolo-app/run.sh
+sh /home/iudx/pulledcode/sgx-yolo-app/r.sh
