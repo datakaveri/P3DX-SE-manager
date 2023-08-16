@@ -1,10 +1,11 @@
 #mport requests
 #import urllib2
-from flask import Flask
+from flask import Flask, jsonify
 from flask import request
 from subprocess import Popen
 import json
 import os
+#import PPDX_SDK as sdk
 #import requests
 
 app = Flask(__name__)
@@ -40,6 +41,26 @@ def get_inference():
     return inferenceString
 
 
+@app.route("/enclave/setstate", methods=["POST"])
+def setState():
+    global state
+    print("In /enclave/setstate...")
+    content = request.json
+    state = content["state"]
+
+    response = app.response_class(
+        #response="{}", status=200, mimetype="application/json"
+        response="{ok}", status=200, mimetype="application/json"
+    )
+    return response
+
+@app.route("/enclave/state", methods=["GET"])
+def get_state():
+    global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
+    stateReturned = json.dumps(state, indent=4)
+    return jsonify(state) 
+
+'''
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
         #load state.json, if it exists
@@ -50,6 +71,7 @@ def get_state():
             with open(fName,"r") as f:
                 stateString=json.load(f)
         return stateString
+'''
 
 @app.route("/enclave/pcrs", methods=["GET"])
 def get_pcrs():
