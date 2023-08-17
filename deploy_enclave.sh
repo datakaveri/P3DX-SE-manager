@@ -12,9 +12,6 @@ function box_out()
   tput sgr 0
 }
 
-#box_out  'Starting externally accessible EnclaveManager-server..'
-#./em.sh &
-
 URL=$1
 REPO=$2
 BRANCH=$3
@@ -60,13 +57,10 @@ cd /home/iudx/pulledcode/$REPO
 g=$(git checkout $BRANCH)
 echo $g
 
-#Now do the measurements...
-#sudo -u iudx /home/iudx/pulledcode/nitro-enclaves/enclavemanager/get_enclave_measurements.sh
-#echo $cmd
 
 echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 
-#Enclave has been deployed. Now run application inside it:
+#Enclave has been deployed. Now build & run application inside it:
 
 box_out 'Building application..'
 #call build script
