@@ -9,6 +9,21 @@
 		{
 			"name": "Deploy enclave",
 			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": [
+						{
+							"key": "password",
+							"value": "{{password}}",
+							"type": "string"
+						},
+						{
+							"key": "username",
+							"value": "{{username}}",
+							"type": "string"
+						}
+					]
+				},
 				"method": "POST",
 				"header": [],
 				"body": {
@@ -21,15 +36,13 @@
 					}
 				},
 				"url": {
-					"raw": "http://127.0.0.1:4000/enclave/deploy",
-					"protocol": "http",
+					"raw": "https://enclave-manager-sgx.iudx.io/enclave/deploy",
+					"protocol": "https",
 					"host": [
-						"127",
-						"0",
-						"0",
-						"1"
+						"enclave-manager-sgx",
+						"iudx",
+						"io"
 					],
-					"port": "4000",
 					"path": [
 						"enclave",
 						"deploy"
@@ -41,21 +54,70 @@
 		{
 			"name": "Get Inference",
 			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": [
+						{
+							"key": "password",
+							"value": "{{password}}",
+							"type": "string"
+						},
+						{
+							"key": "username",
+							"value": "{{username}}",
+							"type": "string"
+						}
+					]
+				},
 				"method": "GET",
 				"header": [],
 				"url": {
-					"raw": "http://127.0.0.1:4000/enclave/inference",
-					"protocol": "http",
+					"raw": "https://enclave-manager-sgx.iudx.io/enclave/inference",
+					"protocol": "https",
 					"host": [
-						"127",
-						"0",
-						"0",
-						"1"
+						"enclave-manager-sgx",
+						"iudx",
+						"io"
 					],
-					"port": "4000",
 					"path": [
 						"enclave",
 						"inference"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get State",
+			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": [
+						{
+							"key": "password",
+							"value": "{{password}}",
+							"type": "string"
+						},
+						{
+							"key": "username",
+							"value": "{{username}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "https://enclave-manager-sgx.iudx.io/enclave/state",
+					"protocol": "https",
+					"host": [
+						"enclave-manager-sgx",
+						"iudx",
+						"io"
+					],
+					"path": [
+						"enclave",
+						"state"
 					]
 				}
 			},
