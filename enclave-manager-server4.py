@@ -34,11 +34,13 @@ def get_inference():
         return inferenceString, 403
 
     f=open("/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json", "r")
-    response = f.read()
+    content = f.read()
     #response = "Here is a temporary response for now.."
-    print (response)
-    inferenceString=response
-    return inferenceString
+    response = app.response_class(
+        response=content,
+        mimetype="application/json"
+    )
+    return response
 
 
 @app.route("/enclave/setstate", methods=["POST"])
@@ -57,7 +59,7 @@ def setState():
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
     global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
-    stateReturned = json.dumps(state, indent=4)
+    #stateReturned = json.dumps(state, indent=4)
     return jsonify(state) 
 
 '''
