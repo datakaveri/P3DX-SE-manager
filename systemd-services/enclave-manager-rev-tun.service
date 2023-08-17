@@ -1,0 +1,11 @@
+[Unit]
+Description=Enclave Manager reverse tunnel
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/autossh -M 23320 -N -q -o "ExitOnForwardFailure yes"  -o "ServerAliveInterval 10" -o "ServerAliveCountMax 3" -R 3005:localhost:4000 vis@analytics.iudx.org.in -i /home/iudx/.ssh/id_rsa
+Restart=always
+RestartSec=120
+
+[Install]
+WantedBy=multi-user.target

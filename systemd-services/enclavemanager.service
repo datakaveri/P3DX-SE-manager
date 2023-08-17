@@ -1,0 +1,15 @@
+[Unit]
+Description=SGX enclave manager systemd service
+
+[Service]
+User=iudx
+WorkingDirectory=/home/iudx/sgx-enclave-manager
+Environment=FLASK_APP=enclave-manager-server4.py
+Environment=FLASK_ENV=development
+Environment=FLASK_RUN_PORT=4000
+Environment=FLASK_RUN_HOST=0.0.0.0
+ExecStart=/home/iudx/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave-manager-server4:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
