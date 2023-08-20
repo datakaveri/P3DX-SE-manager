@@ -1,8 +1,9 @@
 #mport requests
 #import urllib2
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response
 from flask import request
-from subprocess import Popen
+import subprocess
+#from subprocess import Popen
 import json
 import os
 #import PPDX_SDK as sdk
@@ -10,7 +11,7 @@ import os
 
 app = Flask(__name__)
 
-
+is_app_running = False
 stateString="CC_NOTRUNNING"
 
 @app.before_request
@@ -46,10 +47,13 @@ def get_inference():
 @app.route("/enclave/setstate", methods=["POST"])
 def setState():
     global state
+    global is_app_running
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-
+    if(state["step"]==10):
+        #print("Resetting deploy flag as false")
+        is_app_running = False
     response = app.response_class(
         #response="{}", status=200, mimetype="application/json"
         response="{ok}", status=200, mimetype="application/json"
@@ -85,22 +89,43 @@ def get_pcrs():
         return pcrs
 
 
+is_app_running = False
+
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
+    global is_app_running
+
+    if is_app_running:
+        return Response(
+            response="Application is already running",
+            status=400,
+            mimetype="application/json"
+        )
+
     print("In /enclave/deploy...")
     content = request.json
-    # TODO check if all values are valid
     id = content["id"]
     repo = content["repo"]
     branch = content["branch"]
     url = content["url"]
     name = content["name"]
 
-    # calling the actual shell script. Don't wait for it to return and just send 200 OK
-    # send url, id and name as arguments
-    pid = Popen(["./deploy_enclave.sh", url, repo, branch, id, name]).pid
-    stateString="CC_DEPLOYED"
-    response = app.response_class(
-        response="{}", status=200, mimetype="application/json"
-    )
+    try:
+        # Calling the actual shell script. Don't wait for it to return and just send 200 OK
+        # Send url, id, and name as arguments
+        subprocess.Popen(["./deploy_enclave.sh", url, repo, branch, id, name])
+        is_app_running = True
+
+        response = Response(
+            response="{running}",
+            status=200,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        response = Response(
+            response=f"Error: {str(e)}",
+            status=500,
+            mimetype="application/json"
+        )
+
     return response
