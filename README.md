@@ -7,7 +7,8 @@ We will have the following endpoints:
 3. Get State: This will return a json object of the current state of the application, its description and the step it's currently on.
 4. Set State: This will pass a json object containing current state of the application, its description, the step it's currently on and the maximum number of steps.
 
-These endpoints can be run using the following domain: https://enclave-manager-sgx.iudx.io/
+These endpoints can be run using the following domain: https://enclave-manager-sgx.iudx.io/ .
+
 It requires basic authentication.
 
 The server runs as a systemd service
