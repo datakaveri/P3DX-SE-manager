@@ -11,7 +11,8 @@ These endpoints can be run using the following domain: https://enclave-manager-s
 
 It requires basic authentication.
 
-The server runs as a systemd service
+The server runs as a systemd service.
+
 To check status (if active & running):
 
 > sudo systemctl status enclavemanager.service
