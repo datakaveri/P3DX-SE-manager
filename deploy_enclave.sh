@@ -1,4 +1,8 @@
 #!/bin/bash
+source ./setState.sh
+
+#calling setstate endpoint (step 1)
+call_setstate_endpoint "Starting confidential computing.." 10 1 "Starting confidential computing"
 
 function box_out()
 {
@@ -30,15 +34,16 @@ echo $1 $2 $3 $4 $5
 #this code assumes that ~/pulledcode is present
 #this code assumes that $3 is the name of the branch you want
 
-#first, remove everything in that directory..
+#calling setstate endpoint (step 2)
+call_setstate_endpoint "Pulling code." 10 2 "Pulling code"
 
+#first, remove everything in that directory..
 box_out 'Clearing ~/pulledcode'
 
 cd ~/pulledcode
 rm -rf *
 
-#Now do a git pull there
-
+#Now add ssh key and then do a git pull
 echo Adding ssh key...
 eval $(ssh-agent -s)
 ssh-add /home/iudx/.ssh/iudx_cloud
@@ -62,9 +67,11 @@ echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 
 #Enclave has been deployed. Now build & run application inside it:
 
-box_out 'Building application..'
 #call build script
-sh /home/iudx/pulledcode/sgx-yolo-app/b.sh
+. /home/iudx/pulledcode/sgx-yolo-app/b.sh
+
+#calling setstate endpoint (step 5)
+call_setstate_endpoint "Starting Appliction in SGX Enclave using Gramine" 10 5 "Starting Application"
 
 box_out 'Running application inside enclave..'
 #call run script
