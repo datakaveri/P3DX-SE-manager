@@ -11,7 +11,13 @@ import os
 
 app = Flask(__name__)
 
-is_app_running = False
+state = {
+    "step": 0,
+    "maxSteps": 10,
+    "title": "Inactive",
+    "description": "Inactive",
+}
+
 stateString="CC_NOTRUNNING"
 
 @app.before_request
