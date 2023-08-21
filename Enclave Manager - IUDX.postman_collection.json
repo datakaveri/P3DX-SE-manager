@@ -1,25 +1,25 @@
 {
 	"info": {
-		"_postman_id": "8421c696-6f26-4831-a35f-3f72a7c6fc75",
-		"name": "Enclave Manager",
+		"_postman_id": "f79b408a-fb6d-4b4b-ba40-e15d3b9a09d8",
+		"name": "Enclave Manager - IUDX",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-		"_exporter_id": "28952518"
+		"_exporter_id": "26759572"
 	},
 	"item": [
 		{
-			"name": "Deploy enclave",
+			"name": "Deploy Enclave",
 			"request": {
 				"auth": {
 					"type": "basic",
 					"basic": [
 						{
-							"key": "password",
-							"value": "{{password}}",
+							"key": "username",
+							"value": "enclave-manager-sgx",
 							"type": "string"
 						},
 						{
-							"key": "username",
-							"value": "{{username}}",
+							"key": "password",
+							"value": "bi6XR232D5jqCcDRpkI2",
 							"type": "string"
 						}
 					]
@@ -28,7 +28,7 @@
 				"header": [],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n    \"id\":\"78888\",\n    \"repo\":\"sgx-yolo-app\",\n    \"branch\":\"main\",\n    \"url\":\"git@github.com:datakaveri/sgx-yolo-app.git\",\n    \"name\":\"test2\"\n}",
+					"raw": "{\n    \"id\":\"7899\",\n    \"repo\":\"sgx-yolo-app\",\n    \"branch\":\"main\",\n    \"url\":\"git@github.com:datakaveri/sgx-yolo-app.git\",\n    \"name\":\"test\"\n}\n",
 					"options": {
 						"raw": {
 							"language": "json"
@@ -58,13 +58,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "password",
-							"value": "{{password}}",
+							"key": "username",
+							"value": "enclave-manager-sgx",
 							"type": "string"
 						},
 						{
-							"key": "username",
-							"value": "{{username}}",
+							"key": "password",
+							"value": "bi6XR232D5jqCcDRpkI2",
 							"type": "string"
 						}
 					]
@@ -94,13 +94,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "password",
-							"value": "{{password}}",
+							"key": "username",
+							"value": "enclave-manager-sgx",
 							"type": "string"
 						},
 						{
-							"key": "username",
-							"value": "{{username}}",
+							"key": "password",
+							"value": "bi6XR232D5jqCcDRpkI2",
 							"type": "string"
 						}
 					]
@@ -118,6 +118,51 @@
 					"path": [
 						"enclave",
 						"state"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Set State",
+			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": [
+						{
+							"key": "username",
+							"value": "enclave-manager-sgx",
+							"type": "string"
+						},
+						{
+							"key": "password",
+							"value": "bi6XR232D5jqCcDRpkI2",
+							"type": "string"
+						}
+					]
+				},
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"description\":\"deploying\",\n    \"maxSteps\":10,\n    \"step\": 1,\n    \"title\":\"deploying enclave\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://enclave-manager-sgx.iudx.io/enclave/setstate",
+					"protocol": "https",
+					"host": [
+						"enclave-manager-sgx",
+						"iudx",
+						"io"
+					],
+					"path": [
+						"enclave",
+						"setstate"
 					]
 				}
 			},
