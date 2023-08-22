@@ -46,18 +46,18 @@ rm -rf *
 #Now add ssh key and then do a git pull
 echo Adding ssh key...
 eval $(ssh-agent -s)
-ssh-add /home/iudx/.ssh/iudx_cloud
+ssh-add ~/.ssh/iudx_cloud
 
 box_out 'Cloning into ~/pulledcode'
 
 g=$(git clone $URL)
 echo $g
 
-echo $2 >> /home/iudx/pulledcode/dirname.txt
+echo $2 >> ~/pulledcode/dirname.txt
 
 box_out 'Switching branch..'
 echo Switching to.. $BRANCH of $REPO
-cd /home/iudx/pulledcode/$REPO
+cd ~/pulledcode/$REPO
 
 g=$(git checkout $BRANCH)
 echo $g
@@ -68,11 +68,11 @@ echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 #Enclave has been deployed. Now build & run application inside it:
 
 #call build script
-. /home/iudx/pulledcode/sgx-yolo-app/b.sh
+. ~/pulledcode/sgx-yolo-app/b.sh
 
 #calling setstate endpoint (step 5)
 call_setstate_endpoint "Starting Appliction in SGX Enclave using Gramine" 10 5 "Starting Application"
 
 box_out 'Running application inside enclave..'
 #call run script
-sh /home/iudx/pulledcode/sgx-yolo-app/r.sh
+. ~/pulledcode/sgx-yolo-app/r.sh
