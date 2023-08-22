@@ -1,30 +1,52 @@
 # Intel SGX Enclave Manager
 
-We will have the following endpoints:
+##Enclave Manager:
+Enclave is a trusted execution environment (TEE) embedded in a process. The enclave manager is a server that provides communication between the enclave and the APD.
 
-1. Deploy Enclave: This will bring the enclave up and run the application inside it.
-2. Inference: The enclave will send back the inference to the task manager, after it is done running the application.
-3. Get State: This will return a json object of the current state of the application, its description and the step it's currently on.
-4. Set State: This will pass a json object containing current state of the application, its description, the step it's currently on and the maximum number of steps.
+## Enclave Manager Endpoints:
 
-These endpoints can be run using the following domain: https://enclave-manager-sgx.iudx.io/ .
+1. Deploy Enclave (/enclave/deploy): This takes as input github repo link, branch, and name & ID of enclave, and brings the enclave up and runs the application inside it.
+2. Inference (/enclave/inference): The enclave will send back the inference to the task manager, after it is done running the application.
+3. Get State (/enclave/state): This will return a json object of the current state of the application, its description and the step it's currently on.
+4. Set State (/enclave/setstate): This will post a json object containing current state of the application, its description, the step it's currently on and the maximum number of steps.
 
-It requires basic authentication.
+## Steps to Run Server:
 
-The server runs as a systemd service.
+1. create virtual environment
+   `python -m venv .env enclaveManager`
 
-To check status (if active & running):
+2. source the virtual environment
+   `source ~/.env/enclaveManager/bin/activate`
 
-> sudo systemctl status enclavemanager.service
+3. install the dependencies from requirements.txt
+   `pip3 install -r requirements.txt`
 
-To start service:
+4. Then clone the current repo and save it in home directory as sgx-enclave-manager
+   `git clone git@github.com:datakaveri/sgx-enclave-manager.git`
 
-> sudo systemctl start enclavemanager.service
+The enclave manager server can be run in two different ways:
 
-To stop service:
+### As a systemd service (publicly):
 
-> sudo systemctl stop enclavemanager.service
+The enclave manager server runs publicly as a systemd service (enclavemanager). These endpoints can be run on the following domain: https://enclave-manager-sgx.iudx.io/ . It has the endpoints mentioned above. It requires basic authentication.
 
-To restart service (after any changes or if getting error):
+Steps:
 
-> sudo service enclavemanager restart
+1. Move the systemd services to /etc/systemd/system
+   `cp ~/sgx-enclave-manager/systemd_services/enclavemanager.service /etc/systemd/system`
+   `cp ~/sgx-enclave-manager/systemd_services/enclave-manager-rev-tun.service /etc/systemd/system`
+
+2. start the services:
+   `sudo systemctl start enclavemanager.service`
+   `sudo systemctl start enclave-manager-rev-tun.service`
+
+3. Access endpoints on https://enclave-manager-sgx.iudx.io/
+
+### Locally:
+
+The enclave manager server can be run locally on http://127.0.0.1:4000 or http://192.168.1.199:4000 for remote access. Steps:
+
+1. Run the following commands in terminal:
+   `cd sgx-enclave-manager`
+   `./em.sh`
+2. The server is now running on localhost and the endpoints can be accessed using Postman.
