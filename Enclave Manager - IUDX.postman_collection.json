@@ -13,13 +13,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "username",
-							"value": "enclave-manager-sgx",
+							"key": "password",
+							"value": "{{password}}",
 							"type": "string"
 						},
 						{
-							"key": "password",
-							"value": "bi6XR232D5jqCcDRpkI2",
+							"key": "username",
+							"value": "{{username}}",
 							"type": "string"
 						}
 					]
@@ -58,13 +58,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "username",
-							"value": "enclave-manager-sgx",
+							"key": "password",
+							"value": "{{password}}",
 							"type": "string"
 						},
 						{
-							"key": "password",
-							"value": "bi6XR232D5jqCcDRpkI2",
+							"key": "username",
+							"value": "{{username}}",
 							"type": "string"
 						}
 					]
@@ -94,13 +94,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "username",
-							"value": "enclave-manager-sgx",
+							"key": "password",
+							"value": "{{password}}",
 							"type": "string"
 						},
 						{
-							"key": "password",
-							"value": "bi6XR232D5jqCcDRpkI2",
+							"key": "username",
+							"value": "{{username}}",
 							"type": "string"
 						}
 					]
@@ -130,13 +130,13 @@
 					"type": "basic",
 					"basic": [
 						{
-							"key": "username",
-							"value": "enclave-manager-sgx",
+							"key": "password",
+							"value": "{{password}}",
 							"type": "string"
 						},
 						{
-							"key": "password",
-							"value": "bi6XR232D5jqCcDRpkI2",
+							"key": "username",
+							"value": "{{username}}",
 							"type": "string"
 						}
 					]
