@@ -26,16 +26,16 @@ def before_request():
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
-    fileName = "~/pulledcode/sgx-yolo-app/yolov5/labels.json"
+    fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
 
-    if(os.path.isfile(fileName)==False):
+    if not os.path.isfile(fileName):
         response={
             "title": "Error: No Inference Output",
             "description": "Start execution of the application or wait for it to finish."
-       }
+        }
         return jsonify(response), 400
 
-    f=open("~/pulledcode/sgx-yolo-app/yolov5/labels.json", "r")
+    f=open(fileName, "r")
     content = f.read()
     response = app.response_class(
         response=content,
