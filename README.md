@@ -27,18 +27,18 @@ The enclave manager server can be accessed in two different ways:
 The enclave manager server runs publicly as a systemd service (enclavemanager). These endpoints can be run on the following domain: https://enclave-manager-sgx.iudx.io/ . It has the endpoints mentioned above. It requires basic authentication.
 
 Steps:
-1. Move the systemd services to /etc/systemd/system.
-   `cp ~/sgx-enclave-manager/systemd_services/enclavemanager.service /etc/systemd/system`
+1. Move the systemd services to /etc/systemd/system.  
+   `cp ~/sgx-enclave-manager/systemd_services/enclavemanager.service /etc/systemd/system`  
    `cp ~/sgx-enclave-manager/systemd_services/enclave-manager-rev-tun.service /etc/systemd/system`
-2. start the services.
-   `sudo systemctl start enclavemanager.service`
+2. start the services.  
+   `sudo systemctl start enclavemanager.service`  
    `sudo systemctl start enclave-manager-rev-tun.service`
 3. Access endpoints on https://enclave-manager-sgx.iudx.io/ .
 
 ### Locally
 The enclave manager server can be run locally on http://127.0.0.1:4000 or http://192.168.1.199:4000 for remote access. Steps:
 
-1. Run the following commands in terminal.
-   `cd sgx-enclave-manager`
+1. Run the following commands in terminal.  
+   `cd sgx-enclave-manager`  
    `./em.sh`
 2. The server is now running on localhost and the endpoints can be accessed using Postman.
