@@ -11,13 +11,13 @@ Enclave is a trusted execution environment (TEE) embedded in a process. The encl
 4. Set State (/enclave/setstate): This will post a json object containing current state of the application, its description, the step it's currently on and the maximum number of steps.
 
 ## Steps to Run Server
-1. create virtual environment.
-      `python -m venv .env enclaveManager`__
-2. source the virtual environment.
+1. create virtual environment.  
+      `python -m venv .env enclaveManager`
+2. source the virtual environment.  
       `source ~/.env/enclaveManager/bin/activate`
-3. install the dependencies from requirements.txt.
-      `pip3 install -r requirements.txt`
-4. Then clone the current repo and save it in home directory as sgx-enclave-manager.
+3. install the dependencies from requirements.txt.  
+      `pip3 install -r requirements.txt`  
+4. Then clone the current repo and save it in home directory as sgx-enclave-manager.  
       `git clone git@github.com:datakaveri/sgx-enclave-manager.git`
 
 The enclave manager server can be accessed in two different ways:
