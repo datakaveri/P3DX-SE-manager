@@ -43,11 +43,14 @@ box_out 'Clearing ~/pulledcode'
 cd ~/pulledcode
 rm -rf *
 
+'''
 #Now add ssh key and then do a git pull
 echo Adding ssh key...
 eval $(ssh-agent -s)
 ssh-add ~/.ssh/iudx_cloud
+'''
 
+#make sure SSH key is deployed
 box_out 'Cloning into ~/pulledcode'
 
 g=$(git clone $URL)
