@@ -3,7 +3,7 @@ from flask import Flask, jsonify, Response
 from flask import request
 import subprocess
 import os
-from urllib.parse import urljoin
+#from urllib.parse import urljoin
 
 app = Flask(__name__)
 
@@ -28,13 +28,15 @@ def before_request():
 def get_inference():
     fileName = "~/pulledcode/sgx-yolo-app/yolov5/labels.json"
 
-    if (os.path.isfile(fileName)==False):
-        inferenceString = "NO INFERENCE"
-        return inferenceString, 403
+    if(os.path.isfile(fileName)==False):
+        response={
+            "title": "Error: No Inference Output",
+            "description": "Start execution of the application or wait for it to finish."
+       }
+        return jsonify(response), 400
 
     f=open("~/pulledcode/sgx-yolo-app/yolov5/labels.json", "r")
     content = f.read()
-    #response = "Here is a temporary response for now.."
     response = app.response_class(
         response=content,
         mimetype="application/json"
@@ -87,11 +89,11 @@ def deploy_enclave():
 
     # check if the application is already running, if yes, return response saying so
     if is_app_running:
-        return Response(
-            response="Application is already being executed.",
-            status=400,
-            mimetype="application/json"
-        )
+        response={
+            "title": "Error",
+            "description": "Application is already running." 
+        }
+        return jsonify(response), 400
 
     print("In /enclave/deploy...")
     content = request.json
@@ -107,11 +109,11 @@ def deploy_enclave():
         # set the flag to true to indicate that the application is running
         is_app_running = True
 
-        response = Response(
-            response="Application started successfully.",
-            status=200,
-            mimetype="application/json"
-        )
+        response={
+            "title": "Success",
+            "description": "Application execution has started."
+        }
+        return jsonify(response), 200
     except Exception as e:
         response = Response(
             response=f"Error: {str(e)}",
