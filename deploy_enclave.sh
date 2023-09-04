@@ -71,11 +71,11 @@ echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 #Enclave has been deployed. Now build & run application inside it:
 
 #call build script
-. ~/pulledcode/sgx-yolo-app/b.sh
+. ~/pulledcode/$REPO/b.sh
 
 #calling setstate endpoint (step 5)
 call_setstate_endpoint "Starting Appliction in SGX Enclave using Gramine" 10 5 "Starting Application"
 
 box_out 'Running application inside enclave..'
 #call run script
-. ~/pulledcode/sgx-yolo-app/r.sh
+. ~/pulledcode/$REPO/r.sh
