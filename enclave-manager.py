@@ -127,16 +127,16 @@ def deploy_enclave():
 @app.route("/enclave/profiling", methods=["GET"])
 def get_profiling():
     print("In /enclave/profiling...")
-    profilingFile = "/home/iudx/pulledcode/sgx-yolo-app/profiling.json"
 
-    if not os.path.isfile(profilingFile) or profilingFile=="":
-        response={
-            "title": "Error: No Profiling Output",
-            "description": "Start execution of the application or wait for it to finish."
-        }
-        return jsonify(response), 400
+    profilingFileEM = "./profiling.json"
+    profilingFileApp = "/home/iudx/pulledcode/sgx-yolo-app/profiling.json"
+
+    if not os.path.isfile(profilingFileApp):
+        file=profilingFileEM
+    else:
+        file=profilingFileApp
     
-    f=open(profilingFile, "r")
+    f=open(file, "r")
     content = f.read()
     response = app.response_class(
         response=content,

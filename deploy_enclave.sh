@@ -1,5 +1,13 @@
 #!/bin/bash
 source ./setState.sh
+source ./profilingStep.sh
+
+if [ -f "profiling.json" ]; then
+    rm "profiling.json"
+fi
+
+echo "Starting Confidential Computing"
+profiling_func 1 "Starting confidential computing" 
 
 #calling setstate endpoint (step 1)
 call_setstate_endpoint "Starting confidential computing.." 10 1 "Starting confidential computing"
@@ -34,8 +42,10 @@ echo $1 $2 $3 $4 $5
 #this code assumes that ~/pulledcode is present
 #this code assumes that $3 is the name of the branch you want
 
+profiling_func 2 "Pulling code" 
 #calling setstate endpoint (step 2)
 call_setstate_endpoint "Pulling code." 10 2 "Pulling code"
+
 
 #first, remove everything in that directory..
 box_out 'Clearing ~/pulledcode'
@@ -43,12 +53,12 @@ box_out 'Clearing ~/pulledcode'
 cd ~/pulledcode
 rm -rf *
 
-'''
+
 #Now add ssh key and then do a git pull
 echo Adding ssh key...
 eval $(ssh-agent -s)
 ssh-add ~/.ssh/iudx_cloud
-'''
+
 
 #make sure SSH key is deployed
 box_out 'Cloning into ~/pulledcode'
@@ -67,15 +77,10 @@ echo $g
 
 
 echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
-
-#Enclave has been deployed. Now build & run application inside it:
-
-#call build script
+echo $REPO
+#Enclave has been deployed. Call build script
 . ~/pulledcode/$REPO/b.sh
-
-#calling setstate endpoint (step 5)
-call_setstate_endpoint "Starting Appliction in SGX Enclave using Gramine" 10 5 "Starting Application"
 
 box_out 'Running application inside enclave..'
 #call run script
-. ~/pulledcode/$REPO/r.sh
+. /home/iudx/pulledcode/$REPO/r.sh
