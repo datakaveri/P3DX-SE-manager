@@ -27,23 +27,30 @@ def before_request():
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
     fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
+    fileName2 = "/home/iudx/pulledcode/sgx-healthcare-inferencing/diseaseDetection/output.json"
 
-    if not os.path.isfile(fileName):
+    if os.path.isfile(fileName):
+        f=open(fileName, "r")
+        content = f.read()
+        response = app.response_class(
+            response=content,
+            mimetype="application/json"
+        )
+        return response
+    elif os.path.isfile(fileName2):
+        f=open(fileName2, "r")
+        content = f.read()
+        response = app.response_class(
+            response=content,
+            mimetype="application/json"
+        )
+        return response
+    else:
         response={
             "title": "Error: No Inference Output",
             "description": "Start execution of the application or wait for it to finish."
         }
         return jsonify(response), 400
-
-    f=open(fileName, "r")
-    content = f.read()
-    response = app.response_class(
-        response=content,
-        mimetype="application/json"
-    )
-    return response
-
-
 
 #SETSTATE: Sets the state of the enclave as a JSON object
 @app.route("/enclave/setstate", methods=["POST"])
