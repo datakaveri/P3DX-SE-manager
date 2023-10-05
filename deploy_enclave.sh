@@ -1,16 +1,17 @@
 #!/bin/bash
 source ./setState.sh
 source ./profilingStep.sh
+chmod a+x deploy_enclave.sh
+
+#step 1
+python3 -c 'import memory; memory.measure_memory_usage()'
+echo "Starting Confidential Computing"
+profiling_func 1 "Starting confidential computing" 
+call_setstate_endpoint "Starting confidential computing.." 10 1 "Starting confidential computing"
 
 if [ -f "profiling.json" ]; then
     rm "profiling.json"
 fi
-
-echo "Starting Confidential Computing"
-profiling_func 1 "Starting confidential computing" 
-
-#calling setstate endpoint (step 1)
-call_setstate_endpoint "Starting confidential computing.." 10 1 "Starting confidential computing"
 
 function box_out()
 {
@@ -39,9 +40,14 @@ box_out 'Deploying enclave... (no root mode)'
 
 echo $1 $2 $3 $4 $5
 
+#step 1 done
+python3 -c 'import memory; memory.measure_memory_usage()'
+
 #this code assumes that ~/pulledcode is present
 #this code assumes that $3 is the name of the branch you want
 
+#step 2
+python3 -c 'import memory; memory.measure_memory_usage()'
 profiling_func 2 "Pulling code" 
 #calling setstate endpoint (step 2)
 call_setstate_endpoint "Pulling code." 10 2 "Pulling code"
@@ -78,6 +84,10 @@ echo $g
 
 echo "Deployed enclave ID $ID, URL $URL, BRANCH $BRANCH"
 echo $REPO
+
+#step 2 done
+python3 -c 'import memory; script.measure_memory_usage()'
+
 #Enclave has been deployed. Call build script
 . ~/pulledcode/$REPO/b.sh
 
