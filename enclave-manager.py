@@ -3,6 +3,7 @@ from flask import Flask, jsonify, Response
 from flask import request
 import subprocess
 import os
+import shutil
 #from urllib.parse import urljoin
 
 app = Flask(__name__)
@@ -26,31 +27,40 @@ def before_request():
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
-    fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
-    fileName2 = "/home/iudx/pulledcode/sgx-healthcare-inferencing/diseaseDetection/output.json"
-
-    if os.path.isfile(fileName):
-        f=open(fileName, "r")
-        content = f.read()
-        response = app.response_class(
-            response=content,
-            mimetype="application/json"
-        )
-        return response
-    elif os.path.isfile(fileName2):
-        f=open(fileName2, "r")
-        content = f.read()
-        response = app.response_class(
-            response=content,
-            mimetype="application/json"
-        )
-        return response
-    else:
+    global state
+    if(state["step"]!=10):
         response={
             "title": "Error: No Inference Output",
             "description": "Start execution of the application or wait for it to finish."
         }
-        return jsonify(response), 400
+        return jsonify(response), 403
+    else:
+        fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
+        fileName2 = "/home/iudx/pulledcode/sgx-healthcare-inferencing/diseaseDetection/output.json"
+
+        if(os.path.isfile(fileName)):
+            f=open(fileName, "r")
+            content = f.read()
+            response = app.response_class(
+                response=content,
+                mimetype="application/json"
+            )
+            return response
+        elif(os.path.isfile(fileName2)):
+            f=open(fileName2, "r")
+            content = f.read()
+            response = app.response_class(
+                response=content,
+                mimetype="application/json"
+            )
+            return response
+        else:
+            response={
+                "title": "Error: No Inference Output",
+                "description": "No inference output found."
+            }
+            return jsonify(response), 403
+    
 
 #SETSTATE: Sets the state of the enclave as a JSON object
 @app.route("/enclave/setstate", methods=["POST"])
@@ -93,7 +103,13 @@ def get_pcrs():
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
     global is_app_running
-
+    global state
+    state = {
+        "step": 0,
+        "maxSteps": 10,
+        "title": "Inactive",
+        "description": "Inactive",
+    }
     # check if the application is already running, if yes, return response saying so
     if is_app_running:
         response={
@@ -122,6 +138,15 @@ def deploy_enclave():
         }
         return jsonify(response), 200
     except Exception as e:
+        is_app_running = False
+        state = {
+            "step": 0,
+            "maxSteps": 10,
+            "title": "Inactive",
+            "description": "Inactive",
+        }
+        pulledcode_path = "/home/iudx/pulledcode"
+        shutil.rmtree(pulledcode_path)
         response = Response(
             response=f"Error: {str(e)}",
             status=500,
