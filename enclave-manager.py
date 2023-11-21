@@ -4,7 +4,7 @@ from flask import request
 import subprocess
 import os
 import shutil
-#from urllib.parse import urljoin
+import threading
 
 app = Flask(__name__)
 
@@ -35,32 +35,29 @@ def get_inference():
         }
         return jsonify(response), 403
     else:
-        fileName = "/home/iudx/pulledcode/sgx-yolo-app/yolov5/labels.json"
-        fileName2 = "/home/iudx/pulledcode/sgx-healthcare-inferencing/diseaseDetection/output.json"
-
-        if(os.path.isfile(fileName)):
-            f=open(fileName, "r")
-            content = f.read()
-            response = app.response_class(
-                response=content,
-                mimetype="application/json"
-            )
-            return response
-        elif(os.path.isfile(fileName2)):
-            f=open(fileName2, "r")
-            content = f.read()
-            response = app.response_class(
-                response=content,
-                mimetype="application/json"
-            )
-            return response
-        else:
+        pulledcodepath="/home/iudx/pulledcode/"
+        fileNameYOLO=pulledcodepath+"sgx-yolo-app/yolov5/labels.json"
+        fileNameHI=pulledcodepath+"sgx-healthcare-inferencing/output.json"
+        fileNameHT=pulledcodepath+"sgx-healthcare-training/output.json"
+        fileNameDP=pulledcodepath+"sgx-diff-privacy/scripts/output.json"
+        file = ""
+        done=False
+        for file in [fileNameYOLO, fileNameHI, fileNameHT, fileNameDP]:
+            if os.path.isfile(file):
+                f=open(file, "r")
+                content = f.read()
+                response = app.response_class(
+                    response=content,
+                    mimetype="application/json"
+                )
+                done=True
+                return response
+        if not done:
             response={
                 "title": "Error: No Inference Output",
                 "description": "No inference output found."
             }
             return jsonify(response), 403
-    
 
 #SETSTATE: Sets the state of the enclave as a JSON object
 @app.route("/enclave/setstate", methods=["POST"])
@@ -127,47 +124,56 @@ def deploy_enclave():
     name = content["name"]
 
     try:
-        subprocess.Popen(["./deploy_enclave.sh", url, repo, branch, id, name])
-
-        # set the flag to true to indicate that the application is running
+        process=subprocess.Popen(["./deploy_enclave.sh", url, repo, branch, id, name])
         is_app_running = True
 
+        monitor_thread = threading.Thread(target=monitor_subprocess, args=(process,))
+        monitor_thread.start()
+        
         response={
             "title": "Success",
             "description": "Application execution has started."
         }
         return jsonify(response), 200
     except Exception as e:
-        is_app_running = False
-        state = {
-            "step": 0,
-            "maxSteps": 10,
-            "title": "Inactive",
-            "description": "Inactive",
-        }
-        pulledcode_path = "/home/iudx/pulledcode"
-        shutil.rmtree(pulledcode_path)
         response = Response(
             response=f"Error: {str(e)}",
             status=500,
             mimetype="application/json"
         )
-
+    print("RUNNING FLAG: ",is_app_running)
     return response
 
 
 @app.route("/enclave/profiling", methods=["GET"])
 def get_profiling():
     print("In /enclave/profiling...")
-
-    profilingFileEM = "./profiling.json"
-    profilingFileApp = "/home/iudx/pulledcode/sgx-yolo-app/profiling.json"
-
-    if not os.path.isfile(profilingFileApp):
-        file=profilingFileEM
-    else:
-        file=profilingFileApp
+    global state
+    if(state["step"]==0):
+        response={
+            "title": "Error: No Profiling Output",
+            "description": "Start execution of the application."
+        }
+        return jsonify(response), 403
     
+    profilingFileEM = "./profiling.json"
+    applications = ["yolo-app", "healthcare-training", "healthcare-inferencing"]
+    file = ""
+    for application in applications:
+        profilingFile = "/home/iudx/pulledcode/sgx-"+application+"/profiling.json"
+        if os.path.isfile(profilingFile):
+            file=profilingFile
+            break
+    if file=="":
+        if os.path.isfile(profilingFileEM):
+            file=profilingFileEM
+        else:
+            response={
+            "title": "Error: No Profiling Output",
+            "description": "No profiling output found."
+            }
+            return jsonify(response), 403
+        
     f=open(file, "r")
     content = f.read()
     response = app.response_class(
@@ -175,3 +181,22 @@ def get_profiling():
         mimetype="application/json"
     )
     return response
+
+def monitor_subprocess(process):
+    print("Inside monitor subprocess")
+    global is_app_running
+    global state
+    process.wait()  # Wait for the subprocess to finish
+    exit_code = process.returncode
+    print("Exit code:",exit_code)
+    if exit_code != 0:
+        # Subprocess had an error
+        print("Error: Subprocess exited with code:", exit_code)
+        is_app_running = False
+        print("setting flag and state")
+        state = {
+            "step": 0,
+            "maxSteps": 10,
+            "title": "Inactive",
+            "description": "Inactive",
+        }
