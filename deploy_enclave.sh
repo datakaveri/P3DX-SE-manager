@@ -1,7 +1,6 @@
 #!/bin/bash
 source ./setState.sh
 source ./profilingStep.sh
-chmod a+x memory.py
 chmod a+x deploy_enclave.sh
 if [ -f "profiling.json" ]; then
     rm "profiling.json"

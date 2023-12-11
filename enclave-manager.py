@@ -3,7 +3,6 @@ from flask import Flask, jsonify, Response
 from flask import request
 import subprocess
 import os
-import shutil
 import threading
 
 app = Flask(__name__)
@@ -129,7 +128,7 @@ def deploy_enclave():
 
         monitor_thread = threading.Thread(target=monitor_subprocess, args=(process,))
         monitor_thread.start()
-        
+
         response={
             "title": "Success",
             "description": "Application execution has started."
