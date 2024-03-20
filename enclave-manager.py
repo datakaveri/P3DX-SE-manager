@@ -116,14 +116,16 @@ def deploy_enclave():
 
     print("In /enclave/deploy...")
     content = request.json
-    id = content["id"]
-    repo = content["repo"]
-    branch = content["branch"]
-    url = content["url"]
-    name = content["name"]
+
+    # id = content["id"]
+    # repo = content["repo"]
+    # branch = content["branch"]
+    # url = content["url"]
+    # name = content["name"]
+    app_name = content["app_name"]
 
     try:
-        process=subprocess.Popen(["./deploy_enclave.sh", url, repo, branch, id, name])
+        process=subprocess.Popen(["./deploy_enclave.sh", app_name])
         is_app_running = True
 
         monitor_thread = threading.Thread(target=monitor_subprocess, args=(process,))
