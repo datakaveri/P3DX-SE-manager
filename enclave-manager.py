@@ -35,50 +35,33 @@ def deploy_enclave():
         "description": "Inactive",
     }
     # check if the application is already running, if yes, return response saying so
-    if is_app_running:
-        response={
-            "title": "Error",
-            "description": "Application is already running." 
-        }
-        return jsonify(response), 400
+    # if is_app_running:
+    #     response={
+    #         "title": "Error",
+    #         "description": "Application is already running." 
+    #     }
+    #     return jsonify(response), 400
 
     print("In /enclave/deploy...")
-    content = request.json
 
-    # id = content["id"]
-    # repo = content["repo"]
-    # branch = content["branch"]
-    # url = content["url"]
-    # name = content["name"]
-    app_name = content["app_name"]
-
-    #add all the functions here
-    is_app_running=True
-    #PPDX_SDK.generate_and_save_key_pair()
-    PPDX_SDK.pull_docker_image(app_name)
-
-
-
-    # try:
-    #     process=subprocess.Popen(["./deploy_enclave.sh", app_name])
-    #     is_app_running = True
-
-    #     monitor_thread = threading.Thread(target=monitor_subprocess, args=(process,))
-    #     monitor_thread.start()
-
-    #     response={
-    #         "title": "Success",
-    #         "description": "Application execution has started."
-    #     }
-    #     return jsonify(response), 200
-    # except Exception as e:
-    #     response = Response(
-    #         response=f"Error: {str(e)}",
-    #         status=500,
-    #         mimetype="application/json"
-    #     )
-    # print("RUNNING FLAG: ",is_app_running)
-    # return response
+    try:
+        # process=subprocess.Popen(["./deploy_enclave.sh"])
+        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py","https://raw.githubusercontent.com/rajarshi-ray29/pneumonia-docker-compose/main/docker-compose.yml"])
+        is_app_running = True
+    
+        response={
+            "title": "Success",
+            "description": "Application execution has started."
+        }
+        return jsonify(response), 200
+    except Exception as e:
+        response = Response(
+            response=f"Error: {str(e)}",
+            status=500,
+            mimetype="application/json"
+        )
+    print("RUNNING FLAG: ",is_app_running)
+    return response
 
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
@@ -92,7 +75,7 @@ def get_inference():
         return jsonify(response), 403
     else:
         pulledcodepath="/home/iudx/pulledcode/"
-        fileNameYOLO=pulledcodepath+"sgx-yolo-app/yolov5/labels.json"
+        fileNameYOLO="/yolov5/labels.json"
         fileNameHI=pulledcodepath+"sgx-healthcare-inferencing/output.json"
         fileNameHT=pulledcodepath+"sgx-healthcare-training/output.json"
         fileNameDP=pulledcodepath+"sgx-diff-privacy/scripts/output.json"
