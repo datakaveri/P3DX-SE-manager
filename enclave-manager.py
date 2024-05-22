@@ -5,6 +5,7 @@ import subprocess
 import os
 import threading
 import PPDX_SDK
+import shutil
 
 app = Flask(__name__)
 
@@ -26,14 +27,16 @@ def before_request():
 #DEPLOY: Deploys the enclave, builds & runs the application & saves the output in a file
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
+    print("STARTING deploy")
     global is_app_running
-    global state
-    state = {
-        "step": 0,
-        "maxSteps": 10,
-        "title": "Inactive",
-        "description": "Inactive",
-    }
+
+    # global state
+    # state = {
+    #     "step": 0,
+    #     "maxSteps": 10,
+    #     "title": "Inactive",
+    #     "description": "Inactive",
+    # }
     # check if the application is already running, if yes, return response saying so
     # if is_app_running:
     #     response={
@@ -42,11 +45,12 @@ def deploy_enclave():
     #     }
     #     return jsonify(response), 400
 
-    print("In /enclave/deploy...")
-
+    content = request.json
+    app=content["app"]
+    docker_compose_url = content["url"]
     try:
         # process=subprocess.Popen(["./deploy_enclave.sh"])
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py","https://raw.githubusercontent.com/rajarshi-ray29/pneumonia-docker-compose/main/docker-compose.yml"])
+        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
         is_app_running = True
     
         response={
@@ -66,37 +70,55 @@ def deploy_enclave():
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
-    global state
-    if(state["step"]!=10):
-        response={
-            "title": "Error: No Inference Output",
-            "description": "Start execution of the application or wait for it to finish."
-        }
-        return jsonify(response), 403
+    print("STARTING inference")
+    # global state
+    # if(state["step"]!=10):
+    #     response={
+    #         "title": "Error: No Inference Output",
+    #         "description": "Start execution of the application or wait for it to finish."
+    #     }
+    #     return jsonify(response), 403
+    # else:
+        # pulledcodepath="/home/iudx/pulledcode/"
+        # fileNameYOLO="/yolov5/labels.json"
+        # fileNameHI=pulledcodepath+"sgx-healthcare-inferencing/output.json"
+        # fileNameHT=pulledcodepath+"sgx-healthcare-training/output.json"
+        # fileNameDP=pulledcodepath+"sgx-diff-privacy/scripts/output.json"
+        # file = ""
+        # done=False
+        # for file in [fileNameYOLO, fileNameHI, fileNameHT, fileNameDP]:
+        #     if os.path.isfile(file):
+        #         f=open(file, "r")
+        #         content = f.read()
+        #         response = app.response_class(
+        #             response=content,
+        #             mimetype="application/json"
+        #         )
+        #         done=True
+        #         return response
+        # if not done:
+        #     response={
+        #         "title": "Error: No Inference Output",
+        #         "description": "No inference output found."
+        #     }
+        #     return jsonify(response), 403
+    output_file = "/tmp/output/results.json"
+    if os.path.isfile(output_file):
+        f=open(output_file, "r")
+        content = f.read()
+        response = app.response_class(
+            response=content,
+            mimetype="application/json"
+        )
+        return response
     else:
-        pulledcodepath="/home/iudx/pulledcode/"
-        fileNameYOLO="/yolov5/labels.json"
-        fileNameHI=pulledcodepath+"sgx-healthcare-inferencing/output.json"
-        fileNameHT=pulledcodepath+"sgx-healthcare-training/output.json"
-        fileNameDP=pulledcodepath+"sgx-diff-privacy/scripts/output.json"
-        file = ""
-        done=False
-        for file in [fileNameYOLO, fileNameHI, fileNameHT, fileNameDP]:
-            if os.path.isfile(file):
-                f=open(file, "r")
-                content = f.read()
-                response = app.response_class(
-                    response=content,
-                    mimetype="application/json"
-                )
-                done=True
-                return response
-        if not done:
-            response={
-                "title": "Error: No Inference Output",
+        response={
+                "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
             }
-            return jsonify(response), 403
+        return jsonify(response), 403
+
+
 
 #SETSTATE: Sets the state of the enclave as a JSON object
 @app.route("/enclave/setstate", methods=["POST"])
