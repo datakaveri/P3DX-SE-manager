@@ -12,7 +12,7 @@ app = Flask(__name__)
 #default /state response (when application is not running)
 state = {
     "step": 0,
-    "maxSteps": 10,
+    "maxSteps": 9,
     "title": "Inactive",
     "description": "Inactive",
 }
@@ -46,11 +46,16 @@ def deploy_enclave():
     #     return jsonify(response), 400
 
     content = request.json
-    app=content["app"]
+
+    id_no = content["id"]
+    repository = content["repo"]
+    branch = content["branch"]
     docker_compose_url = content["url"]
+    app=content["name"]
+    
     try:
         # process=subprocess.Popen(["./deploy_enclave.sh"])
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
+        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", app, docker_compose_url])
         is_app_running = True
     
         response={
@@ -128,7 +133,7 @@ def setState():
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-    if(state["step"]==10):
+    if(state["step"]==9):
         #print("Resetting deploy flag as false")
         is_app_running = False
     response = app.response_class(
@@ -136,7 +141,6 @@ def setState():
         response="{ok}", status=200, mimetype="application/json"
     )
     return response
-
 
 
 #STATE: Returns the current state of the enclave as a JSON object
@@ -208,7 +212,7 @@ def monitor_subprocess(process):
         print("setting flag and state")
         state = {
             "step": 0,
-            "maxSteps": 10,
+            "maxSteps": 9,
             "title": "Inactive",
             "description": "Inactive",
         }
