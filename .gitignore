@@ -1,0 +1,9 @@
+#Byte-compiled / optimized / DLL files
+__pycache__
+profiling.json
+/keys/
+/vm-files/
+binary_files.json
+deploy_enclave.py
+/apd-verification/
+
