@@ -7,4 +7,5 @@ binary_files.json
 deploy_enclave.py
 /apd-verification/*
 !apd-verification/verification.py
+!apd-verification/README.md
 
