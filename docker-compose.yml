@@ -1,6 +1,6 @@
 services:
   image-classifier:
-    image: rajarshi29/pneumonia-classifier:compat  # Replace with your image name and tag
+    image: kaushalkirpekar/yoloapp_docker:yolo_app  # Replace with your image name and tag
     volumes:
       - /tmp/inputdata:/app/input
       - /tmp/output:/app/output
