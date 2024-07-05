@@ -47,15 +47,14 @@ def deploy_enclave():
 
     content = request.json
 
-    id_no = content["id"]
-    repository = content["repo"]
-    branch = content["branch"]
+    # id_no = content["id"]
+    # repository = content["repo"]
+    # branch = content["branch"]
     docker_compose_url = content["url"]
-    app=content["name"]
     
     try:
         # process=subprocess.Popen(["./deploy_enclave.sh"])
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", app, docker_compose_url])
+        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
         is_app_running = True
     
         response={

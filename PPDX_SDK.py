@@ -335,8 +335,22 @@ def call_set_state_endpoint(state, address):
 
 #profiling function: timestamp, step description
 def profiling_steps(description, stepno):
-    with open("profiling.json", "r") as file:
-        data = json.load(file)
+    profiling_file = "profiling.json"
+    
+    # Initialize profiling.json if it doesn't exist
+    if not os.path.isfile(profiling_file):
+        data = {
+            "input": {},
+            "stepsProfile": [],
+            "totalTime": {
+                "minutes": 0,
+                "seconds": 0
+            }
+        }
+    else:
+        # Load existing data from profiling.json
+        with open(profiling_file, "r") as file:
+            data = json.load(file)
     timestamp_str = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     step = {
         "step"+str(stepno): {
@@ -352,7 +366,7 @@ def profiling_steps(description, stepno):
 def profiling_inputImages():
     with open("profiling.json", "r") as file:
         data = json.load(file)
-    extracted_directory = '/inputdata'
+    extracted_directory = '/tmp/inputdata'
     files_in_directory = os.listdir(extracted_directory)
     image_extensions = ['.jpg', '.jpeg']
     image_count = 0
