@@ -6,3 +6,4 @@ profiling.json
 /vm_pcr_verification/
 /attestation-and-verification.py/
 /test-function.py/
+loadedDict.pkl
