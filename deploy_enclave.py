@@ -79,9 +79,6 @@ if __name__ == "__main__":
     config = load_config(config_file)  # Loads configuration into a dictionary
     address = config["enclaveManagerAddress"]
     
-    #step 0
-    box_out("Starting application")
-    PPDX_SDK.setState("Step 0","Starting Application...",0,10,address)
     #PPDX_SDK.profiling_steps('Application Start', 0)
     #remove_profiling_file()
     remove_files()

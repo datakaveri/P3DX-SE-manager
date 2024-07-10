@@ -37,7 +37,7 @@ def deploy_enclave():
         "title": "Inactive",
         "description": "Inactive",
     }
-    check if the application is already running, if yes, return response saying so
+    #check if the application is already running, if yes, return response saying so
     if is_app_running:
         response={
             "title": "Error",
@@ -73,7 +73,7 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
-    if(state[step]!=10):
+    if(state["step"]!=10):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
