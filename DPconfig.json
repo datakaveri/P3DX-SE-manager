@@ -1,0 +1,13 @@
+{
+    "apd_url": "https://authvertx.iudx.io/auth/v1/token",
+    "clientId": "73599b23-6550-4f01-882d-a2db75ba24ba",
+    "clientSecret": "15a874120135e4eed4782c8b51385649fee55562",
+    "Content-Type": "application/json",
+    "itemId": "8bdebc63-ccb0-4930-bdbb-60ea9d7f7599",
+    "itemType": "resource",
+    "role": "consumer",
+    "data_url": "https://authenclave.iudx.io/diffpriv_resource_server/data/suratITMS_data_csv.csv/",
+    "inferencekey_url": "https://authenclave.iudx.io/diffpriv_resource_server/key/suratITMS_data_csv.csv",
+    "inference_url": "https://authenclave.iudx.io/diffpriv_resource_server/inference/suratITMS_data_csv.csv",
+    "enclaveManagerAddress": "http://0.0.0.0:4000"
+}
