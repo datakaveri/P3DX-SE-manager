@@ -172,24 +172,6 @@ def execute_guest_attestation():
     os.chdir(script_dir)
 
 
-# SGX 
-#generate quote to be sent to APD for verification
-def generateQuote():
-    key = RSA.generate(2048)
-    publicKey=key.publickey().export_key(format='DER')
-    #print("Public key generated: " ,publicKey)
-    #privateKey=key.export_key(format='DER')
-    b64publicKey=base64.b64encode(publicKey)
-    sha= hashlib.sha512(publicKey).hexdigest()
-    shaBytes=bytearray.fromhex(sha)
-    with open("/dev/attestation/user_report_data", "wb") as f:
-        f.write(shaBytes)
-    with open("/dev/attestation/quote", "rb") as f:
-        quote = f.read()
-    print("Quote generated.")
-    #print("Quote: ",quote)
-    return quote,b64publicKey, key
-
 #APD verifies quote and releases token
 def getTokenFromAPD(jwt_file,config_file):
 
@@ -224,36 +206,8 @@ def getTokenFromAPD(jwt_file,config_file):
         print("Token verification failed.", r.text)
         sys.exit() 
 
-# def getTokenFromAPD(quote,b64publicKey,config):
-#     apd_url=config["apd_url"]
-#     headers={'clientId': config["clientId"], 'clientSecret': config["clientSecret"], 'Content-Type': config["Content-Type"]}
-#     b64quote=base64.b64encode(quote)
-#     context={
-#                 "sgxQuote":b64quote.decode("utf-8"),
-#                 "publicKey":b64publicKey.decode("utf-8")
-#             }
-
-#     data={
-#             "itemId": config["itemId"],
-#             "itemType": config["itemType"],
-#             "role": config["role"],
-#             "context": context
-#          }
-#     dataJson=json.dumps(data)
-#     r= requests.post(apd_url,headers=headers,data=dataJson)
-#     if(r.status_code==200):
-#         print("Quote verified and Token recieved.")
-#         jsonResponse=r.json()
-#         token=jsonResponse.get('results').get('accessToken')
-#         #print(token)
-#         return token
-#     else:
-#         print("Quote verification failed.", r.text)
-#         sys.exit() 
-
 #Send token to resource server for verification & get encrypted images  
 def getFileFromResourceServer(token):
-    # token = "eyJpc3MiOiJjb3MuaXVkeC5pbyIsInR5cCI6IkpXVCIsImFsZyI6IkVTMjU2In0.eyJzdWIiOiI4YjE0MjFiOC0wMTJiLTRhNDgtYTUyNC1lNmRmZDBlMjIxMjMiLCJpc3MiOiJjb3MuaXVkeC5pbyIsImF1ZCI6InJzLml1ZHguaW8iLCJleHAiOjE4MTE1Nzg0ODUsImlhdCI6MTcxMTUzNTI4NSwiaWlkIjoicmk6OGJkZWJjNjMtY2NiMC00OTMwLWJkYmItNjBlYTlkN2Y3NTk5Iiwicm9sZSI6ImNvbnN1bWVyIiwiY29ucyI6eyJwdWJsaWNLZXkiOiJNSUlCSWpBTkJna3Foa2lHOXcwQkFRRUZBQU9DQVE4QU1JSUJDZ0tDQVFFQTFuSTMzSE5jNGRNYk4zeDBRTk5KL2ZBV1ZJWTN5ZStPUkowNUtCZEhxL3Z0UHJ1YXo2Z29vT3hOZHdVVERMamRiN0V2d1dvcWxyWm83RFlnbEtZbFdEbzlIcHZ4azFtTy9nc0xMQk5ka0VQc21ja05oNmFJd2tOMGVQb2lsOWFsVHo1S0JXM1M4a0JOdFFibmpLOGVZZ2NrVlJwcjMwRFNtQzhXSDI3OU1TRXk1OUE0SUtoTGE3d2VUeTJJYVJHQmdWaHFlMFViUERDWk9wVXIwVE8zcURONGYwRjl1VTZTZ0UvdUhjOHR0TVpWdnZsQ1k5NmZnVzRqWHozNkg4SW54THRoNHFsOFp4WmdxM1dvaVZwM3hSSFZyWTNQMEx5R3hMazM4MTIrYWViYytHczNKSmdsZzJxRHMvbm8wOWE4ekpZNk5PUFYrUjhiQUk2RFZ0Y1RDUUlEQVFBQiJ9LCJyZyI6ImVlZDNhM2NhLWU2NzktNDlmYS1hZGE1LWEwNDQ5ODljMjJiZSJ9.nredVdyGUyKKRb1P0IVH8OdwsRrhKouq59tQvQDR_Gm9iyZMP1WrQPrW2ZuWSOscolM4Fk-gzx23m5q3RwPNAg"
     rs_url = "https://authenclave.iudx.io/resource_server/encrypted.store"
     rs_headers={'Authorization': f'Bearer {token}'}
     rs=requests.get(rs_url,headers=rs_headers)
