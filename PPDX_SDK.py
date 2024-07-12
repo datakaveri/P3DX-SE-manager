@@ -22,14 +22,6 @@ import psutil
 import gzip
 import csv
 import shutil
-#AMD:
-# 1. generate key pair - DONE
-# 2. measure docker & store in vTPM
-# 3. combine public key & vTPM report & send to MAA & return jwt token
-# 4. send attestation token (public key embedded) to APD & get back access token
-# rest steps are same
-# steps 3 & 4 : use hardcoded token
-# docker compose
 
 def pull_compose_file(url, filename='docker-compose.yml'):
     try:
@@ -94,6 +86,14 @@ def generate_and_save_key_pair():
 
     with open(os.path.join('keys', public_key_file), 'w') as file:
         file.writelines(new_lines)
+
+    #reading private key 
+    with open('keys/private_key.pem', "r") as pem_file:
+        private_key = pem_file.read()
+        print('Using Private Key to Decrypt data')
+    key = RSA.import_key(private_key)
+
+    return key
 
 def pull_docker_image(app_name):
     # Docker login
@@ -274,6 +274,7 @@ def setState(title,description,step,maxSteps,address):
     state= {"title":title,"description":description,"step":step,"maxSteps":maxSteps}
     call_set_state_endpoint(state, address)
 
+
 #function to call set state endpoint
 def call_set_state_endpoint(state, address):
     #define enpoint url
@@ -288,44 +289,104 @@ def call_set_state_endpoint(state, address):
     print(r.text)
 
 
-#Chunk Functions:
+#DP Functions:
+
+def pullconfig(url, token, key):
+    print("Pulling DP application config from RS..")
+    access_token=token
+    rs_url=url
+
+    auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = {'Authorization': auth }
+
+    response = requests.get(rs_url, headers=headers)
+    if response.status_code == 200:
+        loadedDict = pickle.loads(response.content)
+        print("Data downloaded successfully")
+
+        b64encryptedKey=loadedDict["encryptedKey"]
+        encConfig=loadedDict["encConfig"]
+        encryptedKey=base64.b64decode(b64encryptedKey)
+        decryptor = PKCS1_OAEP.new(key)
+        plainKey=decryptor.decrypt(encryptedKey)
+        print("Symmetric key decrypted using the enclave's private RSA key.")
+
+        fernetKey = Fernet(plainKey)
+        decryptedConfig = fernetKey.decrypt(encConfig)
+        print("Config decrypted")
+
+        decryptedConfigStr = decryptedConfig.decode('utf-8')
+        decryptedConfigDict = json.loads(decryptedConfigStr)
+
+        config_path = os.path.expanduser("/tmp/DPinput/config")
+        config_file = os.path.join(config_path, "spatioDP.json")
+
+        with open(config_file, 'w') as json_file:
+            json.dump(decryptedConfigDict, json_file, indent=4)
+        print("Decrypted config written to tmp/DPinput/config")
+    else:
+        print(f"Failed to download file. Status code: {response.status_code}")
+
+
 def dataChunkN(n, url, access_token, key):
-    loadedDict=getChunkFromResourceServer(n, url, access_token)
+    count=n
+    loadedDict=getChunkFromResourceServer(count, url, access_token)
     if loadedDict:
-        decryptChunk(loadedDict, key)
+        decryptChunk(loadedDict, count, key)
         return 1
     else:
         return 0 
     
 def getChunkFromResourceServer (n,url,token):
-    print("Getting chunk from the resource server..")
     rs_headers={'Authorization': f'Bearer {token}'}
     rs_url = f"{url}{n}"
     print(rs_url)
     rs=requests.get(rs_url,headers=rs_headers)
     if(rs.status_code==200):
-        print("Token authenticated and Encrypted images recieved.")
+        print("Token authenticated and Encrypted data recieved.")
         loadedDict=pickle.loads(rs.content)
-        #print(loadedDict.keys())
         return loadedDict
     else:
         print(rs.text)
         return None
 
-def decryptChunk(loadedDict,key):
+def decryptChunk(loadedDict, n, key):
     print("Decrypting chunk..")
     b64encryptedKey=loadedDict["encryptedKey"]
     encData=loadedDict["encData"]
     encryptedKey=base64.b64decode(b64encryptedKey)
     decryptor = PKCS1_OAEP.new(key)
     plainKey=decryptor.decrypt(encryptedKey)
-    print("Symmetric key decrypted using the enclave's private RSA key.")
+
     fernetKey = Fernet(plainKey)
     decryptedData = fernetKey.decrypt(encData)
-    print(os.listdir("../"))
-    with open('../inputdata/outfile.gz', "wb") as f:
-        f.write(decryptedData)
-    print("Chunk decrypted and saved in /inputdata/outfile.gz.")
 
+    temp_dir = os.path.expanduser("/tmp/DPinput")
+    decrypted_data_folder = os.path.join(temp_dir, "encrypted_data")
+    extracted_data_folder = os.path.join(temp_dir, "inputdata")
+
+    if not os.path.exists(extracted_data_folder):
+        os.makedirs(extracted_data_folder)
+    if not os.path.exists(decrypted_data_folder):
+        os.makedirs(decrypted_data_folder)
+
+    decrypted_data_path = os.path.join(decrypted_data_folder, f"outfile{n}.gz")
     
+    if os.path.exists(decrypted_data_path):
+        os.remove(decrypted_data_path)
+
+    with open(decrypted_data_path, "wb") as f:
+        f.write(decryptedData)
+
+    with gzip.open(decrypted_data_path, 'rb') as file:
+        data = file.read().decode('utf-8')
+        json_data = json.loads(data)
+    
+    outfile_path = os.path.join(extracted_data_folder, f"data{n}.json")
+
+    with open(outfile_path, 'w', encoding='utf-8') as outfile:
+        for record in json_data:
+            json.dump(record, outfile)
+            outfile.write('\n')
+
 
