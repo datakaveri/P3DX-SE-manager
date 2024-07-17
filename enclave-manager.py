@@ -12,7 +12,7 @@ app = Flask(__name__)
 #default /state response (when application is not running)
 state = {
     "step": 0,
-    "maxSteps": 9,
+    "maxSteps": 13,
     "title": "Inactive",
     "description": "Inactive",
 }
@@ -33,7 +33,7 @@ def deploy_enclave():
     global state
     state = {
         "step": 0,
-        "maxSteps": 10,
+        "maxSteps": 13,
         "title": "Inactive",
         "description": "Inactive",
     }
@@ -47,13 +47,13 @@ def deploy_enclave():
 
     content = request.json
 
-    # dataset_name = content["dataset_name"]
-    # rs_url = content["rs_url"]
+    dataset_name = content["dataset_name"]
+    rs_url = content["rs_url"]
     docker_compose_url = content["url"]
     
     try:
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
-        #process=subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+        #process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
+        process=subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
         is_app_running = True
     
         response={
@@ -76,7 +76,7 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
-    if(state["step"]!=10):
+    if(state["step"]!=13):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
@@ -107,7 +107,7 @@ def setState():
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-    if(state["step"]==10):
+    if(state["step"]==13):
         #Resetting deploy flag as false
         is_app_running = False
     response = app.response_class(
@@ -119,5 +119,5 @@ def setState():
 #STATE: Returns the current state of the enclave as a JSON object
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
-    global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
+    global state # = {"step":3, "maxSteps":13, "title": "Building enclave,", "description":"The enclave is being compiled,"}
     return jsonify(state) 

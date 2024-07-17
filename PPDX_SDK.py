@@ -385,8 +385,104 @@ def decryptChunk(loadedDict, n, key):
     outfile_path = os.path.join(extracted_data_folder, f"data{n}.json")
 
     with open(outfile_path, 'w', encoding='utf-8') as outfile:
-        for record in json_data:
-            json.dump(record, outfile)
-            outfile.write('\n')
+        outfile.write('[\n')
+        for i, record in enumerate(json_data):
+            json_record = json.dumps(record, indent=4)  # Convert the record to a JSON string with indentation
+            if i < len(json_data) - 1:
+                outfile.write(json_record + ',\n')  # Write the JSON string with a comma
+            else:
+                outfile.write(json_record + '\n')  # Last record, no comma
+        outfile.write(']\n')
 
 
+def getInferenceFernetKey(key, url, access_token):
+    print ("Getting the inference Fernet key..")
+    print("Accessing: ", url)   
+    rs_headers={'Authorization': f'Bearer {access_token}'}
+    rs_url = url
+    rs=requests.get(rs_url,headers=rs_headers)
+
+    if(rs.status_code==200):
+        print("Token authenticated and pickle file recieved.")
+        loadedDict=pickle.loads(rs.content)
+        print(loadedDict.keys())
+        b64encryptedKey=loadedDict["encryptedKey"]
+    else:
+        print(rs.text)
+        return None
+    
+    print("The b64encryptedKey is: ", b64encryptedKey)
+
+    encrypted_inference_key=base64.b64decode(b64encryptedKey)
+
+    decryptor = PKCS1_OAEP.new(key)
+    plain_inferenceKey=decryptor.decrypt(encrypted_inference_key)
+    return plain_inferenceKey
+
+
+def encryptInference(inference_key):
+    #combine inference files and encrypt it
+
+    output_dir = os.path.expanduser("/tmp/DPoutput")
+    # Get a list of all JSON files in the directory
+    json_files = [f for f in os.listdir(output_dir) if f.endswith('.json')]
+
+    combined_json = {}
+    # Iterate over each file and read the JSON data
+    for json_file in json_files:
+        file_path = os.path.join(output_dir, json_file)
+        with open(file_path, 'r') as f:
+            file_data = json.load(f)
+            # Add the file data to the combined JSON using the filename (without .json) as the key
+            combined_json[os.path.splitext(json_file)[0]] = file_data
+
+    # Write the combined JSON to a new file
+    output_file = os.path.join(output_dir, "epsilon_table.json")
+    with open(output_file, 'w') as f:
+        json.dump(combined_json, f, indent=4)
+    print(f"Combined JSON has been written to {output_file}")
+
+    output_folder = os.path.join(output_dir, "output")
+    os.makedirs(output_folder, exist_ok=True)
+    source_file=output_file
+    # Copy combined.json to the output directory
+    shutil.copy(source_file, output_folder)
+
+    print("Encrypting the output file")
+
+    tarball = "pipelineOutput.tar"
+    tar = tarfile.open(tarball, "w")
+    tar.add(output_folder)
+    tar.close()
+
+    fernet_key_bytes = inference_key
+    fernet = Fernet(fernet_key_bytes)
+
+    # encrypt the tarball
+    dataFile = open(tarball, "r+b")
+    data = dataFile.read()
+    enc_inference = fernet.encrypt(data)
+    os.remove(tarball)
+
+    data = {"encInference": enc_inference, "tarName":tarball}
+    pickled_data = pickle.dumps(data)
+
+    return pickled_data
+
+
+def sendInference(inference, access_token, url):
+    #send inference to RS
+    print("Sending the inference to: ", url)
+
+    auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = {'Authorization': auth }
+
+    # Make the POST request with headers
+    response = requests.post(url, headers=headers, data=inference)
+
+    # Check the response
+    if response.status_code == 200:
+        print('Success!')
+    else:
+        print('Request failed with status code:', response.status_code)
+    print(response.text)
