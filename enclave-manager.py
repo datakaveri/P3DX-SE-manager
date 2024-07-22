@@ -82,7 +82,7 @@ def get_inference():
                 "description": "No inference output found."
             }
         return jsonify(response), 403
-    output_file = "/tmp/output/results.json"
+    output_file = "/tmp/DPoutput/epsilon_table.json"
     if os.path.isfile(output_file):
         f=open(output_file, "r")
         content = f.read()

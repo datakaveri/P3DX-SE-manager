@@ -59,47 +59,58 @@ def remove_files():
     else:
         print(f"Folder not found: {folder_path}")
 
-    # folder_path = os.path.join('/tmp', 'DPinput')
-    # if os.path.exists(folder_path):
-    #     shutil.rmtree(folder_path)
-    #     print(f"Removed folder and contents: {folder_path}")
-    # else:
-    #     print(f"Folder not found: {folder_path}")
+    folder_path = os.path.join('/tmp', 'DPinput')
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+        print(f"Removed folder and contents: {folder_path}")
+    else:
+        print(f"Folder not found: {folder_path}")
+    os.makedirs(folder_path)
+    print("Created input folder")
+
+    config_path = os.path.join(folder_path, "config")
+    os.makedirs(config_path)
+    encdata_path = os.path.join(folder_path, "encrypted_data")
+    os.makedirs(encdata_path)
+    inputdata_path = os.path.join(folder_path, "inputdata")
+    os.makedirs(inputdata_path)
+
     
-    # folder_path = os.path.join('/tmp', 'DPoutput')
-    # if os.path.exists(folder_path):
-    #     shutil.rmtree(folder_path)
-    #     print(f"Removed folder and contents: {folder_path}")
-    # else:
-    #     print(f"Folder not found: {folder_path}")
+    folder_path = os.path.join('/tmp', 'DPoutput')
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+        print(f"Removed folder and contents: {folder_path}")
+    else:
+        print(f"Folder not found: {folder_path}")
+    os.makedirs(folder_path)
+    print("Created output folder")
 
 # Start the main process
 if __name__ == "__main__":
     print("In DP script main")
-    config_file = "DPconfig.json"
-    config = load_config(config_file)  # Loads configuration into a dictionary
-    address = config["enclaveManagerAddress"]
-    inference_url=config["inference_url"]
-    inferencekey_url=config["inferencekey_url"]
-    rs_url=config["data_url"]
-    config_url = config["config_url"]
-    inferencekey_url=config["inferencekey_url"]
-    inference_url=config["inference_url"]
-    
-    remove_files()
-
     if len(sys.argv) < 2:
         print("Error: Missing arguments.")
         sys.exit(1)  # Exit with an error code
 
     dataset = sys.argv[1]
-    resource_server_url = sys.argv[2]
+    rs_url = sys.argv[2]
     github_raw_link = sys.argv[3]
-    
+
     # Validate the link
     if not github_raw_link.startswith("https://raw.githubusercontent.com/"):
         print("Error: Invalid GitHub raw link format.")
         sys.exit(1)
+
+    remove_files()
+
+    config_file = "DPconfig.json"
+    config = load_config(config_file)  # Loads configuration into a dictionary
+    address = config["enclaveManagerAddress"]
+
+    inference_url = f"{rs_url}/inference/{dataset}.csv"
+    inferencekey_url = f"{rs_url}/key/{dataset}.csv"
+    data_url = f"{rs_url}/data/{dataset}.csv/"
+    config_url = f"{rs_url}/config/{dataset}.csv"
 
     # Step 1 - Pulling docker compose & extracting docker image link
     print("\nStep 1")
@@ -141,7 +152,7 @@ if __name__ == "__main__":
     print("\nStep 6")
     box_out("Sending JWT to APD for verification...")
     PPDX_SDK.setState("Step 6","Sending JWT to APD for verification...",6,13,address)
-    token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', 'config_file.json')
+    token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', config)
     print("Access token received from APD")
 
     # Step 7 - Pulling config file from RS: 
@@ -157,15 +168,15 @@ if __name__ == "__main__":
     PPDX_SDK.setState("Step 8","Getting chunks from RS...",8,13,address)
     count=0
     lengthList=[]
-    while(True):
+    while True:
         count=count+1
-        lengthList.append(count)
         print("The lengthList is: ", lengthList)
 
-        ret =  PPDX_SDK.dataChunkN(count, rs_url, token, key)
+        ret =  PPDX_SDK.dataChunkN(count, data_url, token, key)
         if (ret==0):
             print ("Error retrieveing chunk. Assuming no more chunks..")
             break
+        lengthList.append(count)
 
     total_chunks = len(lengthList)
     print("TOTAL chunks stored :", total_chunks)

@@ -6,9 +6,5 @@
     "itemId": "8bdebc63-ccb0-4930-bdbb-60ea9d7f7599",
     "itemType": "resource",
     "role": "consumer",
-    "data_url": "https://authenclave.iudx.io/diffpriv_resource_server/data/suratITMS_data_csv.csv/",
-    "config_url": "https://authenclave.iudx.io/diffpriv_resource_server/config/suratITMS_data_csv.csv",
-    "inferencekey_url": "https://authenclave.iudx.io/diffpriv_resource_server/key/suratITMS_data_csv.csv",
-    "inference_url": "https://authenclave.iudx.io/diffpriv_resource_server/inference/suratITMS_data_csv.csv",
     "enclaveManagerAddress": "http://0.0.0.0:4000"
 }

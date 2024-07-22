@@ -173,11 +173,7 @@ def execute_guest_attestation():
 
 
 #APD verifies quote and releases token
-def getTokenFromAPD(jwt_file,config_file):
-
-    with open(config_file, 'r') as file:
-        config = json.load(file)
-
+def getTokenFromAPD(jwt_file,config):
     apd_url=config["apd_url"]
     headers={'clientId': config["clientId"], 'clientSecret': config["clientSecret"], 'Content-Type': config["Content-Type"]}
 
@@ -421,8 +417,7 @@ def getInferenceFernetKey(key, url, access_token):
 
 
 def encryptInference(inference_key):
-    #combine inference files and encrypt it
-
+    print("Encrypting inference")
     output_dir = os.path.expanduser("/tmp/DPoutput")
     # Get a list of all JSON files in the directory
     json_files = [f for f in os.listdir(output_dir) if f.endswith('.json')]
@@ -442,33 +437,26 @@ def encryptInference(inference_key):
         json.dump(combined_json, f, indent=4)
     print(f"Combined JSON has been written to {output_file}")
 
-    output_folder = os.path.join(output_dir, "output")
-    os.makedirs(output_folder, exist_ok=True)
-    source_file=output_file
-    # Copy combined.json to the output directory
-    shutil.copy(source_file, output_folder)
-
     print("Encrypting the output file")
 
     tarball = "pipelineOutput.tar"
     tar = tarfile.open(tarball, "w")
-    tar.add(output_folder)
+    tar.add(output_file, arcname="epsilon_table.json")
     tar.close()
 
     fernet_key_bytes = inference_key
     fernet = Fernet(fernet_key_bytes)
 
-    # encrypt the tarball
+    #encrypt the tarball
     dataFile = open(tarball, "r+b")
-    data = dataFile.read()
-    enc_inference = fernet.encrypt(data)
+    inference_data = dataFile.read()
+    enc_inference = fernet.encrypt(inference_data)
+    
+    data = {"encInference": enc_inference, "tarName": "pipelineOutput.tar"}
+    pickled_data = pickle.dumps(data)
     os.remove(tarball)
 
-    data = {"encInference": enc_inference, "tarName":tarball}
-    pickled_data = pickle.dumps(data)
-
     return pickled_data
-
 
 def sendInference(inference, access_token, url):
     #send inference to RS
@@ -477,7 +465,7 @@ def sendInference(inference, access_token, url):
     auth = "Bearer {access_token}".format(access_token=access_token)
     headers = {'Authorization': auth }
 
-    # Make the POST request with headers
+    #Make the POST request with headers
     response = requests.post(url, headers=headers, data=inference)
 
     # Check the response
@@ -486,3 +474,14 @@ def sendInference(inference, access_token, url):
     else:
         print('Request failed with status code:', response.status_code)
     print(response.text)
+
+    # #TESTING
+    # while True:
+    #     response = requests.post(url, headers=headers, data=inference)
+    #     if(response.status_code==200):
+    #         print("SUCCESS!!")
+    #         break
+    #     else:
+    #         print("Request failed with status code: ", response.status_code)
+    #         print(response.text)
+    # print("DONE")
