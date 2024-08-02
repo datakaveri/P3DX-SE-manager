@@ -7,3 +7,4 @@ profiling.json
 /attestation-and-verification.py/
 docker-compose.yml
 loadedDict.pkl
+inference.json

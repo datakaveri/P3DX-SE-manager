@@ -22,6 +22,7 @@ import psutil
 import gzip
 import csv
 import shutil
+from collections import OrderedDict
 
 def pull_compose_file(url, filename='docker-compose.yml'):
     try:
@@ -97,11 +98,12 @@ def generate_and_save_key_pair():
 
 def pull_docker_image(app_name):
     # Docker login
-    print("Logging in to docker hub")
-    subprocess.run(["sudo", "docker", "login"])
-    # Pull Docker image
+    # print("Logging in to docker hub")
+    # subprocess.run(["sudo", "docker", "login"])
+    #Pull Docker image
     print("Pulling docker image")
-    subprocess.run(["sudo", "docker", "pull", app_name])
+    subprocess.run(["docker", "pull", app_name])
+    #subprocess.run(["sudo", "docker", "pull", app_name])
 
 def measureDockervTPM(link):
     try:
@@ -315,7 +317,7 @@ def pullconfig(url, token, key):
         decryptedConfigDict = json.loads(decryptedConfigStr)
 
         config_path = os.path.expanduser("/tmp/DPinput/config")
-        config_file = os.path.join(config_path, "spatioDP.json")
+        config_file = os.path.join(config_path, "config.json")
 
         with open(config_file, 'w') as json_file:
             json.dump(decryptedConfigDict, json_file, indent=4)
@@ -419,29 +421,43 @@ def getInferenceFernetKey(key, url, access_token):
 def encryptInference(inference_key):
     print("Encrypting inference")
     output_dir = os.path.expanduser("/tmp/DPoutput")
+    config_dir = os.path.expanduser("/tmp/DPinput/config")
+
+    files = os.listdir(config_dir)
+    if len(files) != 1:
+        raise Exception(f"Expected exactly one file in {config_dir}, but found {len(files)} files.")
+        
+    config_file = files[0]
+    config_file_path = os.path.join(config_dir, config_file)
+
+    with open(config_file_path, 'r') as f:
+        config = json.load(f)
+
     # Get a list of all JSON files in the directory
     json_files = [f for f in os.listdir(output_dir) if f.endswith('.json')]
 
-    combined_json = {}
-    # Iterate over each file and read the JSON data
+    combined_json = OrderedDict()
+    combined_json["dataset"] = config["data_type"]
+
+    # Iterate over output files & combine & store in one
     for json_file in json_files:
         file_path = os.path.join(output_dir, json_file)
         with open(file_path, 'r') as f:
             file_data = json.load(f)
-            # Add the file data to the combined JSON using the filename (without .json) as the key
             combined_json[os.path.splitext(json_file)[0]] = file_data
+            # key = json_file[len(dataset_type) + 1:]  # +1 to remove the underscore as well
+            # combined_json[os.path.splitext(key)[0]] = file_data
 
     # Write the combined JSON to a new file
-    output_file = os.path.join(output_dir, "epsilon_table.json")
+    output_file = os.path.join(output_dir, "inference.json")
     with open(output_file, 'w') as f:
         json.dump(combined_json, f, indent=4)
     print(f"Combined JSON has been written to {output_file}")
 
     print("Encrypting the output file")
-
     tarball = "pipelineOutput.tar"
     tar = tarfile.open(tarball, "w")
-    tar.add(output_file, arcname="epsilon_table.json")
+    tar.add(output_file, arcname="inference.json")
     tar.close()
 
     fernet_key_bytes = inference_key

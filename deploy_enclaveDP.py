@@ -9,10 +9,6 @@ import psutil
 import logging
 from datetime import datetime
 
-# Simulate sourcing external scripts -  
-# You'd integrate the necessary functions from setState.sh and profilingStep.sh here 
-
-
 def load_config(filename):
     """Loads configuration data from a JSON file."""
     try:
@@ -39,11 +35,6 @@ def box_out(message):
     # Bottom border
     print("+" + "-" * (max_width + 2) + "+")
 
-
-def remove_profiling_file():
-    if os.path.exists("profiling.json"):
-        os.remove("profiling.json")
-
 def remove_files():
     file_path = os.path.join('.','docker-compose.yml')
     if os.path.exists(file_path):
@@ -65,23 +56,26 @@ def remove_files():
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
+        
     os.makedirs(folder_path)
     print("Created input folder")
 
     config_path = os.path.join(folder_path, "config")
     os.makedirs(config_path)
+
     encdata_path = os.path.join(folder_path, "encrypted_data")
     os.makedirs(encdata_path)
+
     inputdata_path = os.path.join(folder_path, "inputdata")
     os.makedirs(inputdata_path)
 
-    
     folder_path = os.path.join('/tmp', 'DPoutput')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
+
     os.makedirs(folder_path)
     print("Created output folder")
 
@@ -107,10 +101,10 @@ if __name__ == "__main__":
     config = load_config(config_file)  # Loads configuration into a dictionary
     address = config["enclaveManagerAddress"]
 
-    inference_url = f"{rs_url}/inference/{dataset}.csv"
-    inferencekey_url = f"{rs_url}/key/{dataset}.csv"
-    data_url = f"{rs_url}/data/{dataset}.csv/"
-    config_url = f"{rs_url}/config/{dataset}.csv"
+    inference_url = f"{rs_url}/inference/{dataset}"
+    inferencekey_url = f"{rs_url}/key/{dataset}"
+    data_url = f"{rs_url}/data/{dataset}/"
+    config_url = f"{rs_url}/config/{dataset}"
 
     # Step 1 - Pulling docker compose & extracting docker image link
     print("\nStep 1")

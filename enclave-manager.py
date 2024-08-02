@@ -29,7 +29,6 @@ def before_request():
 def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
-
     global state
     state = {
         "step": 0,
@@ -82,7 +81,7 @@ def get_inference():
                 "description": "No inference output found."
             }
         return jsonify(response), 403
-    output_file = "/tmp/DPoutput/epsilon_table.json"
+    output_file = "/tmp/DPoutput/inference.json"
     if os.path.isfile(output_file):
         f=open(output_file, "r")
         content = f.read()
