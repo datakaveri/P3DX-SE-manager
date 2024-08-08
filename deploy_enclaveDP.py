@@ -146,7 +146,7 @@ if __name__ == "__main__":
     print("\nStep 6")
     box_out("Sending JWT to APD for verification...")
     PPDX_SDK.setState("Step 6","Sending JWT to APD for verification...",6,13,address)
-    token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', config)
+    token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', config, dataset, rs_url)
     print("Access token received from APD")
 
     # Step 7 - Pulling config file from RS: 

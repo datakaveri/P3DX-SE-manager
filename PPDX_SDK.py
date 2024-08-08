@@ -175,7 +175,7 @@ def execute_guest_attestation():
 
 
 #APD verifies quote and releases token
-def getTokenFromAPD(jwt_file,config):
+def getTokenFromAPD(jwt_file, config, dataset, rs_url):
     apd_url=config["apd_url"]
     headers={'clientId': config["clientId"], 'clientSecret': config["clientSecret"], 'Content-Type': config["Content-Type"]}
 
@@ -183,7 +183,9 @@ def getTokenFromAPD(jwt_file,config):
         token = file.read().strip()
 
     context={
-                "jwtMAA": token
+                "jwtMAA": token,
+                "dataset_name" : dataset,
+                "rs_url": rs_url
             }
 
     data={
