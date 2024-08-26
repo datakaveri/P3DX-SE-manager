@@ -422,8 +422,11 @@ def getInferenceFernetKey(key, url, access_token):
 
 def encryptInference(inference_key):
     print("Encrypting inference")
-    output_dir = os.path.expanduser("/tmp/DPoutput")
+    output_file = os.path.expanduser("/tmp/DPoutput/concat_output.json")
     config_dir = os.path.expanduser("/tmp/DPinput/config")
+
+    with open(output_file, 'r') as f:
+        concat_output = json.load(f)
 
     files = os.listdir(config_dir)
     if len(files) != 1:
@@ -435,31 +438,19 @@ def encryptInference(inference_key):
     with open(config_file_path, 'r') as f:
         config = json.load(f)
 
-    # Get a list of all JSON files in the directory
-    json_files = [f for f in os.listdir(output_dir) if f.endswith('.json')]
+    concat_output["dataset"] = config["data_type"]
 
-    combined_json = OrderedDict()
-    combined_json["dataset"] = config["data_type"]
-
-    # Iterate over output files & combine & store in one
-    for json_file in json_files:
-        file_path = os.path.join(output_dir, json_file)
-        with open(file_path, 'r') as f:
-            file_data = json.load(f)
-            combined_json[os.path.splitext(json_file)[0]] = file_data
-            # key = json_file[len(dataset_type) + 1:]  # +1 to remove the underscore as well
-            # combined_json[os.path.splitext(key)[0]] = file_data
-
-    # Write the combined JSON to a new file
-    output_file = os.path.join(output_dir, "inference.json")
     with open(output_file, 'w') as f:
-        json.dump(combined_json, f, indent=4)
-    print(f"Combined JSON has been written to {output_file}")
+        json.dump(concat_output, f, indent=4)
+    
+    inference_file = os.path.expanduser("/tmp/DPoutput/inference.json")
+    os.rename(output_file, inference_file)
+    print(f"File renamed and saved as {inference_file}")
 
     print("Encrypting the output file")
     tarball = "pipelineOutput.tar"
     tar = tarfile.open(tarball, "w")
-    tar.add(output_file, arcname="inference.json")
+    tar.add(inference_file, arcname="inference.json")
     tar.close()
 
     fernet_key_bytes = inference_key
