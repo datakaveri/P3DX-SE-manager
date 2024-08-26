@@ -1,4 +1,4 @@
-# Intel SGX Enclave Manager
+# AMD SEV Enclave Manager
 
 ##Enclave Manager:
 Enclave is a trusted execution environment (TEE) embedded in a process. The enclave manager is a server that provides communication between the enclave and the APD.
