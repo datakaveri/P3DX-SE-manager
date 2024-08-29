@@ -11,16 +11,11 @@ from Crypto.PublicKey import RSA
 import base64
 import hashlib
 import json
-import requests
 import _pickle as pickle
 from Crypto.Cipher import PKCS1_OAEP
 from cryptography.fernet import Fernet
 import tarfile
 import urllib.parse
-import datetime
-import psutil
-import gzip
-import csv
 import shutil
 #AMD:
 # 1. generate key pair - DONE
@@ -43,6 +38,85 @@ def pull_compose_file(url, filename='docker-compose.yml'):
     
     except requests.exceptions.RequestException as e:
         print(f"Error downloading content: {e}")
+
+def pull_docker_image(app_name):
+    # read config file
+    with open('config.json', 'r') as file:
+        config = json.load(file)
+
+    github_username = config["github_username"]
+    github_token = config["github_token"]
+
+    # login to github container registry
+    print("Logging in to GitHub Container Registry...")
+    login_command = f"echo {github_token} | docker login ghcr.io -u {github_username} --password-stdin"
+    result = subprocess.run(login_command, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("Logged in successfully!")
+    else:
+        print("Failed to login:", result.stderr)
+        sys.exit(1)
+
+    print("Pulling docker image")
+    result = subprocess.run(["docker", "pull", app_name])
+    if result.returncode != 0: 
+        print("Failed to pull the Docker image")
+        sys.exit
+    print("Docker image pulled successfully")
+    
+    # Fetch the SHA256 digest of the image
+    app_name = app_name.replace("ghcr.io/", "")
+
+    repo_name, image_and_tag = app_name.split('/')
+    image_name, tag = image_and_tag.split(':')
+
+    # GitHub Container Registry API URL
+    url = f"https://ghcr.io/v2/{repo_name}/{image_name}/manifests/{tag}"
+
+    # Make the API request
+    response = requests.get(url, auth=(github_username, github_token))
+
+    if response.status_code == 200:
+        data = response.json()
+        sha256_digest = data['config']['digest'].replace('sha256:', '')
+        print(f"SHA256 digest for image '{app_name}' is: {sha256_digest}")
+        return sha256_digest
+    else:
+        print(f"Failed to fetch the digest. Status code: {response.status_code}")
+        print(f"Response: {response.text}")
+        sys.exit(1)
+
+
+def spawn_container(sha_digest, json_context):
+    # put the sha_digest in the json_context
+    json_context["sha_digest"] = sha_digest
+
+    temp_dir = os.path.expanduser("/tmp")
+    context_dir = os.path.join(temp_dir, "FCcontext")
+
+    # write the json_context to /tmp/FCcontext/context.json
+    with open(os.path.join(context_dir, "context.json"), "w") as file:
+        json.dump(json_context, file)
+
+    # spawn the container by running the docker-compose file
+    print("Spawning the container...")
+    process = subprocess.run(["sudo", "docker", "compose", 'up'])
+    if process.returncode == 0:
+        print("Container spawned successfully!")
+    else:
+        print("Failed to spawn the container")
+        sys.exit(1)
+
+        
+
+
+
+
+
+
+
+
 
 # Generate Public-Private Key Pair
 def generate_and_save_key_pair():
@@ -95,13 +169,6 @@ def generate_and_save_key_pair():
     with open(os.path.join('keys', public_key_file), 'w') as file:
         file.writelines(new_lines)
 
-def pull_docker_image(app_name):
-    # Docker login
-    print("Logging in to docker hub")
-    subprocess.run(["sudo", "docker", "login"])
-    # Pull Docker image
-    print("Pulling docker image")
-    subprocess.run(["sudo", "docker", "pull", app_name])
 
 def measureDockervTPM(link):
     try:

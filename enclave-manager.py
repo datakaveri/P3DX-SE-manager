@@ -3,9 +3,6 @@ from flask import Flask, jsonify, Response
 from flask import request
 import subprocess
 import os
-import threading
-import PPDX_SDK
-import shutil
 
 app = Flask(__name__)
 
@@ -45,12 +42,19 @@ def deploy_enclave():
         }
         return jsonify(response), 400
 
+    # take as parameters the docker-compose.yml file and the json co
     content = request.json
     docker_compose_url = content["url"]
+    #json_config = content.get("config", {})
+    json_context = {
+        "PPB_no": "T01050090085",
+        "crop" : "Bajra",
+        "crop_area" : "0.5",
+        "season" : "Kharif"
+    }
     
     try:
-        # process=subprocess.Popen(["./deploy_enclave.sh"])
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
+        subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
         is_app_running = True
     
         response={
@@ -118,60 +122,3 @@ def setState():
 def get_state():
     global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
     return jsonify(state) 
-
-
-@app.route("/enclave/profiling", methods=["GET"])
-def get_profiling():
-    print("In /enclave/profiling...")
-    global state
-    if(state["step"]==0):
-        response={
-            "title": "Error: No Profiling Output",
-            "description": "Start execution of the application."
-        }
-        return jsonify(response), 403
-    
-    profilingFileEM = "./profiling.json"
-    applications = ["yolo-app", "healthcare-training", "healthcare-inferencing"]
-    file = ""
-    for application in applications:
-        profilingFile = "/home/iudx/pulledcode/sgx-"+application+"/profiling.json"
-        if os.path.isfile(profilingFile):
-            file=profilingFile
-            break
-    if file=="":
-        if os.path.isfile(profilingFileEM):
-            file=profilingFileEM
-        else:
-            response={
-            "title": "Error: No Profiling Output",
-            "description": "No profiling output found."
-            }
-            return jsonify(response), 403
-        
-    f=open(file, "r")
-    content = f.read()
-    response = app.response_class(
-        response=content,
-        mimetype="application/json"
-    )
-    return response
-
-def monitor_subprocess(process):
-    print("Inside monitor subprocess")
-    global is_app_running
-    global state
-    process.wait()  # Wait for the subprocess to finish
-    exit_code = process.returncode
-    print("Exit code:",exit_code)
-    if exit_code != 0:
-        # Subprocess had an error
-        print("Error: Subprocess exited with code:", exit_code)
-        is_app_running = False
-        print("setting flag and state")
-        state = {
-            "step": 0,
-            "maxSteps": 9,
-            "title": "Inactive",
-            "description": "Inactive",
-        }

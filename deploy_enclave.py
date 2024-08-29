@@ -4,10 +4,6 @@ import PPDX_SDK
 import sys
 import json
 import shutil
-import time
-import psutil
-import logging
-from datetime import datetime
 
 # Simulate sourcing external scripts -  
 # You'd integrate the necessary functions from setState.sh and profilingStep.sh here 
@@ -58,26 +54,32 @@ def remove_files():
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
-
-    folder_path = os.path.join('/tmp', 'inputdata')
+    
+    folder_path = os.path.join('/tmp', 'FCoutput')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
     
-    folder_path = os.path.join('/tmp', 'output')
+    # make FCoutput folder
+    os.makedirs('/tmp/FCoutput', exist_ok=True)
+
+    folder_path = os.path.join('/tmp', 'FCcontext')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
 
+    # make contextFolder folder if it does not exist
+    os.makedirs('/tmp/FCcontext', exist_ok=True)
+
 # Start the main process
 if __name__ == "__main__":
-    config_file = "config_file.json"
-    config = load_config(config_file)  # Loads configuration into a dictionary
-    address = config["enclaveManagerAddress"]
+    config_file = "config.json"
+    config = load_config(config_file)
+    address = config["address"]
     
     #PPDX_SDK.profiling_steps('Application Start', 0)
     #remove_profiling_file()
@@ -89,8 +91,7 @@ if __name__ == "__main__":
         sys.exit(1)  # Exit with an error code
 
     github_raw_link = sys.argv[1]
-    # address = "https://enclave-manager-amd.iudx.io"
-    # Validate the link
+    json_context = sys.argv[2]
     if not github_raw_link.startswith("https://raw.githubusercontent.com/"):
         print("Error: Invalid GitHub raw link format.")
         sys.exit(1)
@@ -99,27 +100,26 @@ if __name__ == "__main__":
     print("\nStep 1")
     box_out("Pulling Docker Compose from GitHub...")
     PPDX_SDK.setState("Step 1","Pulling Docker Compose from GitHub...",1,10,address)
-    #PPDX_SDK.profiling_steps('Step 1', 1)
     PPDX_SDK.pull_compose_file(github_raw_link)
     print('Extracting docker link...')
     link = subprocess.check_output(["sudo", "docker", "compose", "config", "--images"]).decode().strip()
     print("Image information:", link)
 
-
-    # Step 2 - Key generation
-    print("\nStep 2") 
-    box_out("Generating and saving key pair...")
-    PPDX_SDK.setState("Step 2","Generating and saving key pair...",2,10,address)
-    #PPDX_SDK.profiling_steps('Step 2', 2)
-    PPDX_SDK.generate_and_save_key_pair()
-
-    # Step 3 - Docker image pulling
-    print("\nStep 3")
+    # Step 2 - Docker image pulling
+    print("\nStep 2")
     box_out("Pulling docker image...")
-    PPDX_SDK.setState("Step 3","Pulling docker image...",3,10,address)
-    #PPDX_SDK.profiling_steps('Step 3', 3)
-    PPDX_SDK.pull_docker_image(link)
-    print("Pulled docker")
+    PPDX_SDK.setState("Step 2","Pulling docker image...",2,10,address)
+    sha_digest = PPDX_SDK.pull_docker_image(link)
+    print("Pulled docker & got sha digest")
+
+
+    # Step 3 - Spawning container
+    print("\nStep 3") 
+    box_out("Spawning Container..")
+    PPDX_SDK.setState("Step 3","Spawning Container..",3,10,address)
+    PPDX_SDK.spawn_container(sha_digest, json_context)
+    print("Application running..")
+
 
     # Step 4 - Measuring image and storing in vTPM
     print("\nStep 4")

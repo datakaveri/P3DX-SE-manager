@@ -1,0 +1,10 @@
+{
+    "apd_url": "https://ts.adex.org.in/auth/v1/token",
+    "clientId": "ec3e85c5-dc2f-406b-9772-50fcbcba7047",
+    "clientSecret": "7718a228cd2acb578e5f28d9241cb1d466b96151",
+    "Content-Type": "application/json",
+    "itemId": "c5422a0f-e60f-48e4-9d1e-1fa4b1714900", 
+    "itemType": "resource",
+    "role": "consumer",
+    "rs_url": "<replace with resource server url>"
+}
