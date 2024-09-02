@@ -1,6 +1,5 @@
 #Byte-compiled / optimized / DLL files
 __pycache__
-profiling.json
 /keys/
 /token_verification/
 /vm_pcr_verification/

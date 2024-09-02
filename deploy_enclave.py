@@ -80,9 +80,7 @@ if __name__ == "__main__":
     config_file = "config.json"
     config = load_config(config_file)
     address = config["address"]
-    
-    #PPDX_SDK.profiling_steps('Application Start', 0)
-    #remove_profiling_file()
+
     remove_files()
 
     if len(sys.argv) < 2:
