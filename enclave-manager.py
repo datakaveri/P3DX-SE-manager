@@ -9,7 +9,7 @@ app = Flask(__name__)
 #default /state response (when application is not running)
 state = {
     "step": 0,
-    "maxSteps": 9,
+    "maxSteps": 5,
     "title": "Inactive",
     "description": "Inactive",
 }
@@ -27,13 +27,6 @@ def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
 
-    global state
-    state = {
-        "step": 0,
-        "maxSteps": 10,
-        "title": "Inactive",
-        "description": "Inactive",
-    }
     #check if the application is already running, if yes, return response saying so
     if is_app_running:
         response={
@@ -42,15 +35,24 @@ def deploy_enclave():
         }
         return jsonify(response), 400
 
+    global state
+    state = {
+        "step": 1,
+        "maxSteps": 5,
+        "title": "Spawning Trusted Execution Environment (TEE)",
+        "description": "Spawning Trusted Execution Environment (TEE)",
+    }
+    
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
     docker_compose_url = content["url"]
-    #json_config = content.get("config", {})
+    #json_context = content.get("config", {})
     json_context = {
         "PPB_no": "T01050090085",
-        "crop" : "Bajra",
-        "crop_area" : "0.5",
-        "season" : "Kharif"
+        "crop" : "Coriander",
+        "crop_area" : 1.5,
+        "season" : "Rabi", 
+        "land_type" :"Irr"
     }
     
     try:
@@ -83,7 +85,7 @@ def get_inference():
                 "description": "No inference output found."
             }
         return jsonify(response), 403
-    output_file = "/tmp/output/results.json"
+    output_file = "/tmp/FCoutput/output.json"
     if os.path.isfile(output_file):
         f=open(output_file, "r")
         content = f.read()

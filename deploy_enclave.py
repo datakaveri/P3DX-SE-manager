@@ -47,13 +47,6 @@ def remove_files():
         print(f"Removed file: {file_path}")
     else:
         print(f"File not found: {file_path}")
-
-    folder_path = os.path.join('.', 'keys')
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
-    else:
-        print(f"Folder not found: {folder_path}")
     
     folder_path = os.path.join('/tmp', 'FCoutput')
     if os.path.exists(folder_path):
