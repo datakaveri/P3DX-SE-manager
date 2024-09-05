@@ -6,25 +6,10 @@ import json
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-import Crypto
-from Crypto.PublicKey import RSA
-import base64
-import hashlib
 import json
-import _pickle as pickle
-from Crypto.Cipher import PKCS1_OAEP
-from cryptography.fernet import Fernet
-import tarfile
 import urllib.parse
-import shutil
-#AMD:
-# 1. generate key pair - DONE
-# 2. measure docker & store in vTPM
-# 3. combine public key & vTPM report & send to MAA & return jwt token
-# 4. send attestation token (public key embedded) to APD & get back access token
-# rest steps are same
-# steps 3 & 4 : use hardcoded token
-# docker compose
+import csv
+
 
 def pull_compose_file(url, filename='docker-compose.yml'):
     try:
@@ -40,81 +25,9 @@ def pull_compose_file(url, filename='docker-compose.yml'):
         print(f"Error downloading content: {e}")
 
 def pull_docker_image(app_name):
-    # read config file
-    with open('config.json', 'r') as file:
-        config = json.load(file)
-
-    github_username = config["github_username"]
-    github_token = config["github_token"]
-
-    # login to github container registry
-    print("Logging in to GitHub Container Registry...")
-    login_command = f"echo {github_token} | docker login ghcr.io -u {github_username} --password-stdin"
-    result = subprocess.run(login_command, shell=True, capture_output=True, text=True)
-
-    if result.returncode == 0:
-        print("Logged in successfully!")
-    else:
-        print("Failed to login:", result.stderr)
-        sys.exit(1)
-
+    # Pull Docker image
     print("Pulling docker image")
-    result = subprocess.run(["docker", "pull", app_name])
-    if result.returncode != 0: 
-        print("Failed to pull the Docker image")
-        sys.exit
-    print("Docker image pulled successfully")
-    
-    # Fetch the SHA256 digest of the image
-    app_name = app_name.replace("ghcr.io/", "")
-
-    repo_name, image_and_tag = app_name.split('/')
-    image_name, tag = image_and_tag.split(':')
-
-    # GitHub Container Registry API URL
-    url = f"https://ghcr.io/v2/{repo_name}/{image_name}/manifests/{tag}"
-
-    # Make the API request
-    response = requests.get(url, auth=(github_username, github_token))
-
-    if response.status_code == 200:
-        data = response.json()
-        sha256_digest = data['config']['digest'].replace('sha256:', '')
-        print(f"SHA256 digest for image '{app_name}' is: {sha256_digest}")
-        return sha256_digest
-    else:
-        print(f"Failed to fetch the digest. Status code: {response.status_code}")
-        print(f"Response: {response.text}")
-        sys.exit(1)
-
-
-def spawn_container(sha_digest, json_context):
-    # put the sha_digest in the json_context
-    json_context["sha_digest"] = sha_digest
-
-    temp_dir = os.path.expanduser("/tmp")
-    context_dir = os.path.join(temp_dir, "FCcontext")
-
-    # write the json_context to /tmp/FCcontext/context.json
-    with open(os.path.join(context_dir, "context.json"), "w") as file:
-        json.dump(json_context, file)
-
-    # spawn the container by running the docker-compose file
-    print("Spawning the container...")
-    subprocess.Popen(["sudo", "docker" , "compose", "up"])
-    print("Container spawned successfully!")
-
-    
-
-
-        
-
-
-
-
-
-
-
+    subprocess.run(["sudo", "docker", "pull", app_name])
 
 
 # Generate Public-Private Key Pair
@@ -210,10 +123,7 @@ def measureDockervTPM(link):
                 else:
                     print("Unexpected output format:", line)
             json_string = json.dumps(pcr_values)
-            # Write the PCR values to a text file
-            # with open(os.path.join('keys', 'pcr_values.txt'), 'w') as file:
-            #     for pcr_number, pcr_value in pcr_values.items():
-            #         file.write(f"{pcr_number}: {pcr_value}\n")
+
             with open(os.path.join('keys', 'pcr_values.json'), 'w') as file:
                 file.write(json_string)
             print("PCR values written to file successfully!")
@@ -239,15 +149,12 @@ def execute_guest_attestation():
 
 
 #APD verifies quote and releases token
-def getTokenFromAPD(jwt_file,config_file):
+def getAttestationToken(config):
 
-    with open(config_file, 'r') as file:
-        config = json.load(file)
+    auth_server_url= config["apd_url"]
+    headers={'clientId': "73599b23-6550-4f01-882d-a2db75ba24ba", 'clientSecret': "15a874120135e4eed4782c8b51385649fee55562", 'Content-Type': config["Content-Type"]}
 
-    apd_url=config["apd_url"]
-    headers={'clientId': config["clientId"], 'clientSecret': config["clientSecret"], 'Content-Type': config["Content-Type"]}
-
-    with open('keys/'+jwt_file, 'r') as file:
+    with open('keys/jwt-response.txt', 'r') as file:
         token = file.read().strip()
 
     context={
@@ -255,85 +162,209 @@ def getTokenFromAPD(jwt_file,config_file):
             }
 
     data={
-            "itemId": config["itemId"],
+            "itemId": "8bdebc63-ccb0-4930-bdbb-60ea9d7f7599",
             "itemType": config["itemType"],
             "role": config["role"],
             "context": context
          }
     dataJson=json.dumps(data)
-    r= requests.post(apd_url,headers=headers,data=dataJson)
+    r= requests.post(auth_server_url,headers=headers,data=dataJson)
+
     if(r.status_code==200):
-        print("Token verified and Token recieved.")
+        print("Attestation Token verified and Token recieved.")
         jsonResponse=r.json()
         token=jsonResponse.get('results').get('accessToken')
         print(token)
         return token
     else:
-        print("Token verification failed.", r.text)
-        sys.exit() 
+        print("Attestation Token fetching failed.", r.text)
+        with open("output/output.json", "w") as f:
+            # make status code 900 & status as "Error" to indicate that the process has failed
+            json.dump({"status_code": "900", "status": "TEE Attestation error"}, f)
+
+def getADEXDataAccessTokens(config):
+    auth_server_url=config["auth_server_url"]
+    headers = {
+        "clientId": config["clientId"],
+        "clientSecret": config["clientSecret"],
+        "Content-Type": "application/json"
+    }
+    data = {
+        "itemId": config["adex_url"],
+        "itemType": "resource_server",
+        "role": config["role"]
+    }
+
+    dataJson = json.dumps(data)
+    r = requests.post(auth_server_url, headers=headers, data=dataJson)
+
+    if r.status_code == 200:
+        print("ADEX Data access Token verified and Token recieved.")
+        jsonResponse = r.json()
+        token = jsonResponse.get('results').get('accessToken')
+        print(token)
+        return token
+    else:
+        print("ADEX data access Token fetching failed.", r.text)
+
+def getFarmerDataToken(config, ppb_number):
+
+    auth_server_url=config["auth_server_url"]
+    headers={'clientId': config["clientId"], 'clientSecret': config["clientSecret"], 'Content-Type': config["Content-Type"]}
+
+    context = {
+        "ppbNumber": ppb_number
+    }
+    data={
+        "itemId": config["FarmerData_itemID"],
+        "itemType": config["itemType"],
+        "role": config["role"],
+        "context": context
+    }
+    
+    dataJson=json.dumps(data)
+    r= requests.post(auth_server_url,headers=headers,data=dataJson)
+
+    if(r.status_code==200):
+        print("Rytabandhu Consent Token verified and Token recieved.")
+        jsonResponse=r.json()
+        token=jsonResponse.get('results').get('accessToken')
+        print(token)
+        return token 
+    else:
+        print("Farmer data access Token fetching failed.", r.text)
+    
 
 #Send token to resource server for verification & get encrypted images  
-def getFileFromResourceServer(token):
-    rs_url = "https://authenclave.iudx.io/resource_server/encrypted.store"
-    rs_headers={'Authorization': f'Bearer {token}'}
-    rs=requests.get(rs_url,headers=rs_headers)
+def getSOFDataFromADEX(config, token):
+    rs_url = config["SOF_url"]
+    headers = {
+        "token": token,
+        "Content-Type": "application/json"  
+    }
+    rs=requests.get(rs_url,headers=headers)
     if rs.status_code == 200:
-        print("Token authenticated and Encrypted images received.")
-        loadedDict = pickle.loads(rs.content)
-        # Write the loadedDict to a file
-        with open("loadedDict.pkl", "wb") as file:
-            pickle.dump(loadedDict, file)
-        print("loadedDict written to loadedDict.pkl file.")
+        print("SOF data fetched successfully.")
+
+        # extract the results dictionary from response & store it in SOF_data.json in data folder
+        jsonResponse = rs.json()
+        results = jsonResponse.get('results')
+        filtered_data = [item for item in results if item['evaluationYear'] == "2024-2025"]
+
+        # if SOF_data.csv exists, delete it
+        # store in /tmp/FCinput directory as SOF_data.csv
+        file_path = os.expanduser('~/tmp/FCinput/SOF_data.csv')
+        with open(file_path, 'w', newline='') as csvfile:
+            # Define the CSV field names
+            fieldnames = ['Crop', 'maxSOF']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in filtered_data:
+                writer.writerow({'Crop': item['cropNameCommon'], 'maxSOF': item['maxSOF']})
+        print("SOF data written to SOF_data.csv file.")
     else:
-        print("Token authentication failed.",rs.text)
-        sys.exit()
+        print(f"Failed to fetch SOF data. Status code: {rs.status_code}")
+        print(f"Response content: {rs.text}")
 
-#Decrypt images recieved using enclave's private key
-def decryptFile():
-    print("In decryptFile")
-    
-    with open('keys/private_key.pem', "r") as pem_file:
-        private_key = pem_file.read()
-        print('Using Private Key to Decrypt data')
-    
-    key = RSA.import_key(private_key)
+def getYieldDataFromADEX(config, token):
+    rs_url = config["Yield_url"]
+    headers = {
+        "token": token,
+        "Content-Type": "application/json"  
+    }
+    rs=requests.get(rs_url,headers=headers)
+    if rs.status_code == 200:
+        print("Yield data fetched successfully.")
 
-    # Read the loadedDict from the file
-    with open("loadedDict.pkl", "rb") as file:
-        loadedDict = pickle.load(file)
-    b64encryptedKey=loadedDict["encryptedKey"]
-    encData=loadedDict["encData"]
-    encryptedKey=base64.b64decode(b64encryptedKey)
-    decryptor = PKCS1_OAEP.new(key)
-    plainKey=decryptor.decrypt(encryptedKey)
-    print("Symmetric key decrypted using the enclave's private RSA key.")
-    fernetKey = Fernet(plainKey)
-    decryptedData = fernetKey.decrypt(encData)
+        # extract the results dictionary from response & store it in SOF_data.json in data folder
+        jsonResponse = rs.json()
+        results = jsonResponse.get('results')
+        # with open('data/Yield_data.json', 'w') as file:
+        #     json.dump(results, file)
+        filtered_data = [item for item in results if item['year'] == 2024]
 
-    temp_dir = os.path.expanduser("/tmp")
+        file_path = os.expanduser('~/tmp/FCinput/Yield_data.csv')
+        with open(file_path, 'w', newline='') as csvfile:
+            # Define the CSV field names
+            fieldnames = ['district', 'crop', 'season', 'yield']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in filtered_data:
+                writer.writerow({'district' : item['districtName'], 'crop': item['commodityName'], 'season': item['cropSeason'], 'yield': item['targetYield']})
+            print("Yield data written to Yield_data.csv file.")
+    else:
+        print(f"Failed to fetch Yield data. Status code: {rs.status_code}")
+        print(f"Response content: {rs.text}")
 
-    decrypted_data_path = os.path.join(temp_dir, "decryptedData.tar.gz")
-    extracted_data_path = os.path.join(temp_dir, "inputdata")
+def getAPMCDataFromADEX(config, token):
+    rs_url = config["APMC_url"]
+    headers = {
+        "token": token,
+        "Content-Type": "application/json"  
+    }
+    rs=requests.get(rs_url,headers=headers)
+    if rs.status_code == 200:
+        print("APMC data fetched successfully.")
 
-    # Remove existing content from the data paths if they exist
-    for data_path in [decrypted_data_path, extracted_data_path]:
-        if os.path.exists(data_path):
-            if os.path.isdir(data_path):
-                shutil.rmtree(data_path)
-            else:
-                os.remove(data_path)
+        # extract the results dictionary from response & store it in SOF_data.json in data folder
+        jsonResponse = rs.json()
+        results = jsonResponse.get('results')
+        # with open('data/APMC_data.json', 'w') as file:
+        #     json.dump(results, file)
+        filtered_data = [item for item in results if item['year'] == 2025]
 
-    # Create the directories if they don't exist
-    os.makedirs(extracted_data_path, exist_ok=True)
-    # Write the decrypted data to a file
-    with open(decrypted_data_path, "wb") as f:
-        f.write(decryptedData)
-    print("Data written")
-    # Extract the contents of the tar.gz file
-    tar=tarfile.open(decrypted_data_path)
-    tar.extractall(extracted_data_path)
-    print("Images decrypted.",os.listdir(extracted_data_path))
-    print("Images stored in tmp directory")
+        file_path = os.expanduser('~/tmp/FCinput/APMC_data.csv')
+        with open(file_path, 'w', newline='') as csvfile:
+            # Define the CSV field names
+            fieldnames = ['district', 'crop', 'season', 'price']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in filtered_data:
+                writer.writerow({'district' : item['districtName'], 'crop': item['commodityName'], 'season': item['cropSeason'], 'price': item['totalPrice']})
+        print("APMC data written to APMC_data.csv file.")
+    else:
+        print(f"Failed to fetch APMC data. Status code: {rs.status_code}")
+        print(f"Response content: {rs.text}")
+
+
+def getFarmerData(config, ppb_number, farmer_data_token):
+    # Define the URL and parameters
+    url = config["farmer_data_url"]
+    params = {
+        "id": "c5422a0f-e60f-48e4-9d1e-1fa4b1714900",
+        "q": f"Ppbno=={ppb_number}",
+        "time": "2023-01-25T12:01:05Z",
+        "endtime": "2023-02-01T12:01:05Z",
+        "timerel": "during"
+    }
+
+    # Define the headers
+    headers = {
+        "token": farmer_data_token
+    }
+
+    try:
+        # Make the GET request
+        response = requests.get(url, headers=headers, params=params)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            print("Farmer data fetched successfully.")
+            
+            file_path = os.expanduser('~/tmp/FCinput/farmer_data.json')
+
+            # Write the response content to a file
+            with open(file_path, "wb") as file:
+                file.write(response.content)
+            print("Farmer data written to farmer_data.json file.")
+        else:
+            print(f"Failed to fetch farmer data. Status code: {response.status_code}")
+            print(f"Response content: {response.text}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred while making the request: {e}")
+
+
 
 #function to set state of enclave
 def setState(title,description,step,maxSteps,address):
@@ -352,46 +383,4 @@ def call_set_state_endpoint(state, address):
 
     #print response
     print(r.text)
-
-
-#Chunk Functions:
-def dataChunkN(n, url, access_token, key):
-    loadedDict=getChunkFromResourceServer(n, url, access_token)
-    if loadedDict:
-        decryptChunk(loadedDict, key)
-        return 1
-    else:
-        return 0 
-    
-def getChunkFromResourceServer (n,url,token):
-    print("Getting chunk from the resource server..")
-    rs_headers={'Authorization': f'Bearer {token}'}
-    rs_url = f"{url}{n}"
-    print(rs_url)
-    rs=requests.get(rs_url,headers=rs_headers)
-    if(rs.status_code==200):
-        print("Token authenticated and Encrypted images recieved.")
-        loadedDict=pickle.loads(rs.content)
-        #print(loadedDict.keys())
-        return loadedDict
-    else:
-        print(rs.text)
-        return None
-
-def decryptChunk(loadedDict,key):
-    print("Decrypting chunk..")
-    b64encryptedKey=loadedDict["encryptedKey"]
-    encData=loadedDict["encData"]
-    encryptedKey=base64.b64decode(b64encryptedKey)
-    decryptor = PKCS1_OAEP.new(key)
-    plainKey=decryptor.decrypt(encryptedKey)
-    print("Symmetric key decrypted using the enclave's private RSA key.")
-    fernetKey = Fernet(plainKey)
-    decryptedData = fernetKey.decrypt(encData)
-    print(os.listdir("../"))
-    with open('../inputdata/outfile.gz', "wb") as f:
-        f.write(decryptedData)
-    print("Chunk decrypted and saved in /inputdata/outfile.gz.")
-
-    
 
