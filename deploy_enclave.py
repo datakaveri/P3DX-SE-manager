@@ -4,6 +4,7 @@ import PPDX_SDK
 import sys
 import json
 import shutil
+import argparse
 
 # Simulate sourcing external scripts -  
 # You'd integrate the necessary functions from setState.sh and profilingStep.sh here 
@@ -88,6 +89,21 @@ def remove_files():
 
 # Start the main process
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('docker_compose_url', type=str, help='The Docker Compose URL')
+    parser.add_argument('json_context', type=str, help='The JSON context as a string')
+
+    args = parser.parse_args()
+    github_raw_link = args.docker_compose_url
+    json_context_str = args.json_context
+
+    try:
+        context = json.loads(json_context_str)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
+
+
     config_file = "config.json"
     config = load_config(config_file)
     address = config["address"]
@@ -99,18 +115,18 @@ if __name__ == "__main__":
         print("Usage: sudo python3 deploy_enclave.py <github_raw_link>")
         sys.exit(1)  # Exit with an error code
 
-    github_raw_link = sys.argv[1]
-    # read json context being passed as arg
-    json_context = sys.argv[2]
     if not github_raw_link.startswith("https://raw.githubusercontent.com/"):
         print("Error: Invalid GitHub raw link format.")
         sys.exit(1)
 
-    with open(json_context) as f:
-        context = json.load(f)
+    ppb_number = context["PPB_no"]
 
-    sha_digest = context["sha_digest"]
-    ppb_number = context["ppb_number"]
+    folder_path = os.path.expanduser("/tmp/FCcontext")
+    file_path = os.path.join(folder_path, "context.json")
+
+    with open(file_path, 'w') as file:
+        json.dump(context, file, indent=4)
+
 
     # Step 1 - Pulling docker compose & extracting docker image link
     box_out("Pulling Docker Compose from GitHub...")
@@ -168,4 +184,6 @@ if __name__ == "__main__":
     # Executing the application  
     box_out("Running the Application...")
     PPDX_SDK.setState("Computing farmer credit amount in TEE", "Step 4",4,5,address)
-    kisaan_loan_amount, consumer_loan_amount = app.main()
+    subprocess.run(["sudo", "docker", "compose", 'up'])
+
+    PPDX_SDK.setState("Secure Computation Complete", "Step 5", 5, 5, address)

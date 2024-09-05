@@ -3,6 +3,7 @@ from flask import Flask, jsonify, Response
 from flask import request
 import subprocess
 import os
+import json
 
 app = Flask(__name__)
 
@@ -45,15 +46,16 @@ def deploy_enclave():
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
     docker_compose_url = content["url"]
-    #json_context = content.get("context", {})
-    json_context = {
-        "PPB_no": "T01050090085",
-        "crop" : "Coriander",
-        "crop_area" : 1.5,
-        "season" : "Rabi", 
-        "land_type" :"Irr"
-    }
-    
+    context = content.get("context", {})
+    # context = {
+    #     "PPB_no": "T01050090085",
+    #     "crop" : "Coriander",
+    #     "crop_area" : 0.05,
+    #     "season" : "Rabi", 
+    #     "land_type" :"Irr"
+    # }
+    json_context = json.dumps(context)
+    print(json_context)
     try:
         subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
         is_app_running = True
@@ -78,7 +80,7 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
-    if(state["step"]!=10):
+    if(state["step"]!=5):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
@@ -109,7 +111,7 @@ def setState():
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-    if(state["step"]==10):
+    if(state["step"]==5):
         #Resetting deploy flag as false
         is_app_running = False
     response = app.response_class(
