@@ -88,18 +88,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Step 1 - Pulling docker compose & extracting docker image link
-    print("\nStep 1")
     box_out("Pulling Docker Compose from GitHub...")
-    PPDX_SDK.setState("Step 1","Pulling Docker Compose from GitHub...",1,10,address)
     PPDX_SDK.pull_compose_file(github_raw_link)
     print('Extracting docker link...')
     link = subprocess.check_output(["sudo", "docker", "compose", "config", "--images"]).decode().strip()
     print("Image information:", link)
 
     # Step 2 - Docker image pulling
-    print("\nStep 2")
     box_out("Pulling docker image...")
-    PPDX_SDK.setState("Step 2","Pulling docker image...",2,10,address)
     sha_digest = PPDX_SDK.pull_docker_image(link)
     print("Pulled docker & got sha digest")
 
@@ -107,61 +103,5 @@ if __name__ == "__main__":
     # Step 3 - Spawning container
     print("\nStep 3") 
     box_out("Spawning Container..")
-    PPDX_SDK.setState("Step 3","Spawning Container..",3,10,address)
     PPDX_SDK.spawn_container(sha_digest, json_context)
     print("Application running..")
-
-
-    # Step 4 - Measuring image and storing in vTPM
-    print("\nStep 4")
-    box_out("Measuring Docker image into vTPM...")
-    PPDX_SDK.setState("Step 4","Measuring Docker image into vTPM...",4,10,address)
-    #PPDX_SDK.profiling_steps('Step 4', 4)
-    PPDX_SDK.measureDockervTPM(link)
-    print("Measured and stored in vTPM")
-
-    # Step 5 - Send VTPM & public key to MAA & get attestation token
-    print("\nStep 5")
-    box_out("Guest Attestation Executing...")
-    PPDX_SDK.setState("Step 5","Guest Attestation Executing...",5,10,address)
-    #PPDX_SDK.profiling_steps('Step 5', 5)
-    PPDX_SDK.execute_guest_attestation()
-    print("Guest Attestation complete. JWT received from MAA")
-
-    # Step 6 - Send the JWT to APD
-    print("\nStep 6")
-    box_out("Sending JWT to APD for verification...")
-    PPDX_SDK.setState("Step 6","Sending JWT to APD for verification...",6,10,address)
-    #PPDX_SDK.profiling_steps('Step 6', 6)
-    token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', 'config_file.json')
-    print("Access token received from APD")
-
-    # Step 7 - Docker image pulling
-    print("\nStep 7")
-    box_out("Getting files from RS...")
-    PPDX_SDK.setState("Step 7","Getting files from RS...",7,10,address)
-    #PPDX_SDK.profiling_steps('Step 7', 7)
-    PPDX_SDK.getFileFromResourceServer(token)
-
-    # Step 8 - Docker image pulling
-    print("\nStep 8")
-    box_out("Decrypting & storing files...")
-    PPDX_SDK.setState("Step 8","Decrypting & storing files...",8,10,address)
-    #PPDX_SDK.profiling_steps('Step 8', 8)
-    PPDX_SDK.decryptFile()
-    #PPDX_SDK.profiling_inputImages()
-    print("Files decrypted and stored in /tmp/inputdata")
-
-    # Executing the application in the docker
-    print("\nStep 9")
-    box_out("Running the Application...")
-    PPDX_SDK.setState("Step 9","Running Application...",9,10,address)
-    #PPDX_SDK.profiling_steps('Step 9', 9)
-    subprocess.run(["sudo", "docker", "compose", 'up'])
-
-    print("\nStep 10")
-    PPDX_SDK.setState("Step 10","Finished Application Execution",10,10,address)
-    #PPDX_SDK.profiling_steps('Step 10', 10)
-    #PPDX_SDK.profiling_totalTime()
-    print('DONE')
-    print('Output saved to /tmp/output')

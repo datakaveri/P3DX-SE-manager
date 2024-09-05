@@ -26,7 +26,6 @@ def before_request():
 def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
-
     #check if the application is already running, if yes, return response saying so
     if is_app_running:
         response={
@@ -40,13 +39,13 @@ def deploy_enclave():
         "step": 1,
         "maxSteps": 5,
         "title": "Spawning Trusted Execution Environment (TEE)",
-        "description": "Spawning Trusted Execution Environment (TEE)",
+        "description": "Step 1"
     }
     
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
     docker_compose_url = content["url"]
-    #json_context = content.get("config", {})
+    #json_context = content.get("context", {})
     json_context = {
         "PPB_no": "T01050090085",
         "crop" : "Coriander",

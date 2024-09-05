@@ -101,12 +101,11 @@ def spawn_container(sha_digest, json_context):
 
     # spawn the container by running the docker-compose file
     print("Spawning the container...")
-    process = subprocess.run(["sudo", "docker", "compose", 'up'])
-    if process.returncode == 0:
-        print("Container spawned successfully!")
-    else:
-        print("Failed to spawn the container")
-        sys.exit(1)
+    subprocess.Popen(["sudo", "docker" , "compose", "up"])
+    print("Container spawned successfully!")
+
+    
+
 
         
 
