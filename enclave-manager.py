@@ -52,7 +52,7 @@ def deploy_enclave():
     
     try:
         #process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
-        process=subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+        subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
         is_app_running = True
     
         response={
@@ -66,6 +66,7 @@ def deploy_enclave():
             status=500,
             mimetype="application/json"
         )
+        is_app_running = False
     print("RUNNING FLAG: ",is_app_running)
     return response
 
