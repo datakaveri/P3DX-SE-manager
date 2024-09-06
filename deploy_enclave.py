@@ -119,7 +119,7 @@ if __name__ == "__main__":
         print("Error: Invalid GitHub raw link format.")
         sys.exit(1)
 
-    ppb_number = context["PPB_no"]
+    ppb_number = context["ppb_number"]
 
     folder_path = os.path.expanduser("/tmp/FCcontext")
     file_path = os.path.join(folder_path, "context.json")
