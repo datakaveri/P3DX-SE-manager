@@ -16,5 +16,5 @@
     "Yield_url": "https://rs.ts.adex.org.in/ngsi-ld/v1/entities?id=6407a6cd-0210-4563-9de9-b95df752a792&q=id%3D%3D6407a6cd-0210-4563-9de9-b95df752a792",
     "SOF_url": "https://rs.ts.adex.org.in/ngsi-ld/v1/entities?q=id==bee0e5cd-1c05-4501-81db-4068af891ac3&id=bee0e5cd-1c05-4501-81db-4068af891ac3",
     "adex_url" : "rs.ts.adex.org.in", 
-    "farmer_data_url": "https://gateway.adex.org.in/ngsi-ld/v1/temporal/entities"
+    "rs_proxy_url": "https://farm-proxy.p3dx.iudx.io/ngsi-ld/v1/temporal/entities"
 }

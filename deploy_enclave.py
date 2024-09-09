@@ -179,7 +179,7 @@ if __name__ == "__main__":
     PPDX_SDK.getAPMCDataFromADEX(config, adexDataToken)
 
     # getting Rytabandhu farmer data
-    PPDX_SDK.getFarmerData(config, ppb_number, farmerDataToken)
+    PPDX_SDK.getFarmerData(config, ppb_number, farmerDataToken, attestationToken)
 
     # Executing the application  
     box_out("Running the Application...")

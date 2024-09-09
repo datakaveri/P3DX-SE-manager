@@ -330,20 +330,21 @@ def getAPMCDataFromADEX(config, token):
         print(f"Response content: {rs.text}")
 
 
-def getFarmerData(config, ppb_number, farmer_data_token):
+def getFarmerData(config, ppb_number, farmer_data_token, attestation_token):
     # Define the URL and parameters
-    url = config["farmer_data_url"]
+    url = config["rs_proxy_url"]
     params = {
         "id": "c5422a0f-e60f-48e4-9d1e-1fa4b1714900",
         "q": f"Ppbno=={ppb_number}",
-        "time": "2023-01-25T12:01:05Z",
-        "endtime": "2023-02-01T12:01:05Z",
+        "time": "2023-06-25T12:01:05Z",
+        "endtime": "2024-06-01T12:01:05Z",
         "timerel": "during"
     }
 
     # Define the headers
     headers = {
-        "token": farmer_data_token
+        "Consent-Token": farmer_data_token, 
+        "Enclave-Token": attestation_token
     }
 
     try:
