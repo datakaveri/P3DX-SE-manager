@@ -41,7 +41,7 @@ def pull_compose_file(url, filename='docker-compose.yml'):
 def pull_docker_image(app_name):
     # Pull Docker image
     print("Pulling docker image")
-    subprocess.run(["sudo", "docker", "pull", app_name])
+    subprocess.run(["docker", "pull", app_name])
 
 
 # Generate Public-Private Key Pair
