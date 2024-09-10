@@ -6,9 +6,23 @@ import json
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+import Crypto
+from Crypto.PublicKey import RSA
+import base64
+import hashlib
 import json
+import requests
+import _pickle as pickle
+from Crypto.Cipher import PKCS1_OAEP
+from cryptography.fernet import Fernet
+import tarfile
 import urllib.parse
+import datetime
+import psutil
+import gzip
 import csv
+import shutil
+import json
 
 
 def pull_compose_file(url, filename='docker-compose.yml'):
@@ -182,6 +196,8 @@ def getAttestationToken(config):
             # make status code 900 & status as "Error" to indicate that the process has failed
             json.dump({"status_code": "900", "status": "TEE Attestation error"}, f)
 
+
+# ADEX SPECIFIC FUNCTIONS
 def getADEXDataAccessTokens(config):
     auth_server_url=config["auth_server_url"]
     headers = {
@@ -368,6 +384,73 @@ def getFarmerData(config, ppb_number, farmer_data_token, attestation_token):
 
     except requests.exceptions.RequestException as e:
         print(f"An error occurred while making the request: {e}")
+
+
+
+# PNEUMONIA/YOLO SPECIFIC FUNCTIONS
+#Send token to resource server for verification & get encrypted images  
+def getFileFromResourceServer(token):
+    rs_url = "https://authenclave.iudx.io/resource_server/encrypted.store"
+    rs_headers={'Authorization': f'Bearer {token}'}
+    rs=requests.get(rs_url,headers=rs_headers)
+    if rs.status_code == 200:
+        print("Token authenticated and Encrypted images received.")
+        loadedDict = pickle.loads(rs.content)
+        # Write the loadedDict to a file
+        with open("loadedDict.pkl", "wb") as file:
+            pickle.dump(loadedDict, file)
+        print("loadedDict written to loadedDict.pkl file.")
+    else:
+        print("Token authentication failed.",rs.text)
+        sys.exit()
+
+#Decrypt images recieved using enclave's private key
+def decryptFile():
+    print("In decryptFile")
+    
+    with open('keys/private_key.pem', "r") as pem_file:
+        private_key = pem_file.read()
+        print('Using Private Key to Decrypt data')
+    
+    key = RSA.import_key(private_key)
+
+    # Read the loadedDict from the file
+    with open("loadedDict.pkl", "rb") as file:
+        loadedDict = pickle.load(file)
+    b64encryptedKey=loadedDict["encryptedKey"]
+    encData=loadedDict["encData"]
+    encryptedKey=base64.b64decode(b64encryptedKey)
+    decryptor = PKCS1_OAEP.new(key)
+    plainKey=decryptor.decrypt(encryptedKey)
+    print("Symmetric key decrypted using the enclave's private RSA key.")
+    fernetKey = Fernet(plainKey)
+    decryptedData = fernetKey.decrypt(encData)
+
+    temp_dir = os.path.expanduser("/tmp")
+
+    decrypted_data_path = os.path.join(temp_dir, "decryptedData.tar.gz")
+    extracted_data_path = os.path.join(temp_dir, "inputdata")
+
+    # Remove existing content from the data paths if they exist
+    for data_path in [decrypted_data_path, extracted_data_path]:
+        if os.path.exists(data_path):
+            if os.path.isdir(data_path):
+                shutil.rmtree(data_path)
+            else:
+                os.remove(data_path)
+
+    # Create the directories if they don't exist
+    os.makedirs(extracted_data_path, exist_ok=True)
+    # Write the decrypted data to a file
+    with open(decrypted_data_path, "wb") as f:
+        f.write(decryptedData)
+    print("Data written")
+    # Extract the contents of the tar.gz file
+    tar=tarfile.open(decrypted_data_path)
+    tar.extractall(extracted_data_path)
+    print("Images decrypted.",os.listdir(extracted_data_path))
+    print("Images stored in tmp directory")
+
 
 
 

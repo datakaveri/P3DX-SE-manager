@@ -7,6 +7,8 @@ import json
 
 app = Flask(__name__)
 
+app_name = ""
+
 #default /state response (when application is not running)
 state = {
     "step": 0,
@@ -27,6 +29,7 @@ def before_request():
 def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
+    global app_name
     #check if the application is already running, if yes, return response saying so
     if is_app_running:
         response={
@@ -42,7 +45,6 @@ def deploy_enclave():
         "title": "Spawning Trusted Execution Environment (TEE)",
         "description": "Step 1"
     }
-    
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
     docker_compose_url = content["url"]
@@ -57,9 +59,15 @@ def deploy_enclave():
     json_context = json.dumps(context)
     print(json_context)
     try:
-        subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
+        if context:
+            subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
+            app_name = "farmer_credit"
+
+        else:
+            subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
+            app_name = "pneumonia"
+
         is_app_running = True
-    
         response={
             "title": "Success",
             "description": "Application execution has started."
@@ -80,13 +88,26 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
+    global app_name
     if(state["step"]!=5):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
             }
         return jsonify(response), 403
-    output_file = "/tmp/FCoutput/output.json"
+
+    if(app_name == "farmer_credit"):    
+        output_file = "/tmp/FCoutput/output.json"
+    elif(app_name == "pneumonia"):
+        output_file = "/tmp/output/results.json"
+    else:
+        response={
+                "title": "Error: Incorrect app",
+                "description": "No inference output found."
+            }
+        return jsonify(response), 403
+
+
     if os.path.isfile(output_file):
         f=open(output_file, "r")
         content = f.read()
