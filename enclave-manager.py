@@ -4,6 +4,7 @@ from flask import request
 import subprocess
 import os
 import json
+import stat
 
 app = Flask(__name__)
 
@@ -106,6 +107,20 @@ def get_inference():
                 "description": "No inference output found."
             }
         return jsonify(response), 403
+    
+    try:
+    # Check if the file exists first
+        if os.path.exists(output_file):
+            # Get the current permissions of the file
+            current_permissions = os.stat(output_file).st_mode
+            
+            # Add write permissions for the owner, group, and others
+            os.chmod(output_file, current_permissions | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+            print(f"Write permissions added for {output_file}")
+        else:
+            print(f"File {output_file} does not exist.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 
     if os.path.isfile(output_file):
