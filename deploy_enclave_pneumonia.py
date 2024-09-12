@@ -136,9 +136,9 @@ if __name__ == "__main__":
 
     # Executing the application in the docker
     box_out("Running the Application...")
-    PPDX_SDK.setState("Computing farmer credit amount in TEE", "Step 4",4,5,address)
+    PPDX_SDK.setState("Running pneumonia detection application", "Step 4",4,5,address)
     subprocess.run(["sudo", "docker", "compose", 'up'])
 
-    PPDX_SDK.setState("Secure Computation Complete", "Step 5", 5, 5, address)
+    PPDX_SDK.setState("Secure Execution Complete", "Step 5", 5, 5, address)
     print('DONE')
     print('Output saved to /tmp/output')
