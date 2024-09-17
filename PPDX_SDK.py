@@ -188,7 +188,7 @@ def getAttestationToken(config):
         print("Attestation Token verified and Token recieved.")
         jsonResponse=r.json()
         token=jsonResponse.get('results').get('accessToken')
-        print(token)
+        #print(token)
         return token
     else:
         print("Attestation Token fetching failed.", r.text)
@@ -218,7 +218,7 @@ def getADEXDataAccessTokens(config):
         print("ADEX Data access Token verified and Token recieved.")
         jsonResponse = r.json()
         token = jsonResponse.get('results').get('accessToken')
-        print(token)
+        #print(token)
         return token
     else:
         print("ADEX data access Token fetching failed.", r.text)
@@ -245,7 +245,7 @@ def getFarmerDataToken(config, ppb_number):
         print("Rytabandhu Consent Token verified and Token recieved.")
         jsonResponse=r.json()
         token=jsonResponse.get('results').get('accessToken')
-        print(token)
+        #print(token)
         return token 
     else:
         print("Farmer data access Token fetching failed.", r.text)
