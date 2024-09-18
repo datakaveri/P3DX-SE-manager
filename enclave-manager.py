@@ -12,7 +12,7 @@ app = Flask(__name__)
 #default /state response (when application is not running)
 state = {
     "step": 0,
-    "maxSteps": 13,
+    "maxSteps": 5,
     "title": "Inactive",
     "description": "Inactive",
 }
@@ -31,10 +31,10 @@ def deploy_enclave():
     global is_app_running
     global state
     state = {
-        "step": 0,
-        "maxSteps": 13,
-        "title": "Inactive",
-        "description": "Inactive",
+        "step": 1,
+        "maxSteps": 5,
+        "title": "Spawning Trusted Execution Environment (TEE)",
+        "description": "Step 1"
     }
     #check if the application is already running, if yes, return response saying so
     if is_app_running:
@@ -76,7 +76,7 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
-    if(state["step"]!=13):
+    if(state["step"]!=5):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
@@ -107,7 +107,7 @@ def setState():
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-    if(state["step"]==13):
+    if(state["step"]==5):
         #Resetting deploy flag as false
         is_app_running = False
     response = app.response_class(
@@ -119,5 +119,5 @@ def setState():
 #STATE: Returns the current state of the enclave as a JSON object
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
-    global state # = {"step":3, "maxSteps":13, "title": "Building enclave,", "description":"The enclave is being compiled,"}
+    global state # = {"step":3, "maxSteps":5, "title": "Building enclave,", "description":"The enclave is being compiled,"}
     return jsonify(state) 

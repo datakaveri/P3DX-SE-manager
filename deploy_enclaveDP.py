@@ -109,7 +109,6 @@ if __name__ == "__main__":
     # Step 1 - Pulling docker compose & extracting docker image link
     print("\nStep 1")
     box_out("Pulling Docker Compose from GitHub...")
-    PPDX_SDK.setState("Step 1","Pulling Docker Compose from GitHub...",1,13,address)
     PPDX_SDK.pull_compose_file(github_raw_link)
     print('Extracting docker link...')
     link = subprocess.check_output(["sudo", "docker", "compose", "config", "--images"]).decode().strip()
@@ -118,48 +117,43 @@ if __name__ == "__main__":
     # Step 2 - Key generation
     print("\nStep 2") 
     box_out("Generating and saving key pair...")
-    PPDX_SDK.setState("Step 2","Generating and saving key pair...",2,13,address)
+    PPDX_SDK.setState("TEE Attestation & Authorisation", "Step 2",2,5,address)
     key=PPDX_SDK.generate_and_save_key_pair()
 
     # Step 3 - Docker image pulling
     print("\nStep 3")
     box_out("Pulling docker image...")
-    PPDX_SDK.setState("Step 3","Pulling docker image...",3,13,address)
     PPDX_SDK.pull_docker_image(link)
     print("Pulled docker")
 
     # Step 4 - Measuring image and storing in vTPM
     print("\nStep 4")
     box_out("Measuring Docker image into vTPM...")
-    PPDX_SDK.setState("Step 4","Measuring Docker image into vTPM...",4,13,address)
     PPDX_SDK.measureDockervTPM(link)
     print("Measured and stored in vTPM")
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     print("\nStep 5")
     box_out("Guest Attestation Executing...")
-    PPDX_SDK.setState("Step 5","Guest Attestation Executing...",5,13,address)
     PPDX_SDK.execute_guest_attestation()
     print("Guest Attestation complete. JWT received from MAA: ")
 
     # Step 6 - Send the JWT to APD
     print("\nStep 6")
     box_out("Sending JWT to APD for verification...")
-    PPDX_SDK.setState("Step 6","Sending JWT to APD for verification...",6,13,address)
     token=PPDX_SDK.getTokenFromAPD('jwt-response.txt', config, dataset, rs_url)
     print("Access token received from APD")
 
     # Step 7 - Pulling config file from RS: 
     print("\nStep 7")
     box_out("Pulling DP application config")
-    PPDX_SDK.setState("Step 8","Getting config from RS...",7,13,address)
+    PPDX_SDK.setState("Getting data into Secure enclave","Step 3",3,5,address)
     PPDX_SDK.pullconfig(config_url, token, key)
     print("Config pulled & stored")
 
     # Step 8 - Pulling chunks, decrypting & storing 
     print("\nStep 8")
     box_out("Getting files from RS, decrypting and storing locally...")
-    PPDX_SDK.setState("Step 8","Getting chunks from RS...",8,13,address)
     count=0
     lengthList=[]
     while True:
@@ -178,27 +172,24 @@ if __name__ == "__main__":
     # Executing the application in the docker
     print("\nStep 9")
     box_out("Running the Application...")
-    PPDX_SDK.setState("Step 9","Running Application...",9,13,address)
+    PPDX_SDK.setState("Performing secure de-identification in TEE", "Step 4",4,5,address)
     subprocess.run(["sudo", "docker", "compose", 'up'])
     print('Output saved to /tmp/output')
 
     print("\nStep 10")
     print("Getting inference encryption key from RS..")
-    PPDX_SDK.setState("Step 10","Getting inference encryption key from RS..",10,13,address)
     inference_key=PPDX_SDK.getInferenceFernetKey(key, inferencekey_url, token)
     print("Got back inference key: ", inference_key)
 
     print("\nStep 11")
     print("Encrypting Inference using inference key")
-    PPDX_SDK.setState("Step 11","Encrypting Inference..",11,13,address)
     inference=PPDX_SDK.encryptInference(inference_key)
     print("Inference encrypted")
 
     print("\nStep 12")
     print("Sending encrypted inference to RS")
-    PPDX_SDK.setState("Step 12","Sending encrypted inference to RS..",12,13,address)
     PPDX_SDK.sendInference(inference, token, inference_url)
     print("Inference sent to RS")
 
     print('DONE')
-    PPDX_SDK.setState("Step 13","Finished Application Execution",13,13,address)
+    PPDX_SDK.setState("Secure Computation Complete", "Step 5", 5, 5, address)
