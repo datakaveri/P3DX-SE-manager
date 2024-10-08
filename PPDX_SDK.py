@@ -494,3 +494,150 @@ def sendInference(inference, access_token, url):
     #         print("Request failed with status code: ", response.status_code)
     #         print(response.text)
     # print("DONE")
+
+
+
+# K-Anon (ARX) FUNCTIONS
+
+def decryptChunk_KAnon(loadedDict, n, key):
+    print("Decrypting chunk..")
+    b64encryptedKey=loadedDict["encryptedKey"]
+    encData=loadedDict["encData"]
+    encryptedKey=base64.b64decode(b64encryptedKey)
+    decryptor = PKCS1_OAEP.new(key)
+    plainKey=decryptor.decrypt(encryptedKey)
+
+    fernetKey = Fernet(plainKey)
+    decryptedData = fernetKey.decrypt(encData)
+
+    temp_dir = os.path.expanduser("/tmp/arx_input")
+    decrypted_data_folder = os.path.join(temp_dir, "encrypted_data")
+    extracted_data_folder = os.path.join(temp_dir, "input_file")
+
+    if not os.path.exists(extracted_data_folder):
+        os.makedirs(extracted_data_folder)
+    if not os.path.exists(decrypted_data_folder):
+        os.makedirs(decrypted_data_folder)
+
+    decrypted_data_path = os.path.join(decrypted_data_folder, f"outfile{n}.gz")
+    
+    if os.path.exists(decrypted_data_path):
+        os.remove(decrypted_data_path)
+
+    with open(decrypted_data_path, "wb") as f:
+        f.write(decryptedData)
+
+    with gzip.open(decrypted_data_path, 'rb') as file:
+        data = file.read().decode('utf-8')
+        json_data = json.loads(data)
+    
+    outfile_path = os.path.join(extracted_data_folder, f"data{n}.csv")
+
+    # Open the CSV file for writing
+    with open(outfile_path, 'w', newline='', encoding='utf-8') as csvfile:
+        # Get the fieldnames (column headers) from the keys of the first record
+        fieldnames = json_data[0].keys() if json_data else []
+
+        # Create a CSV DictWriter object
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        # Write the header row (column names)
+        writer.writeheader()
+
+        # Write each record as a row in the CSV
+        for record in json_data:
+            writer.writerow(record)
+
+
+def encryptInference_KAnon(inference_key):
+    print("Encrypting inference")
+    output_file = os.path.expanduser("/tmp/arx_output/response.json")
+    config_dir = os.path.expanduser("/tmp/arx_input/config")
+
+    with open(output_file, 'r') as f:
+        concat_output = json.load(f)
+
+    files = os.listdir(config_dir)
+    if len(files) != 1:
+        raise Exception(f"Expected exactly one file in {config_dir}, but found {len(files)} files.")
+        
+    config_file = files[0]
+    config_file_path = os.path.join(config_dir, config_file)
+
+    with open(config_file_path, 'r') as f:
+        config = json.load(f)
+
+    concat_output["dataset"] = config["data_type"]
+
+    with open(output_file, 'w') as f:
+        json.dump(concat_output, f, indent=4)
+    
+    inference_file = os.path.expanduser("/tmp/arx_output/inference.json")
+    os.rename(output_file, inference_file)
+    print(f"File renamed and saved as {inference_file}")
+
+    print("Encrypting the output file")
+    tarball = "pipelineOutput.tar"
+    tar = tarfile.open(tarball, "w")
+    tar.add(inference_file, arcname="inference.json")
+    tar.close()
+
+    fernet_key_bytes = inference_key
+    fernet = Fernet(fernet_key_bytes)
+
+    #encrypt the tarball
+    dataFile = open(tarball, "r+b")
+    inference_data = dataFile.read()
+    enc_inference = fernet.encrypt(inference_data)
+    
+    data = {"encInference": enc_inference, "tarName": "pipelineOutput.tar"}
+    pickled_data = pickle.dumps(data)
+    os.remove(tarball)
+
+    return pickled_data
+
+def dataChunkN_KAnon(n, url, access_token, key):
+    count=n
+    loadedDict=getChunkFromResourceServer(count, url, access_token)
+    if loadedDict:
+        decryptChunk_KAnon(loadedDict, count, key)
+        return 1
+    else:
+        return 0 
+    
+
+def pullconfig_KAnon(url, token, key):
+    print("Pulling DP application config from RS..")
+    access_token=token
+    rs_url=url
+
+    auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = {'Authorization': auth }
+
+    response = requests.get(rs_url, headers=headers)
+    if response.status_code == 200:
+        loadedDict = pickle.loads(response.content)
+        print("Data downloaded successfully")
+
+        b64encryptedKey=loadedDict["encryptedKey"]
+        encConfig=loadedDict["encConfig"]
+        encryptedKey=base64.b64decode(b64encryptedKey)
+        decryptor = PKCS1_OAEP.new(key)
+        plainKey=decryptor.decrypt(encryptedKey)
+        print("Symmetric key decrypted using the enclave's private RSA key.")
+
+        fernetKey = Fernet(plainKey)
+        decryptedConfig = fernetKey.decrypt(encConfig)
+        print("Config decrypted")
+
+        decryptedConfigStr = decryptedConfig.decode('utf-8')
+        decryptedConfigDict = json.loads(decryptedConfigStr)
+
+        config_path = os.path.expanduser("/tmp/arx_input/config")
+        config_file = os.path.join(config_path, "config.json")
+
+        with open(config_file, 'w') as json_file:
+            json.dump(decryptedConfigDict, json_file, indent=4)
+        print("Decrypted config written to tmp/DPinput/config")
+    else:
+        print(f"Failed to download file. Status code: {response.status_code}")

@@ -45,14 +45,20 @@ def deploy_enclave():
         return jsonify(response), 400
 
     content = request.json
+    print("CONTENT")
+    print(content)
 
     dataset_name = content["dataset_name"]
     rs_url = content["rs_url"]
     docker_compose_url = content["url"]
+    app = content["repo"]
     
     try:
         #process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
-        subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+        if(app == "anon-pipeline-AMD"):
+            subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+        elif(app == "K-anonymisation-AMD"):
+            subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
         is_app_running = True
     
         response={
