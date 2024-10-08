@@ -20,6 +20,8 @@ state = {
 #setting the flag as false when the application is not running
 is_app_running = False
 
+app_name = ""
+
 @app.before_request
 def before_request():
     return
@@ -30,6 +32,7 @@ def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
     global state
+    global app_name
     state = {
         "step": 1,
         "maxSteps": 5,
@@ -51,13 +54,13 @@ def deploy_enclave():
     dataset_name = content["dataset_name"]
     rs_url = content["rs_url"]
     docker_compose_url = content["url"]
-    app = content["repo"]
+    app_name = content["repo"]
     
     try:
         #process=subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url])
-        if(app == "anon-pipeline-AMD"):
+        if(app_name == "anon-pipeline-AMD"):
             subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
-        elif(app == "K-anonymisation-AMD"):
+        elif(app_name == "K-anonymisation-AMD"):
             subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
         is_app_running = True
     
@@ -82,13 +85,17 @@ def deploy_enclave():
 def get_inference():
     print("STARTING inference")
     global state
+    global app_name
     if(state["step"]!=5):
         response={
                 "title": "Error: No Inference Output/File does not exist",
                 "description": "No inference output found."
             }
         return jsonify(response), 403
-    output_file = "/tmp/DPoutput/inference.json"
+    if(app_name == "K-anonymisation-AMD"):
+        output_file = "/tmp/arx_output/inference.json"
+    else:
+        output_file = "/tmp/DPoutput/inference.json"
     if os.path.isfile(output_file):
         f=open(output_file, "r")
         content = f.read()
