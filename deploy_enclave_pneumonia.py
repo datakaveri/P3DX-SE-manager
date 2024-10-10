@@ -59,19 +59,37 @@ def remove_files():
     else:
         print(f"Folder not found: {folder_path}")
 
+    # Define and remove '/tmp/inputdata' if it exists
     folder_path = os.path.join('/tmp', 'inputdata')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
-    
+
+    # Recreate the folder
+    os.makedirs(folder_path)
+    print(f"Recreated folder: {folder_path}")
+
+    # Give 'a+x' permissions to the folder
+    os.chmod(folder_path, 0o755)  # '755' gives rwxr-xr-x (a+x)
+    print(f"Set a+x permissions on folder: {folder_path}")
+
+    # Define and remove '/tmp/output' if it exists
     folder_path = os.path.join('/tmp', 'output')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
         print(f"Removed folder and contents: {folder_path}")
     else:
         print(f"Folder not found: {folder_path}")
+
+    # Recreate the folder
+    os.makedirs(folder_path)
+    print(f"Recreated folder: {folder_path}")
+
+    # Give 'a+x' permissions to the folder
+    os.chmod(folder_path, 0o755)  # '755' gives rwxr-xr-x (a+x)
+    print(f"Set a+x permissions on folder: {folder_path}")
 
 # Start the main process
 if __name__ == "__main__":
