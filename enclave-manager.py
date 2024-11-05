@@ -49,6 +49,9 @@ def deploy_enclave():
     }
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
+    print("Content:", content)
+    
+    app_name = content["repo"]
     docker_compose_url = content["url"]
     context = content.get("context", {})
     # context = {
@@ -60,15 +63,18 @@ def deploy_enclave():
     # }
     json_context = json.dumps(context)
     print(json_context)
+
     try:
         if context:
             subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
-            app_name = "farmer_credit"
 
         else:
-            subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
-            app_name = "pneumonia"
-
+            if app_name == "anon_pipeline_AMD":
+                dataset_name = content["dataset_name"]
+                rs_url = content["rs_url"]
+                subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+            else:
+                subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
         is_app_running = True
         response={
             "title": "Success",
@@ -101,9 +107,11 @@ def get_inference():
             }
         return jsonify(response), 403
 
-    if(app_name == "farmer_credit"):    
+    if app_name == "anon_pipeline_AMD":
+        output_file = "/tmp/DPoutput/inference.json"
+    elif app_name == "Smart Credit App":
         output_file = "/tmp/FCoutput/output.json"
-    elif(app_name == "pneumonia"):
+    elif app_name in ["AMD_SEV_PNEUMONIA_APP", "AMD_SEV_YOLO_APP"]:
         output_file = "/tmp/output/results.json"
     else:
         response={
