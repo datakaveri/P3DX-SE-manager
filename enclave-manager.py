@@ -73,6 +73,10 @@ def deploy_enclave():
                 dataset_name = content["dataset_name"]
                 rs_url = content["rs_url"]
                 subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+            elif app_name == "K-anonymisation-AMD":
+                dataset_name = content["dataset_name"]
+                rs_url = content["rs_url"]
+                subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
             else:
                 subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
         is_app_running = True
@@ -109,6 +113,8 @@ def get_inference():
 
     if app_name == "anon_pipeline_AMD":
         output_file = "/tmp/DPoutput/inference.json"
+    elif app_name == "K-anonymisation-AMD":
+        output_file = "/tmp/arx_output/inference.json"
     elif app_name == "Smart Credit App":
         output_file = "/tmp/FCoutput/output.json"
     elif app_name in ["AMD_SEV_PNEUMONIA_APP", "AMD_SEV_YOLO_APP"]:
