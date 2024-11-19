@@ -1,0 +1,20 @@
+{
+    "address": "http://0.0.0.0:4000",
+    "auth_server_url": "https://ts.adex.org.in/auth/v1/token",
+    "apd_url" : "https://authvertx.iudx.io/auth/v1/token",
+    "clientId": "ec3e85c5-dc2f-406b-9772-50fcbcba7047",
+    "clientSecret": "7718a228cd2acb578e5f28d9241cb1d466b96151",
+    "Content-Type": "application/json",
+    "AttestationitemId": "<dummy item ID for attestation>",
+    "yieldData_itemID": "<item ID for yield data>",
+    "APMCData_itemID": "<item ID for APMC data>",
+    "SOFData_itemID": "<item ID for SOF data>",
+    "FarmerData_itemID": "c5422a0f-e60f-48e4-9d1e-1fa4b1714900",
+    "itemType": "resource",
+    "role": "consumer",
+    "APMC_url": "https://rs.ts.adex.org.in/ngsi-ld/v1/entities?id=832e3e20-8bf7-4b48-84f3-28128dea3847&q=id%3D%3D832e3e20-8bf7-4b48-84f3-28128dea3847",
+    "Yield_url": "https://rs.ts.adex.org.in/ngsi-ld/v1/entities?id=6407a6cd-0210-4563-9de9-b95df752a792&q=id%3D%3D6407a6cd-0210-4563-9de9-b95df752a792",
+    "SOF_url": "https://rs.ts.adex.org.in/ngsi-ld/v1/entities?q=id==bee0e5cd-1c05-4501-81db-4068af891ac3&id=bee0e5cd-1c05-4501-81db-4068af891ac3",
+    "adex_url" : "rs.ts.adex.org.in", 
+    "rs_proxy_url": "https://farm-proxy.p3dx.iudx.io/ngsi-ld/v1/temporal/entities"
+}
