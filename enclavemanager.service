@@ -1,0 +1,11 @@
+[Unit]
+Description=AMD enclave manager systemd service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/sgx-enclave-manager
+ExecStart=/home/ubuntu/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave-manager:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

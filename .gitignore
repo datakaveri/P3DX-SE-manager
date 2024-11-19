@@ -1,3 +1,9 @@
 #Byte-compiled / optimized / DLL files
 __pycache__
-profiling.json
+/keys/
+loadedDict.pkl
+/token_verification/
+/vm_pcr_verification/
+/attestation-and-verification.py/
+/test-function.py/
+docker-compose.yml
