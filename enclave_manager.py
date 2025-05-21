@@ -32,14 +32,14 @@ def before_request():
 def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
-    global app_name
+    # global app_name
     #check if the application is already running, if yes, return response saying so
-    if is_app_running:
-        response={
-            "title": "Error",
-            "description": "Application is already running." 
-        }
-        return jsonify(response), 400
+    # if is_app_running:
+    #     response={
+    #         "title": "Error",
+    #         "description": "Application is already running." 
+    #     }
+    #     return jsonify(response), 400
 
     # global state
     # state = {
@@ -50,17 +50,18 @@ def deploy_enclave():
     # }
 
     config_file = "config.json"
-    config = load_config(config_file)
+    with open(config_file, 'r') as f:
+        config = json.load(f)
     address_coco = config["address_coco"]
 
-    PPDX_SDK.setState("Spawning Trusted Execution Environment (TEE)","Step 1",1,5, address_coco)
+    PPDX_SDK.setState("Spawning Trusted Execution Environment (Confidential Container Workflow)","Step 1",1,5, address_coco)
 
     # take as parameters the docker-compose.yml file and the json co
     content = request.json
     print("Content:", content)
     
-    app_name = content["repo"]
-    docker_compose_url = content["url"]
+    # app_name = content["repo"]
+    # docker_compose_url = content["url"]
     context = content.get("context", {})
     # context = {
     #     "PPB_no": "T01050090085",
@@ -72,11 +73,21 @@ def deploy_enclave():
     json_context = json.dumps(context)
     print(json_context)
 
-    try:
-        if context:
-            # subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
-            # command to start (kubectl)
+    with open("context.json", "w") as f:
+        f.write(json_context)
 
+
+    try:
+        # subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
+        print("starting")
+        # command to start (kubectl)
+        os.system("kubectl delete -f farmer-credit.yaml")
+        os.system("kubectl delete configmap farmer-credit-app-context")
+        
+        os.system("kubectl create configmap farmer-credit-app-context --from-file=context.json")
+        os.system("kubectl apply -f farmer-credit.yaml")
+
+        '''
         else:
             if app_name == "anon_pipeline_AMD":
                 dataset_name = content["dataset_name"]
@@ -88,10 +99,9 @@ def deploy_enclave():
                 subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
             else:
                 subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
+        '''
 
-        PPDX_SDK.setState("Secure Computation Complete", "Step 5", 5, 5, address_coco)
-
-        is_app_running = True
+        # is_app_running = True
         response={
             "title": "Success",
             "description": "Application execution has started."
@@ -106,7 +116,7 @@ def deploy_enclave():
     print("RUNNING FLAG: ",is_app_running)
     return response
 
-
+'''
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
@@ -195,3 +205,4 @@ def get_state():
     global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
     return jsonify(state) 
 
+'''
