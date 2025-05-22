@@ -2,9 +2,9 @@
 Description=AMD enclave manager systemd service
 
 [Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/sgx-enclave-manager
-ExecStart=/home/ubuntu/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave-manager:app
+User=azureuser
+WorkingDirectory=/home/azureuser/P3DX-SE-manager
+ExecStart=/home/azureuser/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave_manager:app
 Restart=always
 
 [Install]

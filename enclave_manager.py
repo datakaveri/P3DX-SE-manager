@@ -54,7 +54,7 @@ def deploy_enclave():
         config = json.load(f)
     address_coco = config["address_coco"]
 
-    PPDX_SDK.setState("Spawning Trusted Execution Environment (Confidential Container Workflow)","Step 1",1,5, address_coco)
+    PPDX_SDK.setState("Spawning Confidential Container Workload","Step 1",1,5, address_coco)
 
     # take as parameters the docker-compose.yml file and the json co
     content = request.json

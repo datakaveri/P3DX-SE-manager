@@ -7,3 +7,4 @@ loadedDict.pkl
 /attestation-and-verification.py/
 /test-function.py/
 docker-compose.yml
+context.json
