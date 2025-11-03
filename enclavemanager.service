@@ -3,7 +3,7 @@ Description=AMD enclave manager systemd service
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/sgx-enclave-manager
+WorkingDirectory=/home/ubuntu/P3DX-SE-manager
 ExecStart=/home/ubuntu/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave-manager:app
 Restart=always
 

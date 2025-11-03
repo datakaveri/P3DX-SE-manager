@@ -103,7 +103,7 @@ def measureDockervTPM(link):
         print(f"Fetching SHA256 digest for Docker image '{docker_image}'...")
         repo_name, tag = docker_image.split(':')
         # Query Docker Hub API to get image info
-        response = requests.get(f"https://registry.hub.docker.com/v2/repositories/{repo_name}/tags/{tag}")
+        response = requests.get(f"https://registry.hub.docker.com/v2/repositories/geekyjit/my_federation/tags/modified")
         if response.status_code == 200:
             data = response.json()
             sha256_digest = data['images'][0]['digest'].replace('sha256:', '')

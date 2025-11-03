@@ -1,7 +1,39 @@
 #Byte-compiled / optimized / DLL files
-__pycache__
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Certificates and keys
+*.pem
+cert.pem
+key.pem
 /keys/
+
+# Build directories
+build/
+*/build/
+CMakeFiles/
+*.cmake
+!CMakeLists.txt
+
+# IDE settings
+.vscode/
+.idea/
+
+# Compiled binaries
+AttestationClient
+
+# Data files
 loadedDict.pkl
+*.pkl
+*.pbuf
+
+# Project specific
 /token_verification/
 /vm_pcr_verification/
 /attestation-and-verification.py/
