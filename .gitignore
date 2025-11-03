@@ -1,5 +1,11 @@
 #Byte-compiled / optimized / DLL files
 __pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Project specific
 /keys/
 loadedDict.pkl
 /token_verification/
@@ -7,3 +13,60 @@ loadedDict.pkl
 /attestation-and-verification.py/
 /test-function.py/
 docker-compose.yml
+
+# CMake and C++ build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+*.make
+
+# Compiled object files
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Executables and binaries
+*.exe
+*.out
+*.app
+*.bin
+AttestationClient
+a.out
+
+# Build directories
+build/
+_build/
+dist/
+*.egg-info/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled dependencies
+*.d
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Certificates (if sensitive)
+# Uncomment if needed:
+# *.crt
+# *.pem
+# *.key
