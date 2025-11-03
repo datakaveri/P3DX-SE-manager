@@ -65,8 +65,6 @@ dist/
 *.bak
 *.cache
 
-# Certificates (if sensitive)
-# Uncomment if needed:
-# *.crt
-# *.pem
-# *.key
+*.crt
+*.pem
+*.key
