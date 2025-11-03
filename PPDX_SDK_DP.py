@@ -641,3 +641,15 @@ def pullconfig_KAnon(url, token, key):
         print("Decrypted config written to tmp/DPinput/config")
     else:
         print(f"Failed to download file. Status code: {response.status_code}")
+
+
+
+
+
+
+
+
+
+
+
+

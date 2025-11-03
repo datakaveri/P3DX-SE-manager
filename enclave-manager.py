@@ -1,17 +1,21 @@
-#mport requests
-from flask import Flask, jsonify, Response
-from flask import request
+# Enclave Manager Flask API
+from flask import Flask, jsonify, Response, request
+from flask_cors import CORS
 import subprocess
 import os
 import json
-import stat
 import logging
+import threading
+
+# Import log capture module
+from log_capture import clear_logs, get_all_logs, stream_and_capture_box_logs
+
 
 app = Flask(__name__)
-
+CORS(app)
 app_name = ""
 
-#default /state response (when application is not running)
+# Default /state response (when application is not running)
 state = {
     "step": 0,
     "maxSteps": 5,
@@ -19,12 +23,14 @@ state = {
     "description": "Inactive",
 }
 
-#setting the flag as false when the application is not running
+# Setting the flag as false when the application is not running
 is_app_running = False
+
 
 @app.before_request
 def before_request():
     return
+
 
 #DEPLOY: Deploys the enclave, builds & runs the application & saves the output in a file
 @app.route("/enclave/deploy", methods=["POST"])
@@ -32,9 +38,10 @@ def deploy_enclave():
     print("STARTING deploy")
     global is_app_running
     global app_name
-    #check if the application is already running, if yes, return response saying so
+    
+    # Check if the application is already running, if yes, return response saying so
     if is_app_running:
-        response={
+        response = {
             "title": "Error",
             "description": "Application is already running." 
         }
@@ -47,40 +54,33 @@ def deploy_enclave():
         "title": "Spawning Trusted Execution Environment (TEE)",
         "description": "Step 1"
     }
-    # take as parameters the docker-compose.yml file and the json co
+    
     content = request.json
     print("Content:", content)
     
     app_name = content["repo"]
     docker_compose_url = content["url"]
     context = content.get("context", {})
-    # context = {
-    #     "PPB_no": "T01050090085",
-    #     "crop" : "Coriander",
-    #     "crop_area" : 0.05,
-    #     "season" : "Rabi", 
-    #     "land_type" :"Irr"
-    # }
     json_context = json.dumps(context)
     print(json_context)
 
     try:
         if context:
-            subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
-
+            subprocess.Popen(["sudo", "python3", "deploy_enclave.py", docker_compose_url, json_context])
         else:
             if app_name == "anon_pipeline_AMD":
                 dataset_name = content["dataset_name"]
                 rs_url = content["rs_url"]
-                subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
+                subprocess.Popen(["sudo", "python3", "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
             elif app_name == "K-anonymisation-AMD":
                 dataset_name = content["dataset_name"]
                 rs_url = content["rs_url"]
-                subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
+                subprocess.Popen(["sudo", "python3", "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
             else:
-                subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
+                subprocess.Popen(["sudo", "python3", "deploy_enclave_FL-Client.py", docker_compose_url])
+        
         is_app_running = True
-        response={
+        response = {
             "title": "Success",
             "description": "Application execution has started."
         }
@@ -91,24 +91,27 @@ def deploy_enclave():
             status=500,
             mimetype="application/json"
         )
-    print("RUNNING FLAG: ",is_app_running)
+    
+    print("RUNNING FLAG:", is_app_running)
     return response
 
 
 #INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
 @app.route("/enclave/inference", methods=["GET"])
 def get_inference():
-    # print("STARTING inference")
     logger = logging.getLogger()
-    logging.debug('STARTING INFERNCE')
-    logger.handlers[0].flush()
+    logging.debug('STARTING INFERENCE')
+    if logger.handlers:
+        logger.handlers[0].flush()
+    
     global state
     global app_name
-    if(state["step"]!=5):
-        response={
-                "title": "Error: No Inference Output/File does not exist",
-                "description": "No inference output found."
-            }
+    
+    if state["step"] != 5:
+        response = {
+            "title": "Error: No Inference Output/File does not exist",
+            "description": "No inference output found."
+        }
         return jsonify(response), 403
 
     if app_name == "anon_pipeline_AMD":
@@ -120,10 +123,10 @@ def get_inference():
     elif app_name in ["AMD_SEV_PNEUMONIA_APP", "AMD_SEV_YOLO_APP"]:
         output_file = "/tmp/output/results.json"
     else:
-        response={
-                "title": "Error: Incorrect app",
-                "description": "No inference output found."
-            }
+        response = {
+            "title": "Error: Incorrect app",
+            "description": "No inference output found."
+        }
         return jsonify(response), 403
     
     if os.path.exists(output_file):
@@ -132,31 +135,28 @@ def get_inference():
             result = subprocess.run(['sudo', 'chmod', '755', output_file], 
                                     check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            # Check result
             if result.returncode == 0:
                 print(f"Successfully set a+x permissions on file: {output_file}")
             else:
                 print(f"Failed to set permissions. Error: {result.stderr.decode()}")
-
         except subprocess.CalledProcessError as e:
             print(f"Error executing sudo chmod: {e.stderr.decode()}")
     else:
         print(f"File not found: {output_file}")
 
-
     if os.path.isfile(output_file):
-        f=open(output_file, "r")
-        content = f.read()
+        with open(output_file, "r") as f:
+            content = f.read()
         response = app.response_class(
             response=content,
             mimetype="application/json"
         )
         return response
     else:
-        response={
-                "title": "Error: No Inference Output/File does not exist",
-                "description": "No inference output found."
-            }
+        response = {
+            "title": "Error: No Inference Output/File does not exist",
+            "description": "No inference output found."
+        }
         return jsonify(response), 403
 
 
@@ -168,9 +168,11 @@ def setState():
     print("In /enclave/setstate...")
     content = request.json
     state = content["state"]
-    if(state["step"]==5):
-        #Resetting deploy flag as false
+    
+    if state["step"] == 5:
+        # Resetting deploy flag as false
         is_app_running = False
+    
     response = app.response_class(
         response="{ok}", status=200, mimetype="application/json"
     )
@@ -180,5 +182,80 @@ def setState():
 #STATE: Returns the current state of the enclave as a JSON object
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
-    global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
-    return jsonify(state) 
+    global state
+    return jsonify(state)
+
+
+#START: Starts the enclave
+@app.route("/enclave/start", methods=["POST"])
+def start_enclave():
+    start_enclave_script = "/home/ubuntu/start_enclave.sh"
+    
+    if not os.path.exists(start_enclave_script):
+        return jsonify({
+            "title": "Error: start script not found",
+            "description": f"Missing: {start_enclave_script}"
+        }), 500
+    
+    try:
+        # Clear prior logs when a new run starts
+        clear_logs()
+        
+        # Execute the shell script with stdout capture to get box_out logs
+        proc = subprocess.Popen(
+            ["sudo", "bash", start_enclave_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+        )
+        threading.Thread(target=stream_and_capture_box_logs, args=(proc,), daemon=True).start()
+        
+        response = app.response_class(
+            response="{ok}", status=200, mimetype="application/json"
+        )
+        return response
+    except Exception as e:
+        response = {
+            "title": "Error: Failed to start enclave",
+            "description": str(e)
+        }
+        return jsonify(response), 500
+
+
+#LOGS: Returns captured box_out logs as simple messages
+@app.route("/enclave/logs", methods=["GET"])
+def get_enclave_logs():
+    """
+    Returns only the message content from box_out logs.
+    Response: {"logs": ["message1", "message2", ...], "count": N}
+    """
+    try:
+        logs = get_all_logs()
+        return jsonify({
+            "logs": logs,
+            "count": len(logs)
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "title": "Error: Failed to fetch logs",
+            "description": str(e)
+        }), 500
+
+
+#STATUS: Returns enclave status
+@app.route("/enclave/status", methods=["GET"])
+def get_status():
+    status_script = "/home/ubuntu/status_enclave.sh"
+    try:
+        subprocess.Popen(["sudo", "bash", status_script])
+        response = app.response_class(
+            response="{ok}", status=200, mimetype="application/json"
+        )
+        return response
+    except Exception as e:
+        response = {
+            "title": "Error: Failed to get enclave status",
+            "description": str(e)
+        }
+        return jsonify(response), 500

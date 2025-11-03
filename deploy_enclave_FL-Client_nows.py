@@ -1,3 +1,4 @@
+
 import subprocess
 import os
 import PPDX_SDK
@@ -30,14 +31,14 @@ def box_out(message):
     max_width = max(len(line) for line in lines)  # Find longest line
 
     # Top border
-    print("+" + "-" * (max_width + 2) + "+")
+    print("+" + "-" * (max_width + 2) + "+", flush=True)
 
     # Content with padding
     for line in lines:
-        print("| " + line.ljust(max_width) + " |")
+        print("| " + line.ljust(max_width) + " |", flush=True)
 
     # Bottom border
-    print("+" + "-" * (max_width + 2) + "+")
+    print("+" + "-" * (max_width + 2) + "+", flush=True)
 
 
 def remove_profiling_file():
@@ -48,48 +49,48 @@ def remove_files():
     file_path = os.path.join('.','docker-compose.yml')
     if os.path.exists(file_path):
         os.remove(file_path)
-        print(f"Removed file: {file_path}")
+        print(f"Removed file: {file_path}", flush=True)
     else:
-        print(f"File not found: {file_path}")
+        print(f"File not found: {file_path}", flush=True)
 
     folder_path = os.path.join('.', 'keys')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
+        print(f"Removed folder and contents: {folder_path}", flush=True)
     else:
-        print(f"Folder not found: {folder_path}")
+        print(f"Folder not found: {folder_path}", flush=True)
 
     # Define and remove '/tmp/inputdata' if it exists
     folder_path = os.path.join('/tmp', 'inputdata')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
+        print(f"Removed folder and contents: {folder_path}", flush=True)
     else:
-        print(f"Folder not found: {folder_path}")
+        print(f"Folder not found: {folder_path}", flush=True)
 
     # Recreate the folder
     os.makedirs(folder_path)
-    print(f"Recreated folder: {folder_path}")
+    print(f"Recreated folder: {folder_path}", flush=True)
 
     # Give 'a+x' permissions to the folder
     os.chmod(folder_path, 0o755)  # '755' gives rwxr-xr-x (a+x)
-    print(f"Set a+x permissions on folder: {folder_path}")
+    print(f"Set a+x permissions on folder: {folder_path}", flush=True)
 
     # Define and remove '/tmp/output' if it exists
     folder_path = os.path.join('/tmp', 'output')
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
+        print(f"Removed folder and contents: {folder_path}", flush=True)
     else:
-        print(f"Folder not found: {folder_path}")
+        print(f"Folder not found: {folder_path}", flush=True)
 
     # Recreate the folder
     os.makedirs(folder_path)
-    print(f"Recreated folder: {folder_path}")
+    print(f"Recreated folder: {folder_path}", flush=True)
 
     # Give 'a+x' permissions to the folder
     os.chmod(folder_path, 0o755)  # '755' gives rwxr-xr-x (a+x)
-    print(f"Set a+x permissions on folder: {folder_path}")
+    print(f"Set a+x permissions on folder: {folder_path}", flush=True)
 
 # Start the main process
 if __name__ == "__main__":
@@ -102,26 +103,26 @@ if __name__ == "__main__":
     remove_files()
 
     if len(sys.argv) < 2:
-        print("Error: Missing GitHub raw link argument.")
-        print("Usage: sudo python3 deploy_enclave.py <github_raw_link>")
+        print("Error: Missing GitHub raw link argument.", flush=True)
+        print("Usage: sudo python3 deploy_enclave.py <github_raw_link>", flush=True)
         sys.exit(1)  # Exit with an error code
 
     github_raw_link = sys.argv[1]
     if not github_raw_link.startswith("https://raw.githubusercontent.com/"):
-        print("Error: Invalid GitHub raw link format.")
+        print("Error: Invalid GitHub raw link format.", flush=True)
         sys.exit(1)
 
     # Step 1 - Pulling docker compose & extracting docker image link
     box_out("Pulling Docker Compose from GitHub...")
     PPDX_SDK.pull_compose_file(github_raw_link)
-    print('Extracting docker link...')
+    print('Extracting docker link...', flush=True)
     link = subprocess.check_output(["sudo", "docker", "compose", "config", "--images"]).decode().strip()
-    print("Image information:", link)
+    print("Image information:", link, flush=True)
 
     # Step 3 - Docker image pulling
     box_out("Pulling docker image...")
     PPDX_SDK.pull_docker_image(link)
-    print("Pulled docker image")
+    print("Pulled docker image", flush=True)
 
     # Step 2 - Key generation
     box_out("Generating and saving key pair...")
@@ -131,17 +132,17 @@ if __name__ == "__main__":
     # Step 4 - Measuring image and storing in vTPM
     box_out("Measuring Docker image into vTPM...")
     PPDX_SDK.measureDockervTPM(link)
-    print("Measured and stored in vTPM")
+    print("Measured and stored in vTPM", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     box_out("Guest Attestation Executing...")
     PPDX_SDK.execute_guest_attestation()
-    print("Guest Attestation complete. JWT received from MAA")
+    print("Guest Attestation complete. JWT received from MAA", flush=True)
 
     # Step 6 - Send the JWT to APD
     box_out("Sending JWT to APD for verification...")
     token=PPDX_SDK.getAttestationToken(config)
-    print("Access token received from APD")
+    print("Access token received from APD", flush=True)
 
     # Step 7 - Getting data
     box_out("Getting files from RS...")
@@ -150,7 +151,7 @@ if __name__ == "__main__":
 
     box_out("Decrypting & storing files...")
     PPDX_SDK.decryptFile()
-    print("Files decrypted and stored in /tmp/inputdata")
+    print("Files decrypted and stored in /tmp/inputdata", flush=True)
 
     # Executing the application in the docker
     box_out("Running the Application...")
@@ -158,5 +159,6 @@ if __name__ == "__main__":
     subprocess.run(["sudo", "docker", "compose", 'up'])
 
     PPDX_SDK.setState("Secure Execution Complete", "Step 5", 5, 5, address)
-    print('DONE')
-    print('Output saved to /tmp/output')
+    print('DONE', flush=True)
+    print('Output saved to /tmp/output', flush=True)
+

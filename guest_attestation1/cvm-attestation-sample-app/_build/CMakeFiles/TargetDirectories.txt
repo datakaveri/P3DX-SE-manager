@@ -1,0 +1,3 @@
+/home/ubuntu/P3DX-SE-manager/guest_attestation/cvm-attestation-sample-app/_build/CMakeFiles/AttestationClient.dir
+/home/ubuntu/P3DX-SE-manager/guest_attestation/cvm-attestation-sample-app/_build/CMakeFiles/edit_cache.dir
+/home/ubuntu/P3DX-SE-manager/guest_attestation/cvm-attestation-sample-app/_build/CMakeFiles/rebuild_cache.dir
