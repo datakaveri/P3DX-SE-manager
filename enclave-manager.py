@@ -6,6 +6,7 @@ import os
 import json
 import stat
 import logging
+import threading
 
 app = Flask(__name__)
 
@@ -77,6 +78,10 @@ def deploy_enclave():
                 dataset_name = content["dataset_name"]
                 rs_url = content["rs_url"]
                 subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
+            elif app_name == "SKALD_AMD":
+                dataset_name = content["dataset_name"]
+                rs_url = content["rs_url"]
+                subprocess.Popen(["sudo", "python3" , "deploy_enclaveSKALD.py", dataset_name, rs_url, docker_compose_url])
             else:
                 subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
         is_app_running = True
@@ -106,7 +111,7 @@ def get_inference():
     global app_name
     if(state["step"]!=5):
         response={
-                "title": "Error: No Inference Output/File does not exist",
+                "title": "Error: App execution incomplete",
                 "description": "No inference output found."
             }
         return jsonify(response), 403
