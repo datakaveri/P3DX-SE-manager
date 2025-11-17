@@ -93,7 +93,7 @@ def generate_and_save_key_pair():
         private_key = pem_file.read()
         print('Using Private Key to Decrypt data')
     key = RSA.import_key(private_key)
-
+    
     return key
 
 def pull_docker_image(app_name):
@@ -209,7 +209,7 @@ def getTokenFromAPD(jwt_file, config, dataset, rs_url):
 #Send token to resource server for verification & get encrypted images  
 def getFileFromResourceServer(token):
     rs_url = "https://authenclave.iudx.io/resource_server/encrypted.store"
-    rs_headers={'Authorization': f'Bearer {token}'}
+    rs_headers={}
     rs=requests.get(rs_url,headers=rs_headers)
     if rs.status_code == 200:
         print("Token authenticated and Encrypted images received.")
@@ -296,8 +296,8 @@ def pullconfig(url, token, key):
     access_token=token
     rs_url=url
 
-    auth = "Bearer {access_token}".format(access_token=access_token)
-    headers = {'Authorization': auth }
+   # auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = { }
 
     response = requests.get(rs_url, headers=headers)
     if response.status_code == 200:
@@ -338,7 +338,7 @@ def dataChunkN(n, url, access_token, key):
         return 0 
     
 def getChunkFromResourceServer (n,url,token):
-    rs_headers={'Authorization': f'Bearer {token}'}
+    rs_headers={}
     rs_url = f"{url}{n}"
     print(rs_url)
     rs=requests.get(rs_url,headers=rs_headers)
@@ -398,7 +398,7 @@ def decryptChunk(loadedDict, n, key):
 def getInferenceFernetKey(key, url, access_token):
     print ("Getting the inference Fernet key..")
     print("Accessing: ", url)   
-    rs_headers={'Authorization': f'Bearer {access_token}'}
+    rs_headers={}
     rs_url = url
     rs=requests.get(rs_url,headers=rs_headers)
 
@@ -471,8 +471,8 @@ def sendInference(inference, access_token, url):
     #send inference to RS
     print("Sending the inference to: ", url)
 
-    auth = "Bearer {access_token}".format(access_token=access_token)
-    headers = {'Authorization': auth }
+   # auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = {}
 
     #Make the POST request with headers
     response = requests.post(url, headers=headers, data=inference)
@@ -611,8 +611,8 @@ def pullconfig_KAnon(url, token, key):
     access_token=token
     rs_url=url
 
-    auth = "Bearer {access_token}".format(access_token=access_token)
-    headers = {'Authorization': auth }
+    #auth = "Bearer {access_token}".format(access_token=access_token)
+    headers = {}
 
     response = requests.get(rs_url, headers=headers)
     if response.status_code == 200:
