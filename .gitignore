@@ -1,9 +1,29 @@
 #Byte-compiled / optimized / DLL files
 __pycache__
+*.pyc
+*.pyo
+*.pkl
+
+#Keys and config files
 /keys/
-loadedDict.pkl
+DPconfig.json
+docker-compose.yml
+
+#Directories
 /token_verification/
 /vm_pcr_verification/
 /attestation-and-verification.py/
 /test-function.py/
-docker-compose.yml
+/guest_attestation/
+
+#Build artifacts and binaries
+*.deb
+*.o
+*.bin
+*.swp
+*.swo
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+AttestationClient

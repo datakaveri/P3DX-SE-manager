@@ -1,187 +1,199 @@
 import subprocess
 import os
-import PPDX_SDK_DP
-import sys
 import json
 import shutil
 import time
-import psutil
-import logging
-from datetime import datetime
+import sys
+import PPDX_SKALD as PPDX_SKALD
 
-def load_config(filename):
-    """Loads configuration data from a JSON file."""
-    try:
-        with open(filename, 'r') as file:
-            return json.load(file)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Configuration file '{filename}' not found.")
-    except json.JSONDecodeError:
-        raise ValueError(f"Invalid JSON format in configuration file '{filename}'.")
+# Force unbuffered output for live logging
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+
+DOCKER_COMPOSE_URL = "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml"
+
+
+
+
+def restart_enclave_manager():
+    """Restart the enclavemanager systemd service."""
+    print("Restarting enclavemanager service...", flush=True)
+    result = subprocess.run(
+        ["sudo", "systemctl", "restart", "enclavemanager.service"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        print("enclavemanager service restarted successfully", flush=True)
+    else:
+        print(f"Warning: Failed to restart enclavemanager service: {result.stderr}", flush=True)
+
 
 def box_out(message):
     """Prints a box around a message using text characters."""
-
-    lines = message.splitlines()  # Split message into lines
-    max_width = max(len(line) for line in lines)  # Find longest line
-
-    # Top border
-    print("+" + "-" * (max_width + 2) + "+")
-
-    # Content with padding
+    lines = message.splitlines()
+    max_width = max(len(line) for line in lines) if lines else 0
+    
+    print("+" + "-" * (max_width + 2) + "+", flush=True)
     for line in lines:
-        print("| " + line.ljust(max_width) + " |")
+        print("| " + line.ljust(max_width) + " |", flush=True)
+    print("+" + "-" * (max_width + 2) + "+", flush=True)
 
-    # Bottom border
-    print("+" + "-" * (max_width + 2) + "+")
 
-def remove_files():
-    file_path = os.path.join('.','docker-compose.yml')
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        print(f"Removed file: {file_path}")
-    else:
-        print(f"File not found: {file_path}")
+def cleanup_and_prepare_folders():
+    """Clean up old files and prepare SKALD folders."""
+    print("Cleaning up and preparing folders...", flush=True)
+    
+    docker_compose_file = os.path.join('.', 'docker-compose.yml')
+    if os.path.exists(docker_compose_file):
+        os.remove(docker_compose_file)
+        print(f"Removed: {docker_compose_file}", flush=True)
+    
+    keys_folder = os.path.join('.', 'keys')
+    if os.path.exists(keys_folder):
+        shutil.rmtree(keys_folder)
+        print(f"Removed: {keys_folder} (keys and JWT token)", flush=True)
+    
+    bundle_file = os.path.join('.', 'Bundle', 'encrypted.json')
+    if os.path.exists(bundle_file):
+        os.remove(bundle_file)
+        print(f"Removed: {bundle_file}", flush=True)
+    
+    PPDX_SKALD.ensure_skald_folders()
 
-    folder_path = os.path.join('.', 'keys')
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
-    else:
-        print(f"Folder not found: {folder_path}")
 
-    folder_path = os.path.join('/tmp', 'SKALD_input')
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
-    else:
-        print(f"Folder not found: {folder_path}")
-        
-    os.makedirs(folder_path)
-    print("Created input folder")
-
-    config_path = os.path.join(folder_path, "config")
-    os.makedirs(config_path)
-
-    encdata_path = os.path.join(folder_path, "encrypted_data")
-    os.makedirs(encdata_path)
-
-    inputdata_path = os.path.join(folder_path, "input_file")
-    os.makedirs(inputdata_path)
-
-    folder_path = os.path.join('/tmp', 'SKALD_output')
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path)
-        print(f"Removed folder and contents: {folder_path}")
-    else:
-        print(f"Folder not found: {folder_path}")
-
-    os.makedirs(folder_path)
-    print("Created output folder")
-
-# Start the main process
-if __name__ == "__main__":
-    print("In DP script main")
-    if len(sys.argv) < 2:
-        print("Error: Missing arguments.")
-        sys.exit(1)  # Exit with an error code
-
-    dataset = sys.argv[1]
-    rs_url = sys.argv[2]
-    github_raw_link = sys.argv[3]
-
-    # Validate the link
-    if not github_raw_link.startswith("https://raw.githubusercontent.com/"):
-        print("Error: Invalid GitHub raw link format.")
-        sys.exit(1)
-
-    remove_files()
-
-    config_file = "DPconfig.json"   #TODO
-    config = load_config(config_file)  # Loads configuration into a dictionary
+def main():
+    """Main deployment workflow."""
+    print("="*60, flush=True)
+    print("SKALD Enclave Deployment", flush=True)
+    print("="*60, flush=True)
+    
+    config_file = "DPconfig.json"
+    config = PPDX_SKALD.load_config_file(config_file)
     address = config["enclaveManagerAddress"]
-
-    inference_url = f"{rs_url}/inference/{dataset}"
-    inferencekey_url = f"{rs_url}/key/{dataset}"
-    data_url = f"{rs_url}/data/{dataset}/"
-    config_url = f"{rs_url}/config/{dataset}"
-
+    
+    cleanup_and_prepare_folders()
+    
     # Step 1 - Pulling docker compose & extracting docker image link
-    print("\nStep 1")
+    print("\n" + "="*60, flush=True)
+    print("Step 1: Pulling Docker Compose from GitHub", flush=True)
+    print("="*60, flush=True)
     box_out("Pulling Docker Compose from GitHub...")
-    PPDX_SDK_DP.pull_compose_file(github_raw_link)
-    print('Extracting docker link...')
-    link = subprocess.check_output(["sudo", "docker", "compose", "config", "--images"]).decode().strip()
-    print("Image information:", link)
-
+    PPDX_SKALD.pull_compose_file(DOCKER_COMPOSE_URL)
+    print('Extracting docker image link...', flush=True)
+    
+    link = PPDX_SKALD.extract_docker_image_from_compose()
+    print(f"Docker image: {link}", flush=True)
+    
     # Step 2 - Key generation
-    print("\nStep 2") 
+    print("\n" + "="*60, flush=True)
+    print("Step 2: Generating Key Pair", flush=True)
+    print("="*60, flush=True)
     box_out("Generating and saving key pair...")
-    PPDX_SDK_DP.setState("TEE Attestation & Authorisation", "Step 2",2,5,address)
-    key=PPDX_SDK_DP.generate_and_save_key_pair()
-
+    PPDX_SKALD.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address)
+    key = PPDX_SKALD.generate_and_save_key_pair()
+    print("Key pair generated", flush=True)
+    
     # Step 3 - Docker image pulling
-    print("\nStep 3")
+    print("\n" + "="*60, flush=True)
+    print("Step 3: Pulling Docker Image", flush=True)
+    print("="*60, flush=True)
     box_out("Pulling docker image...")
-    PPDX_SDK_DP.pull_docker_image(link)
-    print("Pulled docker")
-
+    PPDX_SKALD.pull_docker_image(link)
+    print("Docker image pulled", flush=True)
+    
     # Step 4 - Measuring image and storing in vTPM
-    print("\nStep 4")
+    print("\n" + "="*60, flush=True)
+    print("Step 4: Measuring Docker Image into vTPM", flush=True)
+    print("="*60, flush=True)
     box_out("Measuring Docker image into vTPM...")
-    PPDX_SDK_DP.measureDockervTPM(link)
-    print("Measured and stored in vTPM")
-
+    PPDX_SKALD.measureDockervTPM(link)
+    print("Image measured and stored in vTPM", flush=True)
+    
     # Step 5 - Send VTPM & public key to MAA & get attestation token
-    print("\nStep 5")
+    print("\n" + "="*60, flush=True)
+    print("Step 5: Guest Attestation", flush=True)
+    print("="*60, flush=True)
     box_out("Guest Attestation Executing...")
-    PPDX_SDK_DP.execute_guest_attestation()
-    print("Guest Attestation complete. JWT received from MAA: ")
+    PPDX_SKALD.execute_guest_attestation()
+    print("Guest Attestation complete. JWT received from MAA", flush=True)
+    
+    # Step 6 - Send the JWT to UI
+    print("\n" + "="*60, flush=True)
+    print("Step 6: Sending JWT to UI", flush=True)
+    print("="*60, flush=True)
+    box_out("Sending JWT to UI for polling...")
+    jwt = PPDX_SKALD.get_jwt_from_file()
+    PPDX_SKALD.send_jwt_to_ui(jwt, address)
+    print("JWT sent to UI. Waiting for bundle...", flush=True)
+    
+    # Step 7 - Receive encrypted bundle from UI
+    print("\n" + "="*60, flush=True)
+    print("Step 7: Receiving Encrypted Bundle from UI", flush=True)
+    print("="*60, flush=True)
+    box_out("Waiting for encrypted bundle from UI...")
+    PPDX_SKALD.setState("Receiving encrypted bundle", "Step 7", 7, 11, address)
+    bundle_data = PPDX_SKALD.wait_for_bundle_from_ui(address, timeout=300)
+    bundle_path = PPDX_SKALD.save_bundle_to_file(bundle_data)
+    print("Bundle received and saved", flush=True)
+    
+    # Step 8 - Decrypt bundle
+    print("\n" + "="*60, flush=True)
+    print("Step 8: Decrypting Bundle", flush=True)
+    print("="*60, flush=True)
+    box_out("Decrypting bundle...")
+    PPDX_SKALD.setState("Decrypting bundle", "Step 8", 8, 11, address)
+    private_key_path = "keys/private_key.pem"
+    PPDX_SKALD.decrypt_bundle_skald(bundle_path, private_key_path)
+    print("Bundle decrypted. Config, SSH key, and symmetric key saved", flush=True)
+    
+    # Step 9 - Fetch and decrypt data
+    print("\n" + "="*60, flush=True)
+    print("Step 9: Fetching and Decrypting Data", flush=True)
+    print("="*60, flush=True)
+    box_out("Fetching encrypted data from remote server...")
+    PPDX_SKALD.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
+    PPDX_SKALD.fetch_and_decrypt_data(config_file)
+    print("Data fetched, decrypted, and saved", flush=True)
+    
+    # Step 10 - Running the application in docker
+    print("\n" + "="*60, flush=True)
+    print("Step 10: Running SKALD Application", flush=True)
+    print("="*60, flush=True)
+    box_out("Running the Application in Docker...")
+    PPDX_SKALD.setState("Performing secure de-identification in TEE", "Step 10", 10, 11, address)
+    PPDX_SKALD.run_docker_containers()
+    
+    # Step 11 - Encrypt inference and upload
+    print("\n" + "="*60, flush=True)
+    print("Step 11: Encrypting and Uploading Inference", flush=True)
+    print("="*60, flush=True)
+    box_out("Encrypting inference output...")
+    PPDX_SKALD.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
+    PPDX_SKALD.encrypt_inference_skald(config_file)
+    print("Inference encrypted and uploaded to remote server", flush=True)
+    
+    
+    # Final state
+    print("\n" + "="*60, flush=True)
+    print("DEPLOYMENT COMPLETE", flush=True)
+    print("="*60, flush=True)
+    PPDX_SKALD.setState("Secure Computation Complete", "Step 11", 11, 11, address)
+    print("All steps completed successfully!", flush=True)
+    #restart_enclave_manager()   #TODO
 
-    # Step 6 - Send the JWT to APD
-    print("\nStep 6")
-    box_out("Sending JWT to APD for verification...")
-    token=PPDX_SDK_DP.getTokenFromAPD('jwt-response.txt', config, dataset, rs_url)
-    print("Access token received from APD")
 
-    # Step 7 - Pulling config file from RS: 
-    print("\nStep 7")
-    box_out("Pulling DP application config")
-    PPDX_SDK_DP.setState("Getting data into Secure enclave","Step 3",3,5,address)
-    PPDX_SDK_DP.pullconfig_SKALD(config_url, token, key)  
-    print("Config pulled & stored")
-
-    # Step 8 - Pulling CSV data directly
-    print("\nStep 8")
-    box_out("Getting CSV data from RS, decrypting and storing locally...")
-    success = PPDX_SDK_DP.pullCSVData_SKALD(data_url, token, key)
-    if success:
-        print("CSV data pulled and stored successfully")
-    else:
-        print("Error: Failed to pull CSV data")
-        sys.exit(1)
-
-    # Executing the application in the docker
-    print("\nStep 9")
-    box_out("Running the Application...")
-    PPDX_SDK_DP.setState("Performing secure de-identification in TEE", "Step 4",4,5,address)
-    subprocess.run(["sudo", "docker", "compose", 'up'])
-    print('Output saved to /tmp/output')
-
-    print("\nStep 10")
-    print("Getting inference encryption key from RS..")
-    inference_key=PPDX_SDK_DP.getInferenceFernetKey(key, inferencekey_url, token)
-    print("Got back inference key: ", inference_key)
-
-    print("\nStep 11")
-    print("Encrypting Inference using inference key")
-    inference=PPDX_SDK_DP.encryptInference_SKALD(inference_key)                
-    print("Inference encrypted")
-
-    print("\nStep 12")
-    print("Sending encrypted inference to RS")
-    PPDX_SDK_DP.sendInference(inference, token, inference_url)
-    print("Inference sent to RS")
-
-    print('DONE')
-    PPDX_SDK_DP.setState("Secure Computation Complete", "Step 5", 5, 5, address)
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDeployment interrupted by user", flush=True)
+        #restart_enclave_manager()
+        exit(1)
+    except Exception as e:
+        print(f"\n\nERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        #restart_enclave_manager()
+        exit(1)

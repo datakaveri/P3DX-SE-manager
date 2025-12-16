@@ -2,9 +2,9 @@
 Description=AMD enclave manager systemd service
 
 [Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/sgx-enclave-manager
-ExecStart=/home/ubuntu/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave-manager:app
+User=kanonTEE
+WorkingDirectory=/home/kanonTEE/P3DX-SE-manager
+ExecStart=/home/kanonTEE/.env/enclaveManager/bin/gunicorn --bind 0.0.0.0:4000 --keyfile /home/kanonTEE/P3DX-SE-manager/ssl/server.key --certfile /home/kanonTEE/P3DX-SE-manager/ssl/server.crt enclave_manager_new:app
 Restart=always
 
 [Install]
