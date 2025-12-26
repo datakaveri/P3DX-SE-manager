@@ -110,7 +110,13 @@ def main():
     box_out("Measuring Docker image into vTPM...")
     PPDX_SKALD.measureDockervTPM(link)
     print("Image measured and stored in vTPM", flush=True)
-    
+
+    # Step 4.5 - Generate deployment nonce
+    nonce = PPDX_SKALD.generate_nonce()
+    PPDX_SKALD.save_nonce(nonce)
+    print(f"Generated deployment nonce: {nonce}", flush=True)
+    PPDX_SKALD.extend_nonce_to_vtpm(nonce)
+
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     print("\n" + "="*60, flush=True)
     print("Step 5: Guest Attestation", flush=True)

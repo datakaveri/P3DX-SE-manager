@@ -1,5 +1,3 @@
-
-
 import os
 import sys
 import subprocess
@@ -12,6 +10,8 @@ import time
 import shutil
 import glob
 import re
+import csv
+import hashlib
 
 import requests
 import _pickle as pickle
@@ -219,6 +219,22 @@ def measureDockervTPM(link):
     except Exception as exc:
         print("Error:", exc)
 
+def generate_nonce(size=32):
+    import secrets, base64
+    nonce = secrets.token_bytes(size)
+    return base64.urlsafe_b64encode(nonce).decode("utf-8")
+
+
+def save_nonce(nonce, path="keys/deployment_nonce.txt"):
+    with open(path, "w") as f:
+        f.write(nonce)
+
+def extend_nonce_to_vtpm(nonce, pcr=14):
+    nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
+    subprocess.run([
+        "sudo", "tpm2_pcrextend",
+        f"{pcr}:sha256={nonce_hash}"
+    ], check=True)
 
 def execute_guest_attestation():
     """Run guest attestation sample app to generate a JWT."""
@@ -226,9 +242,36 @@ def execute_guest_attestation():
     commands_folder = os.path.join(
         script_dir, "guest_attestation/cvm-attestation-sample-app"
     )
-    os.chdir(commands_folder)
-    subprocess.run(["python3", "generate-token.py"])
-    os.chdir(script_dir)
+    original_cwd = os.getcwd()
+    jwt_file = os.path.join(script_dir, "keys", "jwt-response.txt")
+    
+    try:
+        if not os.path.exists(commands_folder):
+            raise RuntimeError(f"Guest attestation folder not found: {commands_folder}")
+        
+        os.chdir(commands_folder)
+        result = subprocess.run(
+            ["python3", "generate-token.py"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+            if not error_msg:
+                error_msg = f"Process exited with code {result.returncode}"
+            raise RuntimeError(f"Guest attestation failed: {error_msg}")
+        
+        if not os.path.exists(jwt_file):
+            resolved_path = os.path.abspath("../../keys/jwt-response.txt")
+            raise RuntimeError(
+                f"JWT file was not created. Expected: {jwt_file}, "
+                f"Resolved from script dir: {resolved_path}"
+            )
+        
+    finally:
+        os.chdir(original_cwd)
 
 
 def getTokenFromAPD(jwt_file, config, dataset, rs_url):
@@ -622,17 +665,17 @@ def encrypt_inference_skald(config_path="DPconfig.json"):
     
     cipher = create_fernet_cipher(key_data)
     
+    required_files = ["generalized.csv", "symmetric_keys.json"]
     output_files = []
-    if os.path.exists(output_dir):
-        for root, dirs, files in os.walk(output_dir):
-            for file in files:
-                if file.endswith(('.json', '.csv', '.txt')):
-                    output_files.append(os.path.join(root, file))
     
-    if not output_files:
-        raise FileNotFoundError(f"No output files found in {output_dir}")
+    for filename in required_files:
+        file_path = os.path.join(output_dir, filename)
+        if os.path.exists(file_path):
+            output_files.append(file_path)
+        else:
+            raise FileNotFoundError(f"Required file not found: {file_path}")
     
-    print(f"Found {len(output_files)} output file(s)")
+    print(f"Found {len(output_files)} required file(s)")
     
     ssh_key_path = find_ssh_key()
     
@@ -662,3 +705,97 @@ def encrypt_inference_skald(config_path="DPconfig.json"):
         os.remove(temp_encrypted)
     
     print("Inference encryption and upload complete")
+
+
+def get_skald_status_and_preview():
+    """Read status.json and return either CSV preview (success) or error details (failure).
+    
+    Returns:
+        dict: Status response with one of:
+            - {"status": "processing"} if status.json doesn't exist yet
+            - {"status": "success", "preview": [...], "preview_count": int, "outputs": {...}} on success
+            - {"status": "error", "error": {...}} on failure
+    """
+    status_file = "/tmp/SKALD_output/status.json"
+    csv_file = "/tmp/SKALD_output/generalized.csv"
+    
+    if not os.path.exists(status_file):
+        return {
+            "status": "processing",
+            "message": "SKALD application is still running. Status will be available once processing completes."
+        }
+    
+    try:
+        with open(status_file, 'r', encoding='utf-8') as f:
+            status_data = json.load(f)
+        
+        if status_data.get("status") == "success":
+            if not os.path.exists(csv_file):
+                return {
+                    "status": "error",
+                    "error": {
+                        "code": "CSV_FILE_NOT_FOUND",
+                        "message": "CSV file not found",
+                        "details": f"CSV file does not exist: {csv_file}"
+                    }
+                }
+            
+            csv_rows = []
+            try:
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    csv_reader = csv.DictReader(f)
+                    for i, row in enumerate(csv_reader):
+                        if i >= 10:
+                            break
+                        csv_rows.append(row)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "error": {
+                        "code": "CSV_READ_ERROR",
+                        "message": "Failed to read CSV file",
+                        "details": str(e)
+                    }
+                }
+            
+            return {
+                "status": "success",
+                "preview": csv_rows,
+                "preview_count": len(csv_rows),
+                "outputs": status_data.get("outputs", {})
+            }
+        
+        elif status_data.get("status") == "error":
+            return {
+                "status": "error",
+                "error": status_data.get("error", {})
+            }
+        
+        else:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "UNKNOWN_STATUS",
+                    "message": "Unknown status in status.json",
+                    "details": f"Status field has unexpected value: {status_data.get('status')}"
+                }
+            }
+    
+    except json.JSONDecodeError as e:
+        return {
+            "status": "error",
+            "error": {
+                "code": "JSON_PARSE_ERROR",
+                "message": "Failed to parse status.json",
+                "details": str(e)
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": {
+                "code": "UNEXPECTED_ERROR",
+                "message": "Unexpected error reading status",
+                "details": str(e)
+            }
+        }
