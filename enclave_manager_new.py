@@ -4,6 +4,7 @@ import subprocess
 import os
 import json
 import logging
+import PPDX_SKALD
 
 
 app = Flask(__name__)
@@ -11,7 +12,7 @@ app = Flask(__name__)
 # Enable CORS for all routes
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5173", "http://localhost:3000"],
+        "origins": ["http://localhost:5173", "http://localhost:3000", "https://spider.p3dx.iudx.org.in/"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -48,11 +49,22 @@ def deploy_enclave():
     global is_app_running, stored_bundle
     
     if is_app_running:
-        response = {
-            "title": "Error",
-            "description": "Application is already running." 
-        }
-        return jsonify(response), 400
+        print("Previous deployment detected. Restarting service to reset state...")
+        try:
+            PPDX_SKALD.restart_enclave_manager()
+
+            import time
+            time.sleep(3)
+            is_app_running = False
+            stored_bundle = None
+        except Exception as e:
+            print(f"Warning: Failed to restart service: {str(e)}")
+            response = {
+                "title": "Error",
+                "description": f"Previous deployment detected but failed to restart service: {str(e)}"
+            }
+            return jsonify(response), 500
+    
     stored_bundle = None
 
     global state
@@ -102,7 +114,8 @@ def receive_jwt():
 @app.route("/enclave/jwt", methods=["GET"])
 def get_jwt():
     print("Fetching JWT token...")
-    jwt_file_path = "keys/jwt-response.txt"
+    base_dir = "/home/kanonTEE/P3DX-SE-manager"
+    jwt_file_path = os.path.join(base_dir, "keys", "jwt-response.txt")
     
     if not os.path.exists(jwt_file_path):
         response = {
@@ -112,13 +125,12 @@ def get_jwt():
         return jsonify(response), 404
     
     try:
-        if os.path.exists(jwt_file_path):
-            result = subprocess.run(
-                ['sudo', 'chmod', '644', jwt_file_path],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+        result = subprocess.run(
+            ['sudo', 'chmod', '644', jwt_file_path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
         
         with open(jwt_file_path, "r") as f:
             jwt_token = f.read().strip()
@@ -152,6 +164,115 @@ def get_jwt():
         }
         return jsonify(response), 500
 
+
+
+# GET FRESH JWT: Returns a fresh JWT token
+@app.route("/enclave/jwt/fresh", methods=["GET"])
+def get_fresh_jwt():
+    """Generate a fresh JWT token by deleting old JWT and executing guest attestation.
+    
+    Returns:
+        JSON response with newly generated JWT token or error details.
+    """
+    print("Generating fresh JWT token...")
+    
+    base_dir = "/home/kanonTEE/P3DX-SE-manager"
+    keys_dir = os.path.join(base_dir, "keys")
+    jwt_file_path = os.path.join(keys_dir, "jwt-response.txt")
+    private_key_path = os.path.join(keys_dir, "private_key.pem")
+    public_key_path = os.path.join(keys_dir, "public_key.pem")
+    
+    original_cwd = os.getcwd()
+    
+    try:
+        os.chdir(base_dir)
+        os.makedirs(keys_dir, exist_ok=True)
+        
+        subprocess.run(
+            ["sudo", "chown", "-R", f"{os.getenv('USER', 'kanonTEE')}:{os.getenv('USER', 'kanonTEE')}", keys_dir],
+            check=False,
+            capture_output=True
+        )
+        subprocess.run(
+            ["sudo", "chmod", "-R", "755", keys_dir],
+            check=False,
+            capture_output=True
+        )
+        
+        if os.path.exists(jwt_file_path):
+            subprocess.run(
+                ["sudo", "rm", "-rf", jwt_file_path],
+                check=False,
+                capture_output=True
+            )
+            print("Old JWT file deleted")
+        
+        if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
+            print("Keys not found. Generating new key pair...")
+            PPDX_SKALD.generate_and_save_key_pair()
+            print("Key pair generated successfully")
+        
+        nonce_path = os.path.join(keys_dir, "deployment_nonce.txt")
+        if not os.path.exists(nonce_path):
+            print("Deployment nonce not found. Generating new nonce...")
+            nonce = PPDX_SKALD.generate_nonce()
+            PPDX_SKALD.save_nonce(nonce)
+            print(f"Generated deployment nonce: {nonce}")
+            try:
+                PPDX_SKALD.extend_nonce_to_vtpm(nonce)
+                print("Nonce extended to vTPM successfully")
+            except Exception as e:
+                print(f"Warning: Failed to extend nonce to vTPM: {str(e)}")
+        
+        print("Executing guest attestation to generate new JWT...")
+        PPDX_SKALD.execute_guest_attestation()
+        
+        subprocess.run(
+            ["sudo", "chown", f"{os.getenv('USER', 'kanonTEE')}:{os.getenv('USER', 'kanonTEE')}", jwt_file_path],
+            check=False,
+            capture_output=True
+        )
+        subprocess.run(
+            ['sudo', 'chmod', '644', jwt_file_path],
+            check=False,
+            capture_output=True
+        )
+        
+        with open(jwt_file_path, "r") as f:
+            jwt_token = f.read().strip()
+        
+        if not jwt_token:
+            response = {
+                "title": "Error: Empty JWT",
+                "description": "JWT token file is empty after generation."
+            }
+            return jsonify(response), 500
+        
+        print(f"Fresh JWT token generated successfully (length: {len(jwt_token)})")
+        
+        response = {
+            "title": "Success",
+            "jwt": jwt_token
+        }
+        return jsonify(response), 200
+        
+    except RuntimeError as e:
+        response = {
+            "title": "Error: JWT generation failed",
+            "description": str(e)
+        }
+        return jsonify(response), 500
+        
+    except Exception as e:
+        print(f"Unexpected error generating JWT: {str(e)}")
+        response = {
+            "title": "Error: JWT generation failed",
+            "description": f"Failed to generate JWT token: {str(e)}"
+        }
+        return jsonify(response), 500
+        
+    finally:
+        os.chdir(original_cwd)
 
 # GET BUNDLE: Returns the encrypted bundle for polling
 @app.route("/enclave/bundle", methods=["GET"])
@@ -312,6 +433,71 @@ def get_state():
     return jsonify(state)
 
 
+# STATUS: Returns SKALD processing status and CSV preview (if successful)
+@app.route("/enclave/status", methods=["GET"])
+def get_skald_status():
+    """Poll endpoint for SKALD processing status.
+    
+    Returns:
+        - {"status": "processing"} if status.json doesn't exist yet (still running)
+        - {"status": "success", "preview": [...], "outputs": {...}} on successful completion
+        - {"status": "error", "error": {...}} on failure
+    """
+    print("Fetching SKALD status...")
+    
+    try:
+        status_response = PPDX_SKALD.get_skald_status_and_preview()
+        
+        if status_response.get("status") == "processing":
+            return jsonify(status_response), 200
+        
+        elif status_response.get("status") == "success":
+            return jsonify(status_response), 200
+        
+        elif status_response.get("status") == "error":
+            return jsonify(status_response), 200
+        
+        else:
+            return jsonify({
+                "status": "error",
+                "error": {
+                    "code": "INVALID_RESPONSE",
+                    "message": "Invalid status response format"
+                }
+            }), 500
+            
+    except Exception as e:
+        print(f"Error fetching SKALD status: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "error": {
+                "code": "ENDPOINT_ERROR",
+                "message": "Failed to fetch status",
+                "details": str(e)
+            }
+        }), 500
+
+
+# Error handler for critical errors that require service restart
+@app.errorhandler(Exception)
+def handle_critical_error(e):
+    """Handle critical errors by restarting the service."""
+    print(f"Critical error in manager: {str(e)}")
+    import traceback
+    traceback.print_exc()
+    
+    # Restart service on critical errors
+    try:
+        PPDX_SKALD.restart_enclave_manager()
+    except Exception as restart_error:
+        print(f"Failed to restart service: {str(restart_error)}")
+    
+    return jsonify({
+        "title": "Error",
+        "description": f"Critical error occurred. Service restarting: {str(e)}"
+    }), 500
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Starting Enclave Manager")
@@ -322,5 +508,6 @@ if __name__ == "__main__":
     print("  - GET  /enclave/state")
     print("  - POST /enclave/setstate")
     print("  - GET  /enclave/inference")
+    print("  - GET  /enclave/status")
     print("=" * 60)
     app.run(host="0.0.0.0", port=4000, debug=True)

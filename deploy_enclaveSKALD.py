@@ -16,18 +16,6 @@ DOCKER_COMPOSE_URL = "https://raw.githubusercontent.com/prathmeshj1729/Docker-Co
 
 
 
-def restart_enclave_manager():
-    """Restart the enclavemanager systemd service."""
-    print("Restarting enclavemanager service...", flush=True)
-    result = subprocess.run(
-        ["sudo", "systemctl", "restart", "enclavemanager.service"],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode == 0:
-        print("enclavemanager service restarted successfully", flush=True)
-    else:
-        print(f"Warning: Failed to restart enclavemanager service: {result.stderr}", flush=True)
 
 
 def box_out(message):
@@ -112,7 +100,6 @@ def main():
     box_out("Measuring Docker image into vTPM...")
     PPDX_SKALD.measureDockervTPM(link)
     print("Image measured and stored in vTPM", flush=True)
-    PPDX_SKALD.extend_image_hash_to_vtpm(image_hash)                            #Pulled Image Hash
 
     # Step 4.5 - Generate deployment nonce
     nonce = PPDX_SKALD.generate_nonce()
@@ -195,7 +182,7 @@ def main():
     print("="*60, flush=True)
     PPDX_SKALD.setState("Secure Computation Complete", "Step 11", 11, 11, address)
     print("All steps completed successfully!", flush=True)
-    #restart_enclave_manager()   #TODO
+    PPDX_SKALD.restart_enclave_manager()
 
 
 if __name__ == "__main__":
@@ -203,11 +190,11 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\nDeployment interrupted by user", flush=True)
-        #restart_enclave_manager()
+        PPDX_SKALD.restart_enclave_manager()
         exit(1)
     except Exception as e:
         print(f"\n\nERROR: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        #restart_enclave_manager()
+        PPDX_SKALD.restart_enclave_manager()
         exit(1)

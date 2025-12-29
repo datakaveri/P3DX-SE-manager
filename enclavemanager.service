@@ -4,8 +4,14 @@ Description=AMD enclave manager systemd service
 [Service]
 User=kanonTEE
 WorkingDirectory=/home/kanonTEE/P3DX-SE-manager
-ExecStart=/home/kanonTEE/.env/enclaveManager/bin/gunicorn --bind 0.0.0.0:4000 --keyfile /home/kanonTEE/P3DX-SE-manager/ssl/server.key --certfile /home/kanonTEE/P3DX-SE-manager/ssl/server.crt enclave_manager_new:app
+ExecStart=/home/kanonTEE/.env/enclaveManager/bin/gunicorn --bind 0.0.0.0:4000 enclave_manager_new:app
 Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

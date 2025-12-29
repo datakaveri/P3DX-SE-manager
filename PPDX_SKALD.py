@@ -184,24 +184,21 @@ def pull_docker_image(app_name):
 
 
 def hash_docker_image(image):
-    """
-    Returns SHA256 hash of the docker image config + layers
-    """
-    import subprocess
-    import json
-    import hashlib
-
+    """Returns SHA256 digest from RepoDigest or computes from docker inspect JSON."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format={{index .RepoDigests 0}}", image],
+            capture_output=True, text=True, check=True, timeout=10
+        )
+        match = re.search(r'sha256:([a-f0-9]{64})', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
     result = subprocess.run(
-        ["docker", "inspect", image],
-        capture_output=True,
-        text=True,
-        check=True
+        ["docker", "inspect", image], capture_output=True, text=True, check=True, timeout=10
     )
-
-    image_json = json.loads(result.stdout)[0]
-    image_bytes = json.dumps(image_json, sort_keys=True).encode()
-
-    return hashlib.sha256(image_bytes).hexdigest()
+    return hashlib.sha256(json.dumps(json.loads(result.stdout)[0], sort_keys=True).encode()).hexdigest()
 
 
 def save_image_hash(image_hash, path="keys/image_hash.txt"):
@@ -210,47 +207,50 @@ def save_image_hash(image_hash, path="keys/image_hash.txt"):
 
 
 def measureDockervTPM(link):
-    """Measure docker image digest into vTPM and save PCR values."""
-    try:
-        print(f"Fetching SHA256 digest for Docker image '{link}'...")
-        repo_name, tag = link.split(":")
-        response = requests.get(
-            f"https://registry.hub.docker.com/v2/repositories/{repo_name}/tags/{tag}"
+    """Extend image digest to PCR 15, read PCR values, and save to pcr_values.json."""
+    pcr_values = {}
+    pcr_file_path = os.path.join("keys", "pcr_values.json")
+    
+    sha256_digest = hash_docker_image(link)
+    if sha256_digest:
+        print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
+        extend_result = subprocess.run(
+            ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
+            capture_output=True, text=True, check=False
         )
-        if response.status_code == 200:
-            sha256_digest = response.json()["images"][0]["digest"].replace("sha256:", "")
-            print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
-            print("Extending the measurement to PCR 15 using TPM2 tools...")
-            subprocess.run(["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"])
+        if extend_result.returncode == 0:
             print("Measurement extended successfully to PCR 15.")
         else:
-            print(f"Error: Image '{link}' not found.")
-    except Exception as exc:
-        print("Error:", exc)
-
+            err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+            print(f"Warning: Failed to extend to PCR 15: {err}")
+    
     try:
-        command = ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,15"]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(
+            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,15"],
+            capture_output=True, text=True
+        )
         if result.returncode == 0:
-            pcr_values = {}
             for line in result.stdout.strip().split("\n")[1:]:
                 parts = line.split(":")
                 if len(parts) == 2:
                     pcr_values[parts[0].strip()] = parts[1].strip()
-            with open(os.path.join("keys", "pcr_values.json"), "w") as file:
-                file.write(json.dumps(pcr_values))
-            print("PCR values written to file successfully!")
+            print("PCR values read from TPM successfully!")
         else:
-            print(f"Error reading PCR values: {result.stderr}")
+            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
+            print(f"Warning: Error reading PCR values: {err}")
     except Exception as exc:
-        print("Error:", exc)
-
-
-def extend_image_hash_to_vtpm(image_hash, pcr=14):
-    subprocess.run(
-        ["sudo", "tpm2_pcrextend", f"{pcr}:sha256={image_hash}"],
-        check=True
-    )
+        print(f"Warning: Error reading PCR values: {exc}")
+    
+    image_hash_path = os.path.join("keys", "image_hash.txt")
+    if os.path.exists(image_hash_path):
+        with open(image_hash_path, "r") as f:
+            image_hash = f.read().strip()
+        if image_hash and "15" not in pcr_values:
+            pcr_values["15"] = f"0x{image_hash}"
+    
+    with open(pcr_file_path, "w") as file:
+        file.write(json.dumps(pcr_values))
+    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
 
 
 def generate_nonce(size=32):
@@ -858,3 +858,21 @@ def get_skald_status_and_preview():
                 "details": str(e)
             }
         }
+
+
+def restart_enclave_manager():
+    import subprocess
+    import time
+    
+    print("Restarting enclavemanager service...", flush=True)
+    result = subprocess.run(
+        ["sudo", "systemctl", "restart", "enclavemanager.service"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        print("enclavemanager service restarted successfully", flush=True)
+        # Give service a moment to fully restart
+        time.sleep(2)
+    else:
+        print(f"Warning: Failed to restart enclavemanager service: {result.stderr}", flush=True)

@@ -149,8 +149,8 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     encrypted_files = payload.get('encryptedFiles', {})
     if not encrypted_files:
         encrypted_files = {k: payload[k] for k in ['sshKey', 'symmetricKey', 'config'] if k in payload}
-    if not encrypted_files:
-        raise ValueError(f"Missing encryptedFiles: {list(payload.keys())}")
+        if not encrypted_files:
+            raise ValueError(f"Missing encryptedFiles: {list(payload.keys())}")
     
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -199,9 +199,9 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
                 output_path = os.path.join(output_folder, original_filename)
             else:
                 output_path = os.path.join(output_dir, original_filename)
-            
-            if os.path.exists(output_path):
-                import shutil
+                
+                if os.path.exists(output_path):
+                        import shutil
                 (shutil.rmtree if os.path.isdir(output_path) else os.remove)(output_path)
             
             with open(output_path, 'wb') as f:
