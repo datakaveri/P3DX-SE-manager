@@ -102,7 +102,9 @@ def main():
     box_out("Pulling docker image...")
     PPDX_SKALD.pull_docker_image(link)
     print("Docker image pulled", flush=True)
-    
+    image_hash = PPDX_SKALD.hash_docker_image(link)
+    PPDX_SKALD.save_image_hash(image_hash)
+
     # Step 4 - Measuring image and storing in vTPM
     print("\n" + "="*60, flush=True)
     print("Step 4: Measuring Docker Image into vTPM", flush=True)
@@ -110,12 +112,18 @@ def main():
     box_out("Measuring Docker image into vTPM...")
     PPDX_SKALD.measureDockervTPM(link)
     print("Image measured and stored in vTPM", flush=True)
+    PPDX_SKALD.extend_image_hash_to_vtpm(image_hash)                            #Pulled Image Hash
 
     # Step 4.5 - Generate deployment nonce
     nonce = PPDX_SKALD.generate_nonce()
     PPDX_SKALD.save_nonce(nonce)
     print(f"Generated deployment nonce: {nonce}", flush=True)
-    PPDX_SKALD.extend_nonce_to_vtpm(nonce)
+    try:
+        PPDX_SKALD.extend_nonce_to_vtpm(nonce)
+        print("Nonce extended to vTPM successfully", flush=True)
+    except Exception as e:
+        print(f"Warning: Failed to extend nonce to vTPM: {str(e)}", flush=True)
+        print("Continuing deployment...", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     print("\n" + "="*60, flush=True)

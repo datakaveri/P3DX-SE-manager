@@ -183,6 +183,32 @@ def pull_docker_image(app_name):
     subprocess.run(["docker", "pull", app_name])
 
 
+def hash_docker_image(image):
+    """
+    Returns SHA256 hash of the docker image config + layers
+    """
+    import subprocess
+    import json
+    import hashlib
+
+    result = subprocess.run(
+        ["docker", "inspect", image],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    image_json = json.loads(result.stdout)[0]
+    image_bytes = json.dumps(image_json, sort_keys=True).encode()
+
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def save_image_hash(image_hash, path="keys/image_hash.txt"):
+    with open(path, "w") as f:
+        f.write(image_hash)
+
+
 def measureDockervTPM(link):
     """Measure docker image digest into vTPM and save PCR values."""
     try:
@@ -219,6 +245,14 @@ def measureDockervTPM(link):
     except Exception as exc:
         print("Error:", exc)
 
+
+def extend_image_hash_to_vtpm(image_hash, pcr=14):
+    subprocess.run(
+        ["sudo", "tpm2_pcrextend", f"{pcr}:sha256={image_hash}"],
+        check=True
+    )
+
+
 def generate_nonce(size=32):
     import secrets, base64
     nonce = secrets.token_bytes(size)
@@ -231,10 +265,15 @@ def save_nonce(nonce, path="keys/deployment_nonce.txt"):
 
 def extend_nonce_to_vtpm(nonce, pcr=14):
     nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
-    subprocess.run([
+    result = subprocess.run([
         "sudo", "tpm2_pcrextend",
         f"{pcr}:sha256={nonce_hash}"
-    ], check=True)
+    ], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+        if not error_msg:
+            error_msg = f"Process exited with code {result.returncode}"
+        raise RuntimeError(f"Failed to extend nonce to vTPM: {error_msg}")
 
 def execute_guest_attestation():
     """Run guest attestation sample app to generate a JWT."""
@@ -257,18 +296,38 @@ def execute_guest_attestation():
             check=False
         )
         
+        stdout_info = result.stdout.strip() if result.stdout else ""
+        stderr_info = result.stderr.strip() if result.stderr else ""
+        
         if result.returncode != 0:
-            error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+            error_msg = stderr_info if stderr_info else stdout_info
             if not error_msg:
                 error_msg = f"Process exited with code {result.returncode}"
             raise RuntimeError(f"Guest attestation failed: {error_msg}")
         
         if not os.path.exists(jwt_file):
             resolved_path = os.path.abspath("../../keys/jwt-response.txt")
-            raise RuntimeError(
+            error_details = []
+            if stdout_info:
+                error_details.append(f"stdout: {stdout_info}")
+            if stderr_info:
+                error_details.append(f"stderr: {stderr_info}")
+            if not error_details:
+                error_details.append("No output captured")
+            
+            error_msg = (
                 f"JWT file was not created. Expected: {jwt_file}, "
-                f"Resolved from script dir: {resolved_path}"
+                f"Resolved from script dir: {resolved_path}. "
+                f"Script output: {'; '.join(error_details)}"
             )
+            
+            if "Error executing command" in stdout_info or stderr_info:
+                error_msg += (
+                    f" The AttestationClient command failed. "
+                    f"Please check if AttestationClient is executable and if the nonce file exists."
+                )
+            
+            raise RuntimeError(error_msg)
         
     finally:
         os.chdir(original_cwd)
