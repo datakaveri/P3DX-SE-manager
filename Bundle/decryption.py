@@ -172,14 +172,18 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     output_folders = {
         'sshKey': '/tmp/SSH_key',
         'symmetricKey': '/tmp/Symmetric_key',
-        'config': '/tmp/SKALD_input/config'
+        'config': '/tmp/SKALD_input/config',
+        'sshConfig': '/tmp/SSH_config'
     }
     
     decrypted_files = {}
     
-    for file_type in ['sshKey', 'symmetricKey', 'config']:
+    for file_type in ['sshKey', 'symmetricKey', 'config', 'sshConfig']:
         if file_type not in encrypted_files:
-            print(f"Warning: {file_type} not found in encrypted files, skipping...")
+            if file_type == 'sshConfig':
+                print(f"Warning: {file_type} not found in encrypted files, will use DPconfig.json fallback")
+            else:
+                print(f"Warning: {file_type} not found in encrypted files, skipping...")
             continue
         
         print(f"\nStep 2.{file_type}: Decrypting {file_type}...")
@@ -233,6 +237,21 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
                 import shutil
                 shutil.copy2(skald_config_path, skald_root_config_path)
                 print(f"  Copied to: {skald_root_config_path} (for Docker mount to /app/)")
+            
+            elif file_type == 'sshConfig' and output_folder == '/tmp/SSH_config':
+                # Parse JSON to validate and save with proper formatting
+                try:
+                    ssh_config_data = json.loads(decrypted_data.decode('utf-8'))
+                    ssh_config_path = os.path.join(output_folder, 'ssh-config.json')
+                    if os.path.exists(ssh_config_path):
+                        os.remove(ssh_config_path)
+                    with open(ssh_config_path, 'w') as f:
+                        json.dump(ssh_config_data, f, indent=2)
+                    os.chmod(ssh_config_path, 0o600)
+                    decrypted_files[file_type]['path'] = ssh_config_path
+                    print(f"  Saved SSH config to: {ssh_config_path}")
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    raise ValueError(f"Invalid JSON in sshConfig: {e}")
             
         except Exception as e:
             raise ValueError(f"Failed to decrypt {file_type}: {e}")

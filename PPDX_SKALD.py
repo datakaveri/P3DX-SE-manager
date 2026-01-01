@@ -24,8 +24,50 @@ from cryptography.fernet import Fernet
 
 def load_config_file(config_path="DPconfig.json"):
     """Load configuration from JSON file."""
-    with open(config_path, 'r') as f:
-        return json.load(f)
+    ssh_config_path = "/tmp/SSH_config/ssh-config.json"
+    base_config = {}
+    
+    # Load base config if it exists
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                base_config = json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load base config from {config_path}: {e}")
+    
+    # Load SSH config from bundle if available
+    ssh_config_loaded = False
+    if os.path.exists(ssh_config_path):
+        try:
+            with open(ssh_config_path, 'r') as f:
+                ssh_config = json.load(f)
+            print(f"Using SSH config from encrypted bundle: {ssh_config_path}")
+            # Merge SSH config into base config (SSH config takes precedence)
+            base_config.update(ssh_config)
+            ssh_config_loaded = True
+        except Exception as e:
+            print(f"Warning: Failed to load SSH config from bundle: {e}, using base config only")
+    
+    # Validate required SSH parameters if SSH operations will be performed
+    required_ssh_params = ['ssh_host', 'ssh_user', 'remote_data_dir', 'remote_output_dir']
+    missing_params = [param for param in required_ssh_params if param not in base_config]
+    
+    if missing_params:
+        if ssh_config_loaded:
+            raise KeyError(f"Missing required SSH parameters in bundle config: {missing_params}")
+        elif os.path.exists(config_path):
+            raise KeyError(f"Missing required SSH parameters in {config_path}: {missing_params}")
+        else:
+            raise FileNotFoundError(
+                f"SSH config not found at {ssh_config_path} and base config not found at {config_path}. "
+                f"Missing required parameters: {missing_params}"
+            )
+    
+    # Return base config if SSH config not available
+    if base_config:
+        return base_config
+    
+    raise FileNotFoundError(f"Config file not found: {config_path} and SSH config not available")
 
 
 def create_fernet_cipher(key_data):
