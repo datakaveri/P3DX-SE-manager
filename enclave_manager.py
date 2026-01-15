@@ -82,7 +82,18 @@ import logging
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
 
-ENCLAVE_131_BASE = "http://20.40.47.131:4000"
+def load_remote_enclave_base():
+    config_path = os.path.join(os.path.dirname(__file__), "DPconfig.json")
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    try:
+        return config["remote_enclave_manager"]["base_url"]
+    except KeyError as e:
+        raise RuntimeError(f"Missing required config field: {e}")
+
+ENCLAVE_131_BASE = load_remote_enclave_base()
 
 state = {
     "step": 0,
@@ -154,7 +165,7 @@ def deploy_enclave():
     # Commands that MUST be executed on 131
     payload = {
         "commands": [
-            "sudo rm -rf /home/kanonTEE/P3DX-SE-manager/keys/image_hash.txt"
+            "sudo rm -rf /home/kanonTEE/P3DX-SE-manager/keys/deployment_nonce.txt"
         ]
     }
 
