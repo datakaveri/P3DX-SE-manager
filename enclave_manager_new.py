@@ -37,9 +37,63 @@ is_app_running = False
 def before_request():
     return
 
+# @app.route("/enclave/deploy", methods=["POST"])
+# def deploy_enclave():
+#     jwt_file_path = "/home/kanonTEE/P3DX-SE-manager/keys/jwt-response.txt"
+#     subprocess.run(["sudo", "rm", "-rf", jwt_file_path], check=False, capture_output=True)
+    
+#     print("STARTING deploy")
+#     global is_app_running, stored_bundle
+    
+#     if is_app_running:
+#         print("Previous deployment detected. Restarting service to reset state...")
+#         try:
+#             PPDX_SKALD.restart_enclave_manager()
 
+#             import time
+#             time.sleep(3)
+#             is_app_running = False
+#             stored_bundle = None
+#         except Exception as e:
+#             print(f"Warning: Failed to restart service: {str(e)}")
+#             response = {
+#                 "title": "Error",
+#                 "description": f"Previous deployment detected but failed to restart service: {str(e)}"
+#             }
+#             return jsonify(response), 500
+    
+#     stored_bundle = None
 
-# DEPLOY: Deploys the SKALD enclave (ACTUAL IMPLEMENTATION)
+#     global state
+#     state = {
+#         "step": 1,
+#         "maxSteps": 5,
+#         "title": "Spawning Trusted Execution Environment (TEE)",
+#         "description": "Step 1"
+#     }
+    
+#     content = request.json if request.json else {}
+
+#     try:
+#         subprocess.Popen([
+#             "sudo", "sh", "-c", 
+#             "python3 -u deploy_enclaveSKALD.py 2>&1 | systemd-cat -t skald-deployment"
+#         ], cwd="/home/kanonTEE/P3DX-SE-manager")
+        
+#         is_app_running = True
+#         response = {
+#             "title": "Success",
+#             "description": "SKALD application execution has started."
+#         }
+#         return jsonify(response), 200
+        
+#     except Exception as e:
+#         response = {
+#             "title": "Error",
+#             "description": f"Failed to start application: {str(e)}"
+#         }
+#         return jsonify(response), 500
+
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
     jwt_file_path = "/home/kanonTEE/P3DX-SE-manager/keys/jwt-response.txt"
@@ -52,21 +106,19 @@ def deploy_enclave():
         print("Previous deployment detected. Restarting service to reset state...")
         try:
             PPDX_SKALD.restart_enclave_manager()
-
             import time
             time.sleep(3)
             is_app_running = False
             stored_bundle = None
         except Exception as e:
             print(f"Warning: Failed to restart service: {str(e)}")
-            response = {
+            return jsonify({
                 "title": "Error",
                 "description": f"Previous deployment detected but failed to restart service: {str(e)}"
-            }
-            return jsonify(response), 500
+            }), 500
     
     stored_bundle = None
-
+    
     global state
     state = {
         "step": 1,
@@ -76,28 +128,31 @@ def deploy_enclave():
     }
     
     content = request.json if request.json else {}
-
+    commands = content.get("commands", [])
+    
+    # If no commands provided, use default SKALD deployment
+    if not commands:
+       commands = ["cd /home/kanonTEE/P3DX-SE-manager && sudo sh -c 'python3 -u deploy_enclaveSKALD.py 2>&1 | systemd-cat -t skald-deployment'"]
+    
     try:
-        subprocess.Popen([
-            "sudo", "sh", "-c", 
-            "python3 -u deploy_enclaveSKALD.py 2>&1 | systemd-cat -t skald-deployment"
-        ], cwd="/home/kanonTEE/P3DX-SE-manager")
+        for cmd in commands:
+            print(f"Executing: {cmd}")
+            subprocess.Popen(
+                ["sudo", "sh", "-c", cmd],
+                cwd="/home/kanonTEE/P3DX-SE-manager"
+            )
         
         is_app_running = True
-        response = {
+        return jsonify({
             "title": "Success",
-            "description": "SKALD application execution has started."
-        }
-        return jsonify(response), 200
+            "description": "Commands accepted and execution started."
+        }), 200
         
     except Exception as e:
-        response = {
+        return jsonify({
             "title": "Error",
             "description": f"Failed to start application: {str(e)}"
-        }
-        return jsonify(response), 500
-
-
+        }), 500
 
 stored_bundle = None
 
@@ -496,7 +551,6 @@ def handle_critical_error(e):
         "title": "Error",
         "description": f"Critical error occurred. Service restarting: {str(e)}"
     }), 500
-
 
 if __name__ == "__main__":
     print("=" * 60)
