@@ -4,7 +4,7 @@ Description=AMD enclave manager systemd service
 [Service]
 User=azureuser
 WorkingDirectory=/home/azureuser/P3DX-SE-manager
-ExecStart=/home/azureuser/.env/enclaveManager/bin/gunicorn -b 0.0.0.0:4000 enclave_manager:app
+ExecStart=/home/azureuser/.env/enclaveManager/bin/gunicorn --access-logfile - --error-logfile - -b 0.0.0.0:4000 enclave_manager:app
 Restart=always
 
 [Install]

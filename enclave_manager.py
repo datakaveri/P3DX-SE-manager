@@ -1,208 +1,239 @@
-#mport requests
-from flask import Flask, jsonify, Response
-from flask import request
-import subprocess
-import os
-import json
-import stat
+# from flask import Flask, request, jsonify, Response
+# import requests
+# import logging
+
+# app = Flask(__name__)
+# logging.basicConfig(level=logging.WARNING)
+
+# enclave_base = "http://20.40.47.131:4000"
+
+
+# def forward_request(method, path):
+#     url = f"{enclave_base}{path}"
+
+#     payload = request.get_json(silent=True)
+#     if payload is None:
+#         payload = {}
+
+#     logging.warning(f"BROKER HIT: {method} {path}")
+#     logging.warning(f"Payload: {payload}")
+
+#     try:
+#         # all requests to enclave have a timeout of 30 seconds
+#         if method == "GET":
+#             resp = requests.get(url, params=request.args, timeout=30)
+
+#         elif method == "POST":
+#             resp = requests.post(
+#                 url,
+#                 json=payload,
+#                 headers={"Content-Type": "application/json"},
+#                 timeout=30
+#             )
+
+#         else:
+#             return jsonify({"error": "Method not supported"}), 405
+
+#         return Response(
+#             response=resp.content,
+#             status=resp.status_code,
+#             content_type=resp.headers.get("Content-Type", "application/json")
+#         )
+
+#     except requests.exceptions.RequestException as e:
+#         logging.error(f"Forwarding failed: {e}")
+#         return jsonify({
+#             "title": "Broker Error",
+#             "description": str(e)
+#         }), 502
+
+# @app.route("/enclave/forward", methods=["POST"])
+# def proxy_forward():
+#     return forward_request("POST", "/enclave/deploy")
+
+
+# @app.route("/enclave/jwt", methods=["GET"])
+# def proxy_jwt():
+#     return forward_request("GET", "/enclave/jwt")
+
+
+# @app.route("/enclave/bundle/upload", methods=["POST"])
+# def proxy_bundle_upload():
+#     return forward_request("POST", "/enclave/bundle/upload")
+
+
+# @app.route("/enclave/status", methods=["GET"])
+# def proxy_status():
+#     return forward_request("GET", "/enclave/status")
+
+
+# @app.route("/enclave/jwt/fresh", methods=["GET"])
+# def proxy_jwt_fresh():
+#     return forward_request("GET", "/enclave/jwt/fresh")
+
+# @app.route("/health", methods=["GET"])
+# def health():
+#     return jsonify({"status": "broker-ok"}), 200
+
+from flask import Flask, request, jsonify, Response
+import requests
 import logging
-import PPDX_SDK
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.WARNING)
 
-app_name = ""
+ENCLAVE_131_BASE = "http://20.40.47.131:4000"
 
-#default /state response (when application is not running)
-# state = {
-#     "step": 0,
-#     "maxSteps": 5,
-#     "title": "Inactive",
-#     "description": "Inactive",
-# }
+state = {
+    "step": 0,
+    "maxSteps": 5,
+    "title": "Inactive",
+    "description": "Inactive"
+}
 
-#setting the flag as false when the application is not running
 is_app_running = False
 
-@app.before_request
-def before_request():
-    return
+def forward_request(method, path):
+    url = f"{ENCLAVE_131_BASE}{path}"
 
-#DEPLOY: Deploys the enclave, builds & runs the application & saves the output in a file
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+
+    logging.warning(f"FORWARD → {method} {path}")
+    logging.warning(f"Payload: {payload}")
+
+    try:
+        if method == "GET":
+            resp = requests.get(url, params=request.args, timeout=30)
+
+        elif method == "POST":
+            resp = requests.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+        else:
+            return jsonify({"error": "Method not supported"}), 405
+
+        return Response(
+            response=resp.content,
+            status=resp.status_code,
+            content_type=resp.headers.get("Content-Type", "application/json")
+        )
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Forwarding failed: {e}")
+        return jsonify({
+            "title": "Broker Error",
+            "description": str(e)
+        }), 502
+
+
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
-    print("STARTING deploy")
-    global is_app_running
-    # global app_name
-    #check if the application is already running, if yes, return response saying so
-    # if is_app_running:
-    #     response={
-    #         "title": "Error",
-    #         "description": "Application is already running." 
-    #     }
-    #     return jsonify(response), 400
+    global is_app_running, state
 
-    # global state
-    # state = {
-    #     "step": 1,
-    #     "maxSteps": 5,
-    #     "title": "Spawning Trusted Execution Environment (TEE)",
-    #     "description": "Step 1"
-    # }
+    logging.warning("DEPLOY requested on 153")
 
-    config_file = "config.json"
-    with open(config_file, 'r') as f:
-        config = json.load(f)
-    address_coco = config["address_coco"]
+    if is_app_running:
+        return jsonify({
+            "title": "Error",
+            "description": "Deployment already in progress"
+        }), 409
 
-    PPDX_SDK.setState("Spawning Confidential Container Workload","Step 1",1,5, address_coco)
+    # UI-visible state
+    state = {
+        "step": 1,
+        "maxSteps": 5,
+        "title": "Spawning Trusted Execution Environment (TEE)",
+        "description": "Step 1"
+    }
 
-    # take as parameters the docker-compose.yml file and the json co
-    content = request.json
-    print("Content:", content)
-    
-    # app_name = content["repo"]
-    # docker_compose_url = content["url"]
-    context = content.get("context", {})
-    # context = {
-    #     "PPB_no": "T01050090085",
-    #     "crop" : "Coriander",
-    #     "crop_area" : 0.05,
-    #     "season" : "Rabi", 
-    #     "land_type" :"Irr"
-    # }
-    json_context = json.dumps(context)
-    print(json_context)
-
-    with open("context.json", "w") as f:
-        f.write(json_context)
+    # Commands that MUST be executed on 131
+    payload = {
+        "commands": [
+            "sudo rm -rf /home/kanonTEE/P3DX-SE-manager/keys/image_hash.txt"
+        ]
+    }
 
 
     try:
-        # subprocess.Popen(["sudo", "python3" , "deploy_enclave.py", docker_compose_url, json_context])
-        print("starting")
-        # command to start (kubectl)
-        os.system("kubectl delete -f farmer-credit.yaml")
-        os.system("kubectl delete configmap farmer-credit-app-context")
-        
-        os.system("kubectl create configmap farmer-credit-app-context --from-file=context.json")
-        os.system("kubectl apply -f farmer-credit.yaml")
+        resp = requests.post(
+            f"{ENCLAVE_131_BASE}/enclave/deploy",
+            json=payload,
+            timeout=10
+        )
 
-        '''
-        else:
-            if app_name == "anon_pipeline_AMD":
-                dataset_name = content["dataset_name"]
-                rs_url = content["rs_url"]
-                subprocess.Popen(["sudo", "python3" , "deploy_enclaveDP.py", dataset_name, rs_url, docker_compose_url])
-            elif app_name == "K-anonymisation-AMD":
-                dataset_name = content["dataset_name"]
-                rs_url = content["rs_url"]
-                subprocess.Popen(["sudo", "python3" , "deploy_enclaveKAnon.py", dataset_name, rs_url, docker_compose_url])
-            else:
-                subprocess.Popen(["sudo", "python3" , "deploy_enclave_pneumonia.py", docker_compose_url])
-        '''
+        if resp.status_code != 200:
+            raise RuntimeError(resp.text)
 
-        # is_app_running = True
-        response={
+        is_app_running = True
+
+        return jsonify({
             "title": "Success",
-            "description": "Application execution has started."
-        }
-        return jsonify(response), 200
+            "description": "SKALD application execution has started."
+        }), 200
+
     except Exception as e:
-        response = Response(
-            response=f"Error: {str(e)}",
-            status=500,
-            mimetype="application/json"
-        )
-    print("RUNNING FLAG: ",is_app_running)
-    return response
-
-'''
-#INFERENCE: Returns the inference as a JSON object, containing runOutput & labels
-@app.route("/enclave/inference", methods=["GET"])
-def get_inference():
-    # print("STARTING inference")
-    logger = logging.getLogger()
-    logging.debug('STARTING INFERNCE')
-    logger.handlers[0].flush()
-    global state
-    global app_name
-    if(state["step"]!=5):
-        response={
-                "title": "Error: No Inference Output/File does not exist",
-                "description": "No inference output found."
-            }
-        return jsonify(response), 403
-
-    if app_name == "anon_pipeline_AMD":
-        output_file = "/tmp/DPoutput/inference.json"
-    elif app_name == "K-anonymisation-AMD":
-        output_file = "/tmp/arx_output/inference.json"
-    elif app_name == "Smart Credit App":
-        output_file = "/tmp/FCoutput/output.json"
-    elif app_name in ["AMD_SEV_PNEUMONIA_APP", "AMD_SEV_YOLO_APP"]:
-        output_file = "/tmp/output/results.json"
-    else:
-        response={
-                "title": "Error: Incorrect app",
-                "description": "No inference output found."
-            }
-        return jsonify(response), 403
-    
-    if os.path.exists(output_file):
-        try:
-            # Use subprocess to run chmod with sudo
-            result = subprocess.run(['sudo', 'chmod', '755', output_file], 
-                                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            # Check result
-            if result.returncode == 0:
-                print(f"Successfully set a+x permissions on file: {output_file}")
-            else:
-                print(f"Failed to set permissions. Error: {result.stderr.decode()}")
-
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing sudo chmod: {e.stderr.decode()}")
-    else:
-        print(f"File not found: {output_file}")
-
-
-    if os.path.isfile(output_file):
-        f=open(output_file, "r")
-        content = f.read()
-        response = app.response_class(
-            response=content,
-            mimetype="application/json"
-        )
-        return response
-    else:
-        response={
-                "title": "Error: No Inference Output/File does not exist",
-                "description": "No inference output found."
-            }
-        return jsonify(response), 403
-
-
-#SETSTATE: Sets the state of the enclave as a JSON object
-@app.route("/enclave/setstate", methods=["POST"])
-def setState():
-    global state
-    global is_app_running
-    print("In /enclave/setstate...")
-    content = request.json
-    state = content["state"]
-    if(state["step"]==5):
-        #Resetting deploy flag as false
         is_app_running = False
-    response = app.response_class(
-        response="{ok}", status=200, mimetype="application/json"
-    )
-    return response
+        logging.error(f"Failed to start SKALD: {e}")
+
+        return jsonify({
+            "title": "Error",
+            "description": str(e)
+        }), 500
+
+# bunch of endpoints from 153
+
+@app.route("/enclave/jwt", methods=["GET"])
+def proxy_jwt():
+    return forward_request("GET", "/enclave/jwt")
 
 
-#STATE: Returns the current state of the enclave as a JSON object
+@app.route("/enclave/jwt/fresh", methods=["GET"])
+def proxy_jwt_fresh():
+    return forward_request("GET", "/enclave/jwt/fresh")
+
+
+@app.route("/enclave/bundle", methods=["GET"])
+def proxy_bundle():
+    return forward_request("GET", "/enclave/bundle")
+
+
+@app.route("/enclave/bundle/upload", methods=["POST"])
+def proxy_bundle_upload():
+    return forward_request("POST", "/enclave/bundle/upload")
+
+
+@app.route("/enclave/status", methods=["GET"])
+def proxy_status():
+    return forward_request("GET", "/enclave/status")
+
+
+@app.route("/enclave/inference", methods=["GET"])
+def proxy_inference():
+    return forward_request("GET", "/enclave/inference")
+
+
 @app.route("/enclave/state", methods=["GET"])
-def get_state():
-    global state # = {"step":3, "maxSteps":10, "title": "Building enclave,", "description":"The enclave is being compiled,"}
-    return jsonify(state) 
+def proxy_state():
+    return forward_request("GET", "/enclave/state")
 
-'''
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "broker-ok"}), 200
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Enclave Manager (BROKER)")
+    print("VM: 153")
+    print("Port: 4000")
+    print("Owns:")
+    print("  POST /enclave/deploy")
+    print("Proxies everything else to 131")
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=4000)
