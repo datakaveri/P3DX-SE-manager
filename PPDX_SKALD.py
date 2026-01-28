@@ -170,6 +170,96 @@ def extract_docker_image_from_compose(compose_file="docker-compose.yml"):
         raise ValueError("Could not extract docker image from docker-compose.yml")
 
 
+def hash_enclave_manager_code(base_dir="/home/kanonTEE/P3DX-SE-manager"):
+    """
+    Deterministically hash enclave manager code directory.
+    Stable unless code changes.
+    """
+    import hashlib, os
+
+    sha256_digest = hashlib.sha256()
+
+    for root, dirs, files in os.walk(base_dir):
+        dirs.sort()
+        files.sort()
+
+        for fname in files:
+            if fname.endswith((".py", ".sh", ".json", ".service")):
+                path = os.path.join(root, fname)
+                with open(path, "rb") as f:
+                    sha256_digest.update(f.read())
+    # if sha256_digest:
+    #     print(f"SHA256 digest for enclave manager code '{link}' is: {sha256_digest}")
+    #     extend_result = subprocess.run(
+    #         ["sudo", "tpm2_pcrextend", f"14:sha256={sha256_digest}"],
+    #         capture_output=True, text=True, check=False
+    #     )
+    #     if extend_result.returncode == 0:
+    #         print("Measurement extended successfully to PCR 14.")
+    #     else:
+    #         err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+    #         print(f"Warning: Failed to extend to PCR 14: {err}")
+
+    return sha256_digest.hexdigest()
+
+def measure_enclave_manager_vtpm():
+    """
+    Extend enclave manager code hash into PCR 14 exactly once.
+    """
+    guard_file = "/home/kanonTEE/P3DX-SE-manager/keys/pcr14_extended"
+
+    if os.path.exists(guard_file):
+        print("PCR 14 already extended — skipping")
+        return
+
+    code_hash = hash_enclave_manager_code()
+    print(f"Extending enclave manager code hash to PCR 14: {code_hash}")
+
+    result = subprocess.run(
+        ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"PCR 14 extend failed: {err}")
+    
+    pcr_values = {}
+    pcr_file_path = os.path.join("keys", "pcr_values.json")
+
+    try:
+        result = subprocess.run(
+            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n")[1:]:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    pcr_values[parts[0].strip()] = parts[1].strip()
+            print("PCR values read from TPM successfully!")
+        else:
+            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
+            print(f"Warning: Error reading PCR values: {err}")
+    except Exception as exc:
+        print(f"Warning: Error reading PCR values: {exc}")
+
+    with open(guard_file, "w") as f:
+        f.write(code_hash)
+    if os.path.exists(guard_file):
+        with open(guard_file, "r") as f:
+            code_hash = f.read().strip()
+        if code_hash and "14" not in pcr_values:
+            pcr_values["14"] = f"0x{code_hash}"
+        
+    with open(pcr_file_path, "w") as file:
+        file.write(json.dumps(pcr_values))
+    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
+
+    print("PCR 14 successfully extended")
+
+
 def generate_and_save_key_pair():
     """Generate RSA key pair, save to keys/, and return the private key object."""
     public_key_file = "public_key.pem"
@@ -268,7 +358,7 @@ def measureDockervTPM(link):
     
     try:
         result = subprocess.run(
-            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,15"],
+            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
             capture_output=True, text=True
         )
         if result.returncode == 0:
