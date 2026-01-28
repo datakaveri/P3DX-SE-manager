@@ -77,23 +77,30 @@
 
 from flask import Flask, request, jsonify, Response
 import requests
+import os
+import json
 import logging
+import time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.WARNING)
 
-def load_remote_enclave_base():
+jwt_wait_time = 180
+
+
+def load_stuff():
     config_path = os.path.join(os.path.dirname(__file__), "DPconfig.json")
 
     with open(config_path, "r") as f:
         config = json.load(f)
 
     try:
-        return config["remote_enclave_manager"]["base_url"]
+        return config["remote_enclave_manager"]["base_url"], config["maa_url"]
     except KeyError as e:
         raise RuntimeError(f"Missing required config field: {e}")
 
-ENCLAVE_131_BASE = load_remote_enclave_base()
+
+ENCLAVE_131_BASE, MAA_URL = load_stuff()
 
 state = {
     "step": 0,
@@ -103,6 +110,7 @@ state = {
 }
 
 is_app_running = False
+
 
 def forward_request(method, path):
     url = f"{ENCLAVE_131_BASE}{path}"
@@ -162,13 +170,9 @@ def deploy_enclave():
         "description": "Step 1"
     }
 
-    # Commands that MUST be executed on 131
     payload = {
-        "commands": [
-            "sudo rm -rf /home/kanonTEE/P3DX-SE-manager/keys/deployment_nonce.txt"
-        ]
+        "commands": []
     }
-
 
     try:
         resp = requests.post(
@@ -196,16 +200,86 @@ def deploy_enclave():
             "description": str(e)
         }), 500
 
-# bunch of endpoints from 153
+
+def poll_for_jwt(path, timeout_seconds, interval_seconds):
+    deadline = time.time() + timeout_seconds
+
+    while time.time() <= deadline:
+        try:
+            resp = requests.get(
+                f"{ENCLAVE_131_BASE}{path}",
+                timeout=10
+            )
+
+            if resp.status_code == 200:
+                return Response(
+                    response=resp.content,
+                    status=200,
+                    content_type=resp.headers.get("Content-Type", "application/json")
+                )
+
+            if resp.status_code == 404:
+                time.sleep(interval_seconds)
+                continue
+
+            return Response(
+                response=resp.content,
+                status=resp.status_code,
+                content_type=resp.headers.get("Content-Type", "application/json")
+            )
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"JWT polling failed: {e}")
+            time.sleep(interval_seconds)
+
+    maa_status = {
+        "status": "unknown",
+        "endpoint": MAA_URL
+    }
+
+    try:
+        start = time.time()
+        maa_resp = requests.get(MAA_URL, timeout=5)
+        latency_ms = int((time.time() - start) * 1000)
+
+        maa_status.update({
+            "status": "up",
+            "http_status": maa_resp.status_code,
+            "latency_ms": latency_ms
+        })
+
+        reason = (
+            "Timeout Error. MAA is working but failed to get JWT."
+        )
+
+    except requests.exceptions.Timeout:
+        maa_status["status"] = "timeout"
+        reason = (
+            "Timeout Error. MAA is working but couldn't get JWT."
+        )
+
+    except requests.exceptions.RequestException as e:
+        maa_status.update({
+            "status": "down",
+            "error": str(e)
+        })
+        reason = (
+            "Timeout Error. MAA is down. "
+        )
+
+    return jsonify({
+        "Error: ": reason
+    }), 504
+
 
 @app.route("/enclave/jwt", methods=["GET"])
 def proxy_jwt():
-    return forward_request("GET", "/enclave/jwt")
+    return poll_for_jwt("/enclave/jwt", 180, 3)
 
 
 @app.route("/enclave/jwt/fresh", methods=["GET"])
 def proxy_jwt_fresh():
-    return forward_request("GET", "/enclave/jwt/fresh")
+    return poll_for_jwt("/enclave/jwt/fresh", 180, 3)
 
 
 @app.route("/enclave/bundle", methods=["GET"])
