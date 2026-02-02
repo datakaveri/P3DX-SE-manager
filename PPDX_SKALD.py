@@ -3,71 +3,32 @@ import sys
 import subprocess
 import json
 import base64
-import gzip
-import tarfile
 import urllib.parse
 import time
 import shutil
-import glob
 import re
 import csv
 import hashlib
+import secrets
+from pathlib import Path
 
 import requests
-import _pickle as pickle
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
 from cryptography.fernet import Fernet
 
 
 def load_config_file(config_path="DPconfig.json"):
     """Load configuration from JSON file."""
-    ssh_config_path = "/tmp/SSH_config/ssh-config.json"
-    base_config = {}
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     
-    # Load base config if it exists
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                base_config = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load base config from {config_path}: {e}")
-    
-    # Load SSH config from bundle if available
-    ssh_config_loaded = False
-    if os.path.exists(ssh_config_path):
-        try:
-            with open(ssh_config_path, 'r') as f:
-                ssh_config = json.load(f)
-            print(f"Using SSH config from encrypted bundle: {ssh_config_path}")
-            # Merge SSH config into base config (SSH config takes precedence)
-            base_config.update(ssh_config)
-            ssh_config_loaded = True
-        except Exception as e:
-            print(f"Warning: Failed to load SSH config from bundle: {e}, using base config only")
-    
-    # Validate required SSH parameters if SSH operations will be performed
-    required_ssh_params = ['ssh_host', 'ssh_user', 'remote_data_dir', 'remote_output_dir']
-    missing_params = [param for param in required_ssh_params if param not in base_config]
-    
-    if missing_params:
-        if ssh_config_loaded:
-            raise KeyError(f"Missing required SSH parameters in bundle config: {missing_params}")
-        elif os.path.exists(config_path):
-            raise KeyError(f"Missing required SSH parameters in {config_path}: {missing_params}")
-        else:
-            raise FileNotFoundError(
-                f"SSH config not found at {ssh_config_path} and base config not found at {config_path}. "
-                f"Missing required parameters: {missing_params}"
-            )
-    
-    # Return base config if SSH config not available
-    if base_config:
-        return base_config
-    
-    raise FileNotFoundError(f"Config file not found: {config_path} and SSH config not available")
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        return config
+    except Exception as e:
+        raise ValueError(f"Failed to load config from {config_path}: {e}")
 
 
 def create_fernet_cipher(key_data):
@@ -87,60 +48,6 @@ def create_fernet_cipher(key_data):
             raise ValueError(f"Invalid key format: {len(key_data)} bytes")
 
 
-def find_ssh_key(ssh_key_dir="/tmp/SSH_key"):
-    """Find SSH key file in directory and set permissions."""
-    ssh_key_files = glob.glob(os.path.join(ssh_key_dir, '*'))
-    if not ssh_key_files:
-        raise FileNotFoundError(f"No SSH key found in {ssh_key_dir}")
-    ssh_key_path = ssh_key_files[0]
-    os.chmod(ssh_key_path, 0o600)
-    return ssh_key_path
-
-
-def build_ssh_command(ssh_key_path, ssh_user, ssh_host, remote_command):
-    """Build SSH command with standard options."""
-    return [
-        'ssh',
-        '-i', ssh_key_path,
-        '-o', 'StrictHostKeyChecking=no',
-        '-o', 'UserKnownHostsFile=/dev/null',
-        '-o', 'ConnectTimeout=10',
-        f'{ssh_user}@{ssh_host}',
-        remote_command
-    ]
-
-
-def build_scp_command(ssh_key_path, ssh_user, ssh_host, source_path, dest_path, is_upload=True):
-    """Build SCP command with standard options.
-    
-    Args:
-        ssh_key_path: Path to SSH private key
-        ssh_user: SSH username
-        ssh_host: SSH hostname/IP
-        source_path: Source file path (local if uploading, remote if downloading)
-        dest_path: Destination path (remote if uploading, local if downloading)
-        is_upload: True for upload (local->remote), False for download (remote->local)
-    """
-    if is_upload:
-        remote_path = f'{ssh_user}@{ssh_host}:{dest_path}'
-        return [
-            'scp',
-            '-i', ssh_key_path,
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'UserKnownHostsFile=/dev/null',
-            source_path,
-            remote_path
-        ]
-    else:
-        remote_path = f'{ssh_user}@{ssh_host}:{source_path}'
-        return [
-            'scp',
-            '-i', ssh_key_path,
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'UserKnownHostsFile=/dev/null',
-            remote_path,
-            dest_path
-        ]
 
 
 def pull_compose_file(url, filename="docker-compose.yml"):
@@ -170,98 +77,10 @@ def extract_docker_image_from_compose(compose_file="docker-compose.yml"):
         raise ValueError("Could not extract docker image from docker-compose.yml")
 
 
-def hash_enclave_manager_code(base_dir="/home/kanonTEE/P3DX-SE-manager"):
-    """
-    Deterministically hash enclave manager code directory.
-    Stable unless code changes.
-    """
-    import hashlib, os
-
-    sha256_digest = hashlib.sha256()
-
-    for root, dirs, files in os.walk(base_dir):
-        dirs.sort()
-        files.sort()
-
-        for fname in files:
-            if fname.endswith((".py", ".sh", ".json", ".service")):
-                path = os.path.join(root, fname)
-                with open(path, "rb") as f:
-                    sha256_digest.update(f.read())
-    # if sha256_digest:
-    #     print(f"SHA256 digest for enclave manager code '{link}' is: {sha256_digest}")
-    #     extend_result = subprocess.run(
-    #         ["sudo", "tpm2_pcrextend", f"14:sha256={sha256_digest}"],
-    #         capture_output=True, text=True, check=False
-    #     )
-    #     if extend_result.returncode == 0:
-    #         print("Measurement extended successfully to PCR 14.")
-    #     else:
-    #         err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-    #         print(f"Warning: Failed to extend to PCR 14: {err}")
-
-    return sha256_digest.hexdigest()
-
-def measure_enclave_manager_vtpm():
-    """
-    Extend enclave manager code hash into PCR 14 exactly once.
-    """
-    guard_file = "/home/kanonTEE/P3DX-SE-manager/keys/pcr14_extended"
-
-    if os.path.exists(guard_file):
-        print("PCR 14 already extended — skipping")
-        return
-
-    code_hash = hash_enclave_manager_code()
-    print(f"Extending enclave manager code hash to PCR 14: {code_hash}")
-
-    result = subprocess.run(
-        ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"PCR 14 extend failed: {err}")
-    
-    pcr_values = {}
-    pcr_file_path = os.path.join("keys", "pcr_values.json")
-
-    try:
-        result = subprocess.run(
-            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n")[1:]:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    pcr_values[parts[0].strip()] = parts[1].strip()
-            print("PCR values read from TPM successfully!")
-        else:
-            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
-            print(f"Warning: Error reading PCR values: {err}")
-    except Exception as exc:
-        print(f"Warning: Error reading PCR values: {exc}")
-
-    with open(guard_file, "w") as f:
-        f.write(code_hash)
-    if os.path.exists(guard_file):
-        with open(guard_file, "r") as f:
-            code_hash = f.read().strip()
-        if code_hash and "14" not in pcr_values:
-            pcr_values["14"] = f"0x{code_hash}"
-        
-    with open(pcr_file_path, "w") as file:
-        file.write(json.dumps(pcr_values))
-    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
-
-    print("PCR 14 successfully extended")
 
 
 def generate_and_save_key_pair():
-    """Generate RSA key pair, save to keys/, and return the private key object."""
+    """Generate RSA key pair and save to keys/ directory."""
     public_key_file = "public_key.pem"
     private_key_file = "private_key.pem"
 
@@ -302,11 +121,7 @@ def generate_and_save_key_pair():
     with open(os.path.join("keys", public_key_file), "w") as file:
         file.writelines(cleaned_lines)
 
-    with open("keys/private_key.pem", "r") as pem_file:
-        private_key_pem = pem_file.read()
-        print("Using Private Key to Decrypt data")
-    key = RSA.import_key(private_key_pem)
-    return key
+    print("Private key generated and saved successfully")
 
 
 def pull_docker_image(app_name):
@@ -338,24 +153,83 @@ def save_image_hash(image_hash, path="keys/image_hash.txt"):
         f.write(image_hash)
 
 
-def measureDockervTPM(link):
-    """Extend image digest to PCR 15, read PCR values, and save to pcr_values.json."""
+def hash_enclave_manager_code(base_dir="/home/kanonTEE/P3DX-SE-manager"):
+    """
+    Deterministically hash enclave manager code directory.
+    """
+    sha256_digest = hashlib.sha256()
+
+    # Files to include in hash (deterministic order)
+    files_to_hash = []
+    
+    for root, dirs, files in os.walk(base_dir):
+        # Sort for deterministic order
+        dirs.sort()
+        files.sort()
+        
+        # Skip certain directories
+        skip_dirs = {'.git', '__pycache__', '.mono', 'keys', 'node_modules', '.pytest_cache'}
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        
+        for fname in files:
+            # Only hash source code and config files
+            if fname.endswith((".py", ".sh", ".json", ".service", ".md", ".txt", ".yaml", ".yml")):
+                # Skip files in keys directory and other excluded paths
+                if 'keys' in root or '.git' in root or '__pycache__' in root:
+                    continue
+                path = os.path.join(root, fname)
+                files_to_hash.append(path)
+    
+    # Sort files for deterministic hashing
+    files_to_hash.sort()
+    
+    # Hash each file's content
+    for file_path in files_to_hash:
+        try:
+            with open(file_path, "rb") as f:
+                file_content = f.read()
+            # Include relative path in hash to ensure file location matters
+            rel_path = os.path.relpath(file_path, base_dir)
+            sha256_digest.update(rel_path.encode('utf-8'))
+            sha256_digest.update(file_content)
+        except Exception as e:
+            print(f"Warning: Could not hash {file_path}: {e}")
+    
+    return sha256_digest.hexdigest()
+
+
+def save_code_hash(code_hash, path="keys/code_hash.txt"):
+    """Save enclave manager code hash to file."""
+    with open(path, "w") as f:
+        f.write(code_hash)
+
+
+def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager"):
+    """
+    Hash enclave manager code directory and extend to PCR 14.
+    """
     pcr_values = {}
     pcr_file_path = os.path.join("keys", "pcr_values.json")
     
-    sha256_digest = hash_docker_image(link)
-    if sha256_digest:
-        print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
+    print(f"Hashing enclave manager code directory: {base_dir}")
+    code_hash = hash_enclave_manager_code(base_dir)
+    
+    if code_hash:
+        print(f"SHA256 digest for enclave manager code is: {code_hash}")
+        save_code_hash(code_hash)
+        
+        # Extend to PCR 14
         extend_result = subprocess.run(
-            ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
+            ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
             capture_output=True, text=True, check=False
         )
         if extend_result.returncode == 0:
-            print("Measurement extended successfully to PCR 15.")
+            print("Enclave manager code hash extended successfully to PCR 14.")
         else:
             err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-            print(f"Warning: Failed to extend to PCR 15: {err}")
+            print(f"Warning: Failed to extend to PCR 14: {err}")
     
+    # Read PCR values
     try:
         result = subprocess.run(
             ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
@@ -373,12 +247,64 @@ def measureDockervTPM(link):
     except Exception as exc:
         print(f"Warning: Error reading PCR values: {exc}")
     
-    image_hash_path = os.path.join("keys", "image_hash.txt")
-    if os.path.exists(image_hash_path):
-        with open(image_hash_path, "r") as f:
-            image_hash = f.read().strip()
-        if image_hash and "15" not in pcr_values:
-            pcr_values["15"] = f"0x{image_hash}"
+    # Update pcr_values.json if it exists, otherwise create new
+    if os.path.exists(pcr_file_path):
+        try:
+            with open(pcr_file_path, "r") as f:
+                existing_values = json.load(f)
+            existing_values.update(pcr_values)
+            pcr_values = existing_values
+        except:
+            pass
+    
+    with open(pcr_file_path, "w") as file:
+        file.write(json.dumps(pcr_values))
+    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
+
+
+def measureDockervTPM(link):
+    """Extend image digest to PCR 15, read PCR values, and save to pcr_values.json."""
+    pcr_file_path = os.path.join("keys", "pcr_values.json")
+    
+    # Load existing PCR values
+    pcr_values = {}
+    if os.path.exists(pcr_file_path):
+        try:
+            with open(pcr_file_path, "r") as f:
+                pcr_values = json.load(f)
+        except:
+            pass
+    
+    sha256_digest = hash_docker_image(link)
+    if sha256_digest:
+        print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
+        extend_result = subprocess.run(
+            ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
+            capture_output=True, text=True, check=False
+        )
+        if extend_result.returncode == 0:
+            print("Measurement extended successfully to PCR 15.")
+        else:
+            err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+            print(f"Warning: Failed to extend to PCR 15: {err}")
+    
+    # Read PCR values from TPM
+    try:
+        result = subprocess.run(
+            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n")[1:]:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    pcr_values[parts[0].strip()] = parts[1].strip()
+            print("PCR values read from TPM successfully!")
+        else:
+            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
+            print(f"Warning: Error reading PCR values: {err}")
+    except Exception as exc:
+        print(f"Warning: Error reading PCR values: {exc}")
     
     with open(pcr_file_path, "w") as file:
         file.write(json.dumps(pcr_values))
@@ -386,7 +312,7 @@ def measureDockervTPM(link):
 
 
 def generate_nonce(size=32):
-    import secrets, base64
+    """Generate a cryptographically secure random nonce."""
     nonce = secrets.token_bytes(size)
     return base64.urlsafe_b64encode(nonce).decode("utf-8")
 
@@ -394,18 +320,6 @@ def generate_nonce(size=32):
 def save_nonce(nonce, path="keys/deployment_nonce.txt"):
     with open(path, "w") as f:
         f.write(nonce)
-
-def extend_nonce_to_vtpm(nonce, pcr=14):
-    nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
-    result = subprocess.run([
-        "sudo", "tpm2_pcrextend",
-        f"{pcr}:sha256={nonce_hash}"
-    ], capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
-        if not error_msg:
-            error_msg = f"Process exited with code {result.returncode}"
-        raise RuntimeError(f"Failed to extend nonce to vTPM: {error_msg}")
 
 def execute_guest_attestation():
     """Run guest attestation sample app to generate a JWT."""
@@ -465,36 +379,6 @@ def execute_guest_attestation():
         os.chdir(original_cwd)
 
 
-def getTokenFromAPD(jwt_file, config, dataset, rs_url):
-    """Send JWT to APD for verification and return the access token."""
-    apd_url = config["apd_url"]
-    headers = {
-        "clientId": config["clientId"],
-        "clientSecret": config["clientSecret"],
-        "Content-Type": config["Content-Type"],
-    }
-
-    with open("keys/" + jwt_file, "r") as file:
-        token = file.read().strip()
-
-    context = {"jwtMAA": token, "dataset_name": dataset, "rs_url": rs_url}
-    data = {
-        "itemId": config["itemId"],
-        "itemType": config["itemType"],
-        "role": config["role"],
-        "context": context,
-    }
-    r = requests.post(apd_url, headers=headers, data=json.dumps(data))
-    if r.status_code == 200:
-        print("Token verified and Token recieved.")
-        jsonResponse = r.json()
-        token = jsonResponse.get("results").get("accessToken")
-        print(token)
-        return token
-    print("Token verification failed.", r.text)
-    sys.exit()
-
-
 def call_set_state_endpoint(state, address):
     """Helper to call the enclave setstate endpoint."""
     endpoint_url = urllib.parse.urljoin(address, "/enclave/setstate")
@@ -514,178 +398,13 @@ def setState(title, description, step, maxSteps, address):
     call_set_state_endpoint(state, address)
 
 
-def pullconfig(url, token, key):
-    """Pull and decrypt DP application config from resource server."""
-    print("Pulling DP application config from RS..")
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Failed to download file. Status code: {response.status_code}")
-        return
-
-    loadedDict = pickle.loads(response.content)
-    print("Data downloaded successfully")
-    
-    encryptedKey = base64.b64decode(loadedDict["encryptedKey"])
-    decryptor = PKCS1_OAEP.new(key)
-    plainKey = decryptor.decrypt(encryptedKey)
-    print("Symmetric key decrypted using the enclave's private RSA key.")
-    
-    fernetKey = Fernet(plainKey)
-    decryptedConfig = fernetKey.decrypt(loadedDict["encConfig"])
-    print("Config decrypted")
-
-    decryptedConfigDict = json.loads(decryptedConfig.decode("utf-8"))
-    config_path = os.path.expanduser("/tmp/DPinput/config")
-    os.makedirs(config_path, exist_ok=True)
-    config_file = os.path.join(config_path, "config.json")
-    with open(config_file, "w") as json_file:
-        json.dump(decryptedConfigDict, json_file, indent=4)
-    print("Decrypted config written to tmp/DPinput/config")
-
-
-def getChunkFromResourceServer(n, url, token):
-    """Fetch encrypted chunk n from the resource server."""
-    rs_url = f"{url}{n}"
-    headers = {"Authorization": f"Bearer {token}"}
-    print(rs_url)
-    response = requests.get(rs_url, headers=headers)
-    if response.status_code == 200:
-        print("Token authenticated and Encrypted data recieved.")
-        return pickle.loads(response.content)
-    print(response.text)
-    return None
-
-
-def decryptChunk(loadedDict, n, key):
-    """Decrypt one chunk and write it to /tmp/DPinput."""
-    print("Decrypting chunk..")
-    encryptedKey = base64.b64decode(loadedDict["encryptedKey"])
-    decryptor = PKCS1_OAEP.new(key)
-    plainKey = decryptor.decrypt(encryptedKey)
-    fernetKey = Fernet(plainKey)
-    decryptedData = fernetKey.decrypt(loadedDict["encData"])
-
-    temp_dir = os.path.expanduser("/tmp/DPinput")
-    decrypted_data_folder = os.path.join(temp_dir, "encrypted_data")
-    extracted_data_folder = os.path.join(temp_dir, "inputdata")
-    os.makedirs(decrypted_data_folder, exist_ok=True)
-    os.makedirs(extracted_data_folder, exist_ok=True)
-
-    decrypted_data_path = os.path.join(decrypted_data_folder, f"outfile{n}.gz")
-    if os.path.exists(decrypted_data_path):
-        os.remove(decrypted_data_path)
-    with open(decrypted_data_path, "wb") as f:
-        f.write(decryptedData)
-
-    with gzip.open(decrypted_data_path, "rb") as file:
-        data = file.read().decode("utf-8")
-        json_data = json.loads(data)
-
-    outfile_path = os.path.join(extracted_data_folder, f"data{n}.json")
-    with open(outfile_path, "w", encoding="utf-8") as outfile:
-        outfile.write("[\n")
-        for i, record in enumerate(json_data):
-            json_record = json.dumps(record, indent=4)
-            outfile.write(json_record + (",\n" if i < len(json_data) - 1 else "\n"))
-        outfile.write("]\n")
-
-
-def dataChunkN(n, url, access_token, key):
-    """Pull and decrypt chunk n; return 1 on success else 0."""
-    loadedDict = getChunkFromResourceServer(n, url, access_token)
-    if not loadedDict:
-        return 0
-    decryptChunk(loadedDict, n, key)
-    return 1
-
-
-def getInferenceFernetKey(key, url, access_token):
-    """Retrieve the Fernet key for encrypting inference output."""
-    print("Getting the inference Fernet key..")
-    print("Accessing: ", url)
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code == 200:
-        print("Token authenticated and pickle file recieved.")
-        loadedDict = pickle.loads(response.content)
-        print(loadedDict.keys())
-        b64encryptedKey = loadedDict["encryptedKey"]
-    else:
-        print(response.text)
-        return None
-
-    print("The b64encryptedKey is: ", b64encryptedKey)
-    encrypted_inference_key = base64.b64decode(b64encryptedKey)
-    decryptor = PKCS1_OAEP.new(key)
-    return decryptor.decrypt(encrypted_inference_key)
-
-
-def encryptInference(inference_key):
-    """Package and encrypt inference output located in /tmp/DPoutput."""
-    print("Encrypting inference")
-    output_file = os.path.expanduser("/tmp/DPoutput/concat_output.json")
-    config_dir = os.path.expanduser("/tmp/DPinput/config")
-
-    with open(output_file, "r") as f:
-        concat_output = json.load(f)
-
-    files = os.listdir(config_dir)
-    if len(files) != 1:
-        raise Exception(f"Expected exactly one file in {config_dir}, but found {len(files)} files.")
-
-    config_file_path = os.path.join(config_dir, files[0])
-    with open(config_file_path, "r") as f:
-        config = json.load(f)
-    concat_output["dataset"] = config["data_type"]
-
-    with open(output_file, "w") as f:
-        json.dump(concat_output, f, indent=4)
-
-    inference_file = os.path.expanduser("/tmp/DPoutput/inference.json")
-    os.rename(output_file, inference_file)
-    print(f"File renamed and saved as {inference_file}")
-
-    print("Encrypting the output file")
-    tarball = "pipelineOutput.tar"
-    tar = tarfile.open(tarball, "w")
-    tar.add(inference_file, arcname="inference.json")
-    tar.close()
-
-    fernet = Fernet(inference_key)
-    with open(tarball, "r+b") as dataFile:
-        enc_inference = fernet.encrypt(dataFile.read())
-
-    pickled_data = pickle.dumps({
-        "encInference": enc_inference,
-        "tarName": "pipelineOutput.tar"
-    })
-    os.remove(tarball)
-    return pickled_data
-
-
-def sendInference(inference, access_token, url):
-    """Send encrypted inference to the resource server."""
-    print("Sending the inference to: ", url)
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.post(url, headers=headers, data=inference)
-    if response.status_code == 200:
-        print("Success!")
-    else:
-        print("Request failed with status code:", response.status_code)
-    print(response.text)
-
-
 def ensure_skald_folders():
     """Create SKALD folders if they don't exist and clean old files."""
     folders = [
         '/tmp/SKALD_input/input_file',
         '/tmp/SKALD_input/config',
         '/tmp/SKALD_output',
-        '/tmp/SKALD_keys',
-        '/tmp/SSH_key',
-        '/tmp/Symmetric_key'
+        '/tmp/urls'
     ]
     
     for folder in folders:
@@ -763,7 +482,6 @@ def save_bundle_to_file(bundle_data, bundle_path="Bundle/encrypted.json"):
 
 def decrypt_bundle_skald(bundle_path, private_key_path):
     """Decrypt bundle using decryption.py logic."""
-    import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Bundle'))
     from decryption import decrypt_bundle
     
@@ -773,8 +491,7 @@ def decrypt_bundle_skald(bundle_path, private_key_path):
 
 
 def fetch_and_decrypt_data(config_path="DPconfig.json"):
-    """Fetch encrypted data from remote server and decrypt using fetch_data.py logic."""
-    import sys
+    """Fetch encrypted data from Azure Blob Storage and decrypt using fetch_data.py logic."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Fetch_data'))
     from fetch_data import fetch_and_decrypt
     
@@ -993,9 +710,7 @@ def get_skald_status_and_preview():
 
 
 def restart_enclave_manager():
-    import subprocess
-    import time
-    
+    """Restart the enclave manager systemd service."""
     print("Restarting enclavemanager service...", flush=True)
     result = subprocess.run(
         ["sudo", "systemctl", "restart", "enclavemanager.service"],

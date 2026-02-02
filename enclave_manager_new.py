@@ -47,15 +47,12 @@ def deploy_enclave():
     
     print("STARTING deploy")
     global is_app_running, stored_bundle
-
-    manager_code_hash = PPDX_SKALD.measure_enclave_manager_vtpm()
     
     if is_app_running:
         print("Previous deployment detected. Restarting service to reset state...")
         try:
             PPDX_SKALD.restart_enclave_manager()
 
-            import time
             time.sleep(3)
             is_app_running = False
             stored_bundle = None
@@ -118,7 +115,6 @@ def get_jwt():
     print("Fetching JWT token...")
     base_dir = "/home/kanonTEE/P3DX-SE-manager"
     jwt_file_path = os.path.join(base_dir, "keys", "jwt-response.txt")
-    pcr14_path = os.path.join(base_dir, "keys", "pcr14_extended")
     
     if not os.path.exists(jwt_file_path):
         response = {
@@ -137,11 +133,6 @@ def get_jwt():
         
         with open(jwt_file_path, "r") as f:
             jwt_token = f.read().strip()
-
-        pcr14_value = None
-        if os.path.exists(pcr14_path):
-            with open(pcr14_path, "r") as f:
-                pcr14_value = f.read().strip()
         
         if not jwt_token:
             response = {
@@ -154,8 +145,7 @@ def get_jwt():
         
         response = {
             "title": "Success",
-            "jwt": jwt_token,
-            "pcr14": pcr14_value
+            "jwt": jwt_token
         }
         return jsonify(response), 200
         
@@ -222,23 +212,22 @@ def get_fresh_jwt():
             print("Key pair generated successfully")
 
         try:
+            # Measure enclave manager code
+            PPDX_SKALD.measure_enclave_manager_code_vtpm()
+            print("Enclave manager code hash measured successfully")
+            
+            # Measure Docker image
             link = PPDX_SKALD.extract_docker_image_from_compose()
             PPDX_SKALD.measureDockervTPM(link)        
             print("Application image hash measured successfully")
         except Exception as e:
-            print(f"Warning: Failed to measure application image: {str(e)}")
+            print(f"Warning: Failed to measure code/image: {str(e)}")
         
         # new nonce generated every time a fresh endpoint is hit
         print("Generating fresh deployment nonce...")
         nonce = PPDX_SKALD.generate_nonce()                  
         PPDX_SKALD.save_nonce(nonce)                         
         print(f"Generated deployment nonce: {nonce}")
-
-        try:
-            PPDX_SKALD.extend_nonce_to_vtpm(nonce)            
-            print("Nonce extended to vTPM successfully")
-        except Exception as e:
-            print(f"Warning: Failed to extend nonce to vTPM: {str(e)}")
 
         print("Executing guest attestation to generate new JWT...")
         PPDX_SKALD.execute_guest_attestation()
@@ -257,12 +246,6 @@ def get_fresh_jwt():
         with open(jwt_file_path, "r") as f:
             jwt_token = f.read().strip()
         
-        pcr14_path = os.path.join(base_dir, "keys", "pcr14_extended")
-        pcr14_value = None
-        if os.path.exists(pcr14_path):
-            with open(pcr14_path, "r") as f:
-                pcr14_value = f.read().strip()
-        
         if not jwt_token:
             response = {
                 "title": "Error: Empty JWT",
@@ -274,8 +257,7 @@ def get_fresh_jwt():
         
         response = {
             "title": "Success",
-            "jwt": jwt_token,
-            "pcr14": pcr14_value
+            "jwt": jwt_token
         }
         return jsonify(response), 200
         
@@ -386,7 +368,7 @@ def get_inference():
     if os.path.exists(output_file):
         try:
             result = subprocess.run(
-                ['sudo', 'chmod', '755', output_file], 
+                ['sudo', 'chmod', '644', output_file], 
                 check=True, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE

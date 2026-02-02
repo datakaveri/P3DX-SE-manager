@@ -1,9 +1,8 @@
 import subprocess
 import os
-import json
 import shutil
-import time
 import sys
+import traceback
 import PPDX_SKALD as PPDX_SKALD
 
 # Force unbuffered output for live logging
@@ -93,24 +92,22 @@ def main():
     image_hash = PPDX_SKALD.hash_docker_image(link)
     PPDX_SKALD.save_image_hash(image_hash)
 
-    # Step 4 - Measuring image and storing in vTPM
+    # Step 4 - Measuring enclave manager code and Docker image into vTPM
     print("\n" + "="*60, flush=True)
-    print("Step 4: Measuring Docker Image into vTPM", flush=True)
+    print("Step 4: Measuring Code and Docker Image into vTPM", flush=True)
     print("="*60, flush=True)
-    box_out("Measuring Docker image into vTPM...")
+    box_out("Measuring enclave manager code")
+    PPDX_SKALD.measure_enclave_manager_code_vtpm()
+    print("Enclave manager code measured and stored", flush=True)
+    
+    box_out("Measuring Docker image...")
     PPDX_SKALD.measureDockervTPM(link)
-    print("Image measured and stored in vTPM", flush=True)
+    print("Docker image measured and stored", flush=True)
 
     # Step 4.5 - Generate deployment nonce
     nonce = PPDX_SKALD.generate_nonce()
     PPDX_SKALD.save_nonce(nonce)
     print(f"Generated deployment nonce: {nonce}", flush=True)
-    try:
-        PPDX_SKALD.extend_nonce_to_vtpm(nonce)
-        print("Nonce extended to vTPM successfully", flush=True)
-    except Exception as e:
-        print(f"Warning: Failed to extend nonce to vTPM: {str(e)}", flush=True)
-        print("Continuing deployment...", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     print("\n" + "="*60, flush=True)
