@@ -3,13 +3,13 @@
 
 import json
 import base64
-import struct
 import hmac
 import hashlib
 import os
+import shutil
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 
 
@@ -19,11 +19,6 @@ def base64url_decode(data: str) -> bytes:
     if padding:
         data += '=' * (4 - padding)
     return base64.b64decode(data.replace('-', '+').replace('_', '/'))
-
-
-def base64url_encode(data: bytes) -> str:
-    """Encode bytes to base64url string."""
-    return base64.b64encode(data).decode('utf-8').rstrip('=').replace('+', '-').replace('/', '_')
 
 
 def decrypt_fernet_token(token_b64url: str, fernet_key: bytes) -> bytes:
@@ -85,7 +80,7 @@ def decrypt_rsa_wrapped_key(wrapped_key_b64: str, private_key_path: str, passwor
 
 def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = None, key_password: str = None, debug: bool = False):
     """
-    Decrypt the entire bundle and save decrypted files.
+    Decrypt the bundle and save decrypted files and URLs.
     
     Args:
         bundle_path: Path to encrypted JSON bundle file
@@ -96,33 +91,9 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     """
     with open(bundle_path, 'r') as f:
         data = json.load(f)
-    
-    # Handle nested JSON structure where bundle is stored as string
-    # Can be: {'bundle': '...'} or {'bundle': {'bundle': '...'}}
     if 'bundle' in data:
-        bundle_value = data['bundle']
-        
-        if isinstance(bundle_value, str):
-            # Bundle is a JSON string, parse it
-            bundle = json.loads(bundle_value)
-            if debug:
-                pass
-        elif isinstance(bundle_value, dict):
-            # Bundle is a dict - check if it has another 'bundle' key
-            if 'bundle' in bundle_value and isinstance(bundle_value['bundle'], str):
-                # Double nested: {'bundle': {'bundle': '...'}}
-                bundle = json.loads(bundle_value['bundle'])
-                if debug:
-                    pass
-            else:
-                # Bundle is already a dict with the actual bundle data
-                bundle = bundle_value
-                if debug:
-                    print("Detected nested JSON structure (dict)")
-        else:
-            bundle = data
+        bundle = data['bundle']
     else:
-        # No 'bundle' key, use data directly
         bundle = data
     
     if debug:
@@ -137,20 +108,20 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     if bundle_version and bundle_version != '1.0':
         print(f"Warning: Bundle version {bundle_version} (expected 1.0)")
     
-    payload = bundle.get('payload', bundle if 'encryptedFiles' in bundle else {})
+    payload = bundle.get('payload', {})
     if not payload:
         raise ValueError(f"Missing payload in bundle: {list(bundle.keys())}")
     
     metadata = bundle.get('metadata', {})
-    wrapped_key = payload.get('wrappedKey') or bundle.get('wrappedKey') or bundle.get('encryptedFernetKey')
+    wrapped_key = payload.get('wrappedKey')
     if not wrapped_key:
-        raise ValueError(f"Missing wrappedKey: {list(payload.keys())}")
+        raise ValueError(f"Missing wrappedKey in payload: {list(payload.keys())}")
     
     encrypted_files = payload.get('encryptedFiles', {})
-    if not encrypted_files:
-        encrypted_files = {k: payload[k] for k in ['sshKey', 'symmetricKey', 'config'] if k in payload}
-        if not encrypted_files:
-            raise ValueError(f"Missing encryptedFiles: {list(payload.keys())}")
+    encrypted_urls = payload.get('encryptedUrls', {})
+    
+    if not encrypted_files and not encrypted_urls:
+        raise ValueError(f"Missing encryptedFiles and encryptedUrls in payload: {list(payload.keys())}")
     
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -169,113 +140,90 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     
     file_names = metadata.get('fileNames', {})
     original_sizes = metadata.get('originalSizes', {})
-    output_folders = {
-        'sshKey': '/tmp/SSH_key',
-        'symmetricKey': '/tmp/Symmetric_key',
-        'config': '/tmp/SKALD_input/config',
-        'sshConfig': '/tmp/SSH_config'
-    }
-    
     decrypted_files = {}
+    decrypted_urls = {}
     
-    for file_type in ['sshKey', 'symmetricKey', 'config', 'sshConfig']:
-        if file_type not in encrypted_files:
-            if file_type == 'sshConfig':
-                print(f"Warning: {file_type} not found in encrypted files, will use DPconfig.json fallback")
-            else:
-                print(f"Warning: {file_type} not found in encrypted files, skipping...")
-            continue
-        
-        print(f"\nStep 2.{file_type}: Decrypting {file_type}...")
+    # Decrypt config file
+    if 'config' in encrypted_files:
+        print(f"\nStep 2: Decrypting config file...")
         try:
-            encrypted_token = encrypted_files[file_type]
+            encrypted_token = encrypted_files['config']
             decrypted_data = decrypt_fernet_token(encrypted_token, fernet_key)
             
-            expected_size = original_sizes.get(file_type)
+            expected_size = original_sizes.get('config')
             if expected_size and len(decrypted_data) != expected_size:
-                print(f"Size mismatch: {len(decrypted_data)} vs {expected_size} bytes")
+                print(f"Warning: Size mismatch: {len(decrypted_data)} vs {expected_size} bytes")
             
-            output_folder = output_folders.get(file_type)
-            original_filename = file_names.get(file_type, f'{file_type}.decrypted')
-            
-            if output_folder:
-                os.makedirs(output_folder, exist_ok=True)
-                output_path = os.path.join(output_folder, original_filename)
-            else:
-                output_path = os.path.join(output_dir, original_filename)
-                
-                if os.path.exists(output_path):
-                        import shutil
-                (shutil.rmtree if os.path.isdir(output_path) else os.remove)(output_path)
+            original_filename = file_names.get('config', 'generated-config.json')
+            output_folder = '/tmp/SKALD_input/config'
+            os.makedirs(output_folder, exist_ok=True)
+            output_path = os.path.join(output_folder, original_filename)
             
             with open(output_path, 'wb') as f:
                 f.write(decrypted_data)
             os.chmod(output_path, 0o600)
             
-            decrypted_files[file_type] = {
-                'path': output_path,
+            # Rename to kconfig_beneficiary.json for SKALD
+            skald_config_path = os.path.join(output_folder, 'kconfig_beneficiary.json')
+            if os.path.exists(skald_config_path):
+                os.remove(skald_config_path)
+            os.rename(output_path, skald_config_path)
+            
+            # Also copy to /tmp/SKALD_input/ for Docker mount
+            skald_root_config_path = '/tmp/SKALD_input/kconfig_beneficiary.json'
+            os.makedirs('/tmp/SKALD_input', exist_ok=True)
+            shutil.copy2(skald_config_path, skald_root_config_path)
+            
+            decrypted_files['config'] = {
+                'path': skald_config_path,
+                'root_path': skald_root_config_path,
                 'size': len(decrypted_data),
-                'original_filename': original_filename,
-                'folder': output_folder if output_folder else output_dir
+                'original_filename': original_filename
             }
             
-            print(f"{file_type} decrypted successfully")
-            print(f"  Saved to: {output_path}")
+            print(f"Config decrypted successfully")
+            print(f"  Saved to: {skald_config_path}")
+            print(f"  Copied to: {skald_root_config_path} (for Docker mount)")
             print(f"  Size: {len(decrypted_data)} bytes")
             
-            # Special handling for config file: rename to kconfig_beneficiary.json for SKALD
-            if file_type == 'config' and output_folder == '/tmp/SKALD_input/config':
-                skald_config_path = os.path.join(output_folder, 'kconfig_beneficiary.json')
-                if os.path.exists(skald_config_path):
-                    os.remove(skald_config_path)
-                os.rename(output_path, skald_config_path)
-                decrypted_files[file_type]['path'] = skald_config_path
-                print(f"  Renamed to: {skald_config_path} (SKALD expected filename)")
-                
-                # Also copy to /tmp/SKALD_input/ so it mounts to /app/kconfig_beneficiary.json in Docker
-                skald_root_config_path = '/tmp/SKALD_input/kconfig_beneficiary.json'
-                import shutil
-                shutil.copy2(skald_config_path, skald_root_config_path)
-                print(f"  Copied to: {skald_root_config_path} (for Docker mount to /app/)")
-            
-            elif file_type == 'sshConfig' and output_folder == '/tmp/SSH_config':
-                # Parse JSON to validate and save with proper formatting
-                try:
-                    ssh_config_data = json.loads(decrypted_data.decode('utf-8'))
-                    ssh_config_path = os.path.join(output_folder, 'ssh-config.json')
-                    if os.path.exists(ssh_config_path):
-                        os.remove(ssh_config_path)
-                    with open(ssh_config_path, 'w') as f:
-                        json.dump(ssh_config_data, f, indent=2)
-                    os.chmod(ssh_config_path, 0o600)
-                    decrypted_files[file_type]['path'] = ssh_config_path
-                    print(f"  Saved SSH config to: {ssh_config_path}")
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                    raise ValueError(f"Invalid JSON in sshConfig: {e}")
-            
         except Exception as e:
-            raise ValueError(f"Failed to decrypt {file_type}: {e}")
+            raise ValueError(f"Failed to decrypt config: {e}")
+    
+    # Decrypt encrypted URLs
+    if encrypted_urls:
+        print(f"\nStep 3: Decrypting encrypted URLs...")
+        for url_type in ['blobUrl', 'keyVaultUrl']:
+            if url_type in encrypted_urls:
+                try:
+                    encrypted_token = encrypted_urls[url_type]
+                    decrypted_url = decrypt_fernet_token(encrypted_token, fernet_key).decode('utf-8')
+                    decrypted_urls[url_type] = decrypted_url
+                    print(f"  {url_type}: {decrypted_url}")
+                except Exception as e:
+                    raise ValueError(f"Failed to decrypt {url_type}: {e}")
+        
+        # Save decrypted URLs to a JSON file
+        if decrypted_urls:
+            urls_dir = '/tmp/urls'
+            os.makedirs(urls_dir, exist_ok=True)
+            urls_output_path = os.path.join(urls_dir, 'decrypted_urls.json')
+            with open(urls_output_path, 'w') as f:
+                json.dump(decrypted_urls, f, indent=2)
+            os.chmod(urls_output_path, 0o600)
+            print(f"\n  Decrypted URLs saved to: {urls_output_path}")
     
     print("\n" + "="*60)
     print("Decryption Summary")
     print("="*60)
     for file_type, info in decrypted_files.items():
         print(f"  {file_type}: {info['path']} ({info['size']} bytes)")
+    if decrypted_urls:
+        print(f"\n  Decrypted URLs:")
+        for url_type, url in decrypted_urls.items():
+            print(f"    {url_type}: {url}")
     print("="*60)
     
-
-def extract_bundle_from_encrypted_json(encrypted_json_path: str) -> str:
-    """Extract nested bundle JSON if present."""
-    with open(encrypted_json_path, 'r') as f:
-        data = json.load(f)
-    
-    if 'bundle' in data and isinstance(data['bundle'], str):
-        bundle_dir = os.path.dirname(os.path.abspath(encrypted_json_path))
-        bundle_json_path = os.path.join(bundle_dir, 'bundle.json')
-        with open(bundle_json_path, 'w') as f:
-            json.dump(json.loads(data['bundle']), f, indent=2)
-        return bundle_json_path
-    return encrypted_json_path
-
-
-
+    return {
+        'files': decrypted_files,
+        'urls': decrypted_urls
+    }

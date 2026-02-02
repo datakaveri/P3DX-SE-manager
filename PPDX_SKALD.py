@@ -493,10 +493,10 @@ def decrypt_bundle_skald(bundle_path, private_key_path):
 def fetch_and_decrypt_data(config_path="DPconfig.json"):
     """Fetch encrypted data from Azure Blob Storage and decrypt using fetch_data.py logic."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Fetch_data'))
-    from fetch_data import fetch_and_decrypt
+    from fetch_data import fetch_and_decrypt_tee
     
-    print("Fetching and decrypting data from remote server...")
-    fetch_and_decrypt(config_path)
+    print("Fetching and decrypting data from Azure Blob Storage...")
+    fetch_and_decrypt_tee()
     print("Data fetched and decrypted successfully")
 
 
@@ -552,26 +552,32 @@ def run_docker_containers():
 
 
 def encrypt_inference_skald(config_path="DPconfig.json"):
-    """Encrypt inference output and upload to remote server."""
-    config = load_config_file(config_path)
+    """Encrypt inference output and upload to Azure Blob Storage."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Fetch_data'))
+    from fetch_data import fetch_fernet_key_from_kv, upload_blob
     
-    remote_host = config["ssh_host"]
-    remote_user = config["ssh_user"]
-    remote_output_dir = config["remote_output_dir"]
-    
-    symmetric_key_path = "/tmp/Symmetric_key"
     output_dir = "/tmp/SKALD_output"
+    urls_path = Path("/tmp/urls/decrypted_urls.json")
     
-    if os.path.isdir(symmetric_key_path):
-        key_files = glob.glob(os.path.join(symmetric_key_path, '*'))
-        if not key_files:
-            raise FileNotFoundError(f"No key files found in {symmetric_key_path}")
-        symmetric_key_path = key_files[0]
+    if not urls_path.exists():
+        raise FileNotFoundError(
+            f"decrypted_urls.json not found at {urls_path}. "
+            "Cannot determine upload location without decrypted URLs."
+        )
     
-    with open(symmetric_key_path, 'rb') as f:
-        key_data = f.read().strip()
+    # Read decrypted URLs to get Key Vault URL for encryption key
+    with open(urls_path, "r") as f:
+        urls = json.load(f)
     
-    cipher = create_fernet_cipher(key_data)
+    if "keyVaultUrl" not in urls:
+        raise ValueError("keyVaultUrl not found in decrypted_urls.json")
+    
+    keyvault_url = urls["keyVaultUrl"]
+    
+    # Fetch Fernet key from Key Vault for encryption
+    print("Fetching encryption key from Key Vault...")
+    fernet_key = fetch_fernet_key_from_kv(keyvault_url)
+    cipher = create_fernet_cipher(fernet_key)
     
     required_files = ["generalized.csv", "symmetric_keys.json"]
     output_files = []
@@ -585,8 +591,18 @@ def encrypt_inference_skald(config_path="DPconfig.json"):
     
     print(f"Found {len(output_files)} required file(s)")
     
-    ssh_key_path = find_ssh_key()
+    # Determine upload blob URL base from input blob URL
+    blob_base_url = None
+    if "blobUrl" in urls:
+        # Extract base URL (container URL) from input blob URL
+        input_blob_url = urls["blobUrl"]
+        # Remove the filename to get container base URL
+        blob_base_url = "/".join(input_blob_url.split("/")[:-1])
     
+    if not blob_base_url:
+        raise ValueError("Cannot determine blob storage URL for uploads")
+    
+    # Upload each encrypted file
     for output_file in output_files:
         print(f"Encrypting {output_file}...")
         with open(output_file, 'rb') as f:
@@ -599,16 +615,16 @@ def encrypt_inference_skald(config_path="DPconfig.json"):
         with open(temp_encrypted, 'wb') as f:
             f.write(encrypted_data)
         
-        remote_path = f"{remote_output_dir}/{encrypted_filename}"
-        print(f"Uploading to {remote_user}@{remote_host}:{remote_path}...")
+        # Construct upload blob URL
+        upload_blob_url = f"{blob_base_url}/output/{encrypted_filename}"
+        print(f"Uploading to blob storage: {upload_blob_url}...")
         
-        scp_cmd = build_scp_command(ssh_key_path, remote_user, remote_host, temp_encrypted, remote_path)
-        
-        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0:
-            print(f"Uploaded {encrypted_filename}")
-        else:
-            print(f"Failed to upload {encrypted_filename}: {result.stderr}")
+        try:
+            upload_blob(upload_blob_url, temp_encrypted)
+            print(f"Successfully uploaded {encrypted_filename}")
+        except Exception as e:
+            print(f"Failed to upload {encrypted_filename}: {e}")
+            raise
         
         os.remove(temp_encrypted)
     
