@@ -79,7 +79,7 @@ def main():
     print("="*60, flush=True)
     box_out("Generating and saving key pair...")
     PPDX_SKALD.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address)
-    key = PPDX_SKALD.generate_and_save_key_pair()
+    PPDX_SKALD.generate_and_save_key_pair()
     print("Key pair generated", flush=True)
     
     # Step 3 - Docker image pulling
@@ -144,13 +144,13 @@ def main():
     PPDX_SKALD.setState("Decrypting bundle", "Step 8", 8, 11, address)
     private_key_path = "keys/private_key.pem"
     PPDX_SKALD.decrypt_bundle_skald(bundle_path, private_key_path)
-    print("Bundle decrypted. Config, SSH key, and symmetric key saved", flush=True)
+    print("Bundle decrypted. Config and URLs saved", flush=True)
     
     # Step 9 - Fetch and decrypt data
     print("\n" + "="*60, flush=True)
     print("Step 9: Fetching and Decrypting Data", flush=True)
     print("="*60, flush=True)
-    box_out("Fetching encrypted data from remote server...")
+    box_out("Fetching encrypted data from Azure Blob Storage...")
     PPDX_SKALD.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
     PPDX_SKALD.fetch_and_decrypt_data(config_file)
     print("Data fetched, decrypted, and saved", flush=True)
@@ -170,7 +170,7 @@ def main():
     box_out("Encrypting inference output...")
     PPDX_SKALD.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
     PPDX_SKALD.encrypt_inference_skald(config_file)
-    print("Inference encrypted and uploaded to remote server", flush=True)
+    print("Inference encrypted and uploaded to Azure Blob Storage", flush=True)
     
     
     # Final state
@@ -191,7 +191,6 @@ if __name__ == "__main__":
         exit(1)
     except Exception as e:
         print(f"\n\nERROR: {e}", flush=True)
-        import traceback
         traceback.print_exc()
         PPDX_SKALD.restart_enclave_manager()
         exit(1)
