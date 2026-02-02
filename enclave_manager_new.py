@@ -53,7 +53,6 @@ def deploy_enclave():
         try:
             PPDX_SKALD.restart_enclave_manager()
 
-            import time
             time.sleep(3)
             is_app_running = False
             stored_bundle = None
@@ -211,19 +210,25 @@ def get_fresh_jwt():
             print("Keys not found. Generating new key pair...")
             PPDX_SKALD.generate_and_save_key_pair()
             print("Key pair generated successfully")
+
+        try:
+            # Measure enclave manager code
+            PPDX_SKALD.measure_enclave_manager_code_vtpm()
+            print("Enclave manager code hash measured successfully")
+            
+            # Measure Docker image
+            link = PPDX_SKALD.extract_docker_image_from_compose()
+            PPDX_SKALD.measureDockervTPM(link)        
+            print("Application image hash measured successfully")
+        except Exception as e:
+            print(f"Warning: Failed to measure code/image: {str(e)}")
         
-        nonce_path = os.path.join(keys_dir, "deployment_nonce.txt")
-        if not os.path.exists(nonce_path):
-            print("Deployment nonce not found. Generating new nonce...")
-            nonce = PPDX_SKALD.generate_nonce()
-            PPDX_SKALD.save_nonce(nonce)
-            print(f"Generated deployment nonce: {nonce}")
-            try:
-                PPDX_SKALD.extend_nonce_to_vtpm(nonce)
-                print("Nonce extended to vTPM successfully")
-            except Exception as e:
-                print(f"Warning: Failed to extend nonce to vTPM: {str(e)}")
-        
+        # new nonce generated every time a fresh endpoint is hit
+        print("Generating fresh deployment nonce...")
+        nonce = PPDX_SKALD.generate_nonce()                  
+        PPDX_SKALD.save_nonce(nonce)                         
+        print(f"Generated deployment nonce: {nonce}")
+
         print("Executing guest attestation to generate new JWT...")
         PPDX_SKALD.execute_guest_attestation()
         
@@ -363,7 +368,7 @@ def get_inference():
     if os.path.exists(output_file):
         try:
             result = subprocess.run(
-                ['sudo', 'chmod', '755', output_file], 
+                ['sudo', 'chmod', '644', output_file], 
                 check=True, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE
