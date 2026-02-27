@@ -595,6 +595,7 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     
     print(f"Found {len(output_files)} file(s) to encrypt and upload")
     
+    # Upload each encrypted file
     for output_file in output_files:
         print(f"Encrypting {output_file}...")
         with open(output_file, 'rb') as f:
