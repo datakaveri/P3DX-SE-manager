@@ -1,9 +1,8 @@
 import subprocess
 import os
-import json
 import shutil
-import time
 import sys
+import traceback
 import PPDX_SKALD as PPDX_SKALD
 
 # Force unbuffered output for live logging
@@ -11,7 +10,11 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 
-DOCKER_COMPOSE_URL = "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml"
+def get_compose_url():
+    """Get Docker Compose URL from command line argument."""
+    if len(sys.argv) < 2:
+        raise ValueError("compose_url is required. Usage: python deploy_enclaveSKALD.py <compose_url>")
+    return sys.argv[1]
 
 
 
@@ -30,7 +33,7 @@ def box_out(message):
 
 
 def cleanup_and_prepare_folders():
-    """Clean up old files and prepare SKALD folders."""
+    """Clean up old files and prepare TEE folders."""
     print("Cleaning up and preparing folders...", flush=True)
     
     docker_compose_file = os.path.join('.', 'docker-compose.yml')
@@ -48,13 +51,15 @@ def cleanup_and_prepare_folders():
         os.remove(bundle_file)
         print(f"Removed: {bundle_file}", flush=True)
     
-    PPDX_SKALD.ensure_skald_folders()
+    PPDX_SKALD.ensure_tee_folders()
 
 
 def main():
     """Main deployment workflow."""
+    compose_url = get_compose_url()
+    
     print("="*60, flush=True)
-    print("SKALD Enclave Deployment", flush=True)
+    print("TEE Enclave Deployment", flush=True)
     print("="*60, flush=True)
     
     config_file = "DPconfig.json"
@@ -68,7 +73,7 @@ def main():
     print("Step 1: Pulling Docker Compose from GitHub", flush=True)
     print("="*60, flush=True)
     box_out("Pulling Docker Compose from GitHub...")
-    PPDX_SKALD.pull_compose_file(DOCKER_COMPOSE_URL)
+    PPDX_SKALD.pull_compose_file(compose_url)
     print('Extracting docker image link...', flush=True)
     
     link = PPDX_SKALD.extract_docker_image_from_compose()
@@ -80,7 +85,7 @@ def main():
     print("="*60, flush=True)
     box_out("Generating and saving key pair...")
     PPDX_SKALD.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address)
-    key = PPDX_SKALD.generate_and_save_key_pair()
+    PPDX_SKALD.generate_and_save_key_pair()
     print("Key pair generated", flush=True)
     
     # Step 3 - Docker image pulling
@@ -93,24 +98,22 @@ def main():
     image_hash = PPDX_SKALD.hash_docker_image(link)
     PPDX_SKALD.save_image_hash(image_hash)
 
-    # Step 4 - Measuring image and storing in vTPM
+    # Step 4 - Measuring enclave manager code and Docker image into vTPM
     print("\n" + "="*60, flush=True)
-    print("Step 4: Measuring Docker Image into vTPM", flush=True)
+    print("Step 4: Measuring Code and Docker Image into vTPM", flush=True)
     print("="*60, flush=True)
-    box_out("Measuring Docker image into vTPM...")
+    box_out("Measuring enclave manager code")
+    PPDX_SKALD.measure_enclave_manager_code_vtpm()
+    print("Enclave manager code measured and stored", flush=True)
+    
+    box_out("Measuring Docker image...")
     PPDX_SKALD.measureDockervTPM(link)
-    print("Image measured and stored in vTPM", flush=True)
+    print("Docker image measured and stored", flush=True)
 
     # Step 4.5 - Generate deployment nonce
     nonce = PPDX_SKALD.generate_nonce()
     PPDX_SKALD.save_nonce(nonce)
     print(f"Generated deployment nonce: {nonce}", flush=True)
-    try:
-        PPDX_SKALD.extend_nonce_to_vtpm(nonce)
-        print("Nonce extended to vTPM successfully", flush=True)
-    except Exception as e:
-        print(f"Warning: Failed to extend nonce to vTPM: {str(e)}", flush=True)
-        print("Continuing deployment...", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
     print("\n" + "="*60, flush=True)
@@ -147,13 +150,13 @@ def main():
     PPDX_SKALD.setState("Decrypting bundle", "Step 8", 8, 11, address)
     private_key_path = "keys/private_key.pem"
     PPDX_SKALD.decrypt_bundle_skald(bundle_path, private_key_path)
-    print("Bundle decrypted. Config, SSH key, and symmetric key saved", flush=True)
+    print("Bundle decrypted. Config and URLs saved", flush=True)
     
     # Step 9 - Fetch and decrypt data
     print("\n" + "="*60, flush=True)
     print("Step 9: Fetching and Decrypting Data", flush=True)
     print("="*60, flush=True)
-    box_out("Fetching encrypted data from remote server...")
+    box_out("Fetching encrypted data from Azure Blob Storage...")
     PPDX_SKALD.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
     PPDX_SKALD.fetch_and_decrypt_data(config_file)
     print("Data fetched, decrypted, and saved", flush=True)
@@ -172,8 +175,8 @@ def main():
     print("="*60, flush=True)
     box_out("Encrypting inference output...")
     PPDX_SKALD.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
-    PPDX_SKALD.encrypt_inference_skald(config_file)
-    print("Inference encrypted and uploaded to remote server", flush=True)
+    PPDX_SKALD.encrypt_and_upload_output(config_file)
+    print("Inference encrypted and uploaded to Azure Blob Storage", flush=True)
     
     
     # Final state
@@ -194,7 +197,6 @@ if __name__ == "__main__":
         exit(1)
     except Exception as e:
         print(f"\n\nERROR: {e}", flush=True)
-        import traceback
         traceback.print_exc()
         PPDX_SKALD.restart_enclave_manager()
         exit(1)

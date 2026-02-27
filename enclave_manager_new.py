@@ -1,22 +1,34 @@
 from flask import Flask, jsonify, Response, request
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 import subprocess
 import os
 import json
+import time
 import logging
 import PPDX_SKALD
 
 
 app = Flask(__name__)
 
-# Enable CORS for all routes
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:5173", "http://localhost:3000", "https://spider.p3dx.iudx.org.in/"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# Enable CORS for all routes with proper configuration
+# Remove trailing slashes from origins - CORS matching is strict
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": [
+                 "http://localhost:5173",
+                 "http://localhost:3000", 
+                 "https://spider.p3dx.iudx.org.in"
+             ],
+             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+             "expose_headers": ["Content-Type", "Authorization"],
+             "supports_credentials": True,
+             "max_age": 3600
+         }
+     },
+     supports_credentials=True)
 
 
 # Default state when application is not running
@@ -33,9 +45,8 @@ is_app_running = False
 
 
 
-@app.before_request
-def before_request():
-    return
+# Removed after_request handler - flask-cors already handles CORS headers
+# Adding duplicate headers causes "multiple values" error
 
 
 
@@ -53,7 +64,6 @@ def deploy_enclave():
         try:
             PPDX_SKALD.restart_enclave_manager()
 
-            import time
             time.sleep(3)
             is_app_running = False
             stored_bundle = None
@@ -76,12 +86,20 @@ def deploy_enclave():
     }
     
     content = request.json if request.json else {}
+    compose_url = content.get("compose_url")
+
+    if not compose_url:
+        return jsonify({
+            "title": "Error",
+            "description": "compose_url is required in request payload"
+        }), 400
 
     try:
-        subprocess.Popen([
-            "sudo", "sh", "-c", 
-            "python3 -u deploy_enclaveSKALD.py 2>&1 | systemd-cat -t skald-deployment"
-        ], cwd="/home/kanonTEE/P3DX-SE-manager")
+        cmd = f"python3 -u deploy_enclaveSKALD.py {repr(compose_url)} 2>&1 | systemd-cat -t skald-deployment"
+        subprocess.Popen(
+            ["sudo", "sh", "-c", cmd],
+            cwd="/home/kanonTEE/P3DX-SE-manager"
+        )
         
         is_app_running = True
         response = {
@@ -211,19 +229,25 @@ def get_fresh_jwt():
             print("Keys not found. Generating new key pair...")
             PPDX_SKALD.generate_and_save_key_pair()
             print("Key pair generated successfully")
+
+        try:
+            # Measure enclave manager code
+            PPDX_SKALD.measure_enclave_manager_code_vtpm()
+            print("Enclave manager code hash measured successfully")
+            
+            # Measure Docker image
+            link = PPDX_SKALD.extract_docker_image_from_compose()
+            PPDX_SKALD.measureDockervTPM(link)        
+            print("Application image hash measured successfully")
+        except Exception as e:
+            print(f"Warning: Failed to measure code/image: {str(e)}")
         
-        nonce_path = os.path.join(keys_dir, "deployment_nonce.txt")
-        if not os.path.exists(nonce_path):
-            print("Deployment nonce not found. Generating new nonce...")
-            nonce = PPDX_SKALD.generate_nonce()
-            PPDX_SKALD.save_nonce(nonce)
-            print(f"Generated deployment nonce: {nonce}")
-            try:
-                PPDX_SKALD.extend_nonce_to_vtpm(nonce)
-                print("Nonce extended to vTPM successfully")
-            except Exception as e:
-                print(f"Warning: Failed to extend nonce to vTPM: {str(e)}")
-        
+        # new nonce generated every time a fresh endpoint is hit
+        print("Generating fresh deployment nonce...")
+        nonce = PPDX_SKALD.generate_nonce()                  
+        PPDX_SKALD.save_nonce(nonce)                         
+        print(f"Generated deployment nonce: {nonce}")
+
         print("Executing guest attestation to generate new JWT...")
         PPDX_SKALD.execute_guest_attestation()
         
@@ -358,12 +382,12 @@ def get_inference():
         return jsonify(response), 403
 
 
-    output_file = "/tmp/SKALD_output/inference.json"
+    output_file = "/tmp/tee_output/status.json"
     
     if os.path.exists(output_file):
         try:
             result = subprocess.run(
-                ['sudo', 'chmod', '755', output_file], 
+                ['sudo', 'chmod', '644', output_file], 
                 check=True, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE
@@ -433,41 +457,21 @@ def get_state():
     return jsonify(state)
 
 
-# STATUS: Returns SKALD processing status and CSV preview (if successful)
+# STATUS: Returns application status
 @app.route("/enclave/status", methods=["GET"])
-def get_skald_status():
-    """Poll endpoint for SKALD processing status.
+def get_app_status_endpoint():
+    """Poll endpoint for application status.
     
-    Returns:
-        - {"status": "processing"} if status.json doesn't exist yet (still running)
-        - {"status": "success", "preview": [...], "outputs": {...}} on successful completion
-        - {"status": "error", "error": {...}} on failure
+    Returns status.json content
     """
-    print("Fetching SKALD status...")
+    print("Fetching application status...")
     
     try:
-        status_response = PPDX_SKALD.get_skald_status_and_preview()
-        
-        if status_response.get("status") == "processing":
-            return jsonify(status_response), 200
-        
-        elif status_response.get("status") == "success":
-            return jsonify(status_response), 200
-        
-        elif status_response.get("status") == "error":
-            return jsonify(status_response), 200
-        
-        else:
-            return jsonify({
-                "status": "error",
-                "error": {
-                    "code": "INVALID_RESPONSE",
-                    "message": "Invalid status response format"
-                }
-            }), 500
+        status_response = PPDX_SKALD.get_app_status()
+        return jsonify(status_response), 200
             
     except Exception as e:
-        print(f"Error fetching SKALD status: {str(e)}")
+        print(f"Error fetching status: {str(e)}")
         return jsonify({
             "status": "error",
             "error": {
@@ -481,21 +485,57 @@ def get_skald_status():
 # Error handler for critical errors that require service restart
 @app.errorhandler(Exception)
 def handle_critical_error(e):
-    """Handle critical errors by restarting the service."""
+    """Handle critical errors by restarting the service.
+    
+    Excludes:
+    - HTTP exceptions (404, 400, etc.) - normal routing errors
+    - PermissionError - file permission issues, should be handled in routes
+    - OSError/IOError - file system errors, usually recoverable
+    
+    Only actual application crashes and unhandled exceptions trigger service restart.
+    """
+    # Skip HTTP exceptions - these are normal routing errors, not critical failures
+    if isinstance(e, HTTPException):
+        # Return proper JSON response with CORS headers for HTTP errors
+        response = jsonify({
+            "title": "Error",
+            "description": f"{e.code} {e.name}: {e.description}"
+        })
+        response.status_code = e.code
+        return response
+    
+    # Skip file permission and I/O errors - these are recoverable and should be handled in routes
+    if isinstance(e, (PermissionError, OSError, IOError)):
+        print(f"File system error (non-critical): {str(e)}")
+        traceback.print_exc()
+        response = jsonify({
+            "title": "Error",
+            "description": f"File system error: {str(e)}. Please check file permissions and try again."
+        })
+        response.status_code = 500
+        return response
+    
+    # Only handle actual critical errors (unhandled exceptions, crashes, etc.)
     print(f"Critical error in manager: {str(e)}")
-    import traceback
     traceback.print_exc()
     
-    # Restart service on critical errors
+    # Restart service on critical errors only
+    # Use a flag to prevent infinite restart loops
+    restart_attempted = False
     try:
         PPDX_SKALD.restart_enclave_manager()
+        restart_attempted = True
+        print("Service restart initiated successfully")
     except Exception as restart_error:
-        print(f"Failed to restart service: {str(restart_error)}")
+        error_msg = str(restart_error) if restart_error else "Unknown error"
+        print(f"Failed to restart service: {error_msg}")
     
-    return jsonify({
+    response = jsonify({
         "title": "Error",
-        "description": f"Critical error occurred. Service restarting: {str(e)}"
-    }), 500
+        "description": f"Critical error occurred. {'Service restarting' if restart_attempted else 'Service restart failed'}: {str(e)}"
+    })
+    response.status_code = 500
+    return response
 
 
 if __name__ == "__main__":
