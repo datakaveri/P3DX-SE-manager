@@ -16,6 +16,27 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
 
+# Ensure Bundle directory is in path for decryption import
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_bundle_dir = os.path.join(_script_dir, 'Bundle')
+_fetch_data_dir = os.path.join(_script_dir, 'Fetch_data')
+if _bundle_dir not in sys.path:
+    sys.path.insert(0, _bundle_dir)
+from decryption import decrypt_bundle
+
+# Lazy import for fetch_data
+_fetch_data_module = None
+
+
+def _get_fetch_data():
+    """Import fetch_data once; required due to circular dependency."""
+    global _fetch_data_module
+    if _fetch_data_module is None:
+        if _fetch_data_dir not in sys.path:
+            sys.path.insert(0, _fetch_data_dir)
+        import fetch_data as _fetch_data_module
+    return _fetch_data_module
+
 
 def load_config_file(config_path="DPconfig.json"):
     """Load configuration from JSON file."""
@@ -479,11 +500,8 @@ def save_bundle_to_file(bundle_data, bundle_path="Bundle/encrypted.json"):
     return bundle_path
 
 
-def decrypt_bundle_skald(bundle_path, private_key_path):
+def decrypt_bundle_tee(bundle_path, private_key_path):
     """Decrypt bundle using decryption.py logic."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Bundle'))
-    from decryption import decrypt_bundle
-    
     print("Decrypting bundle...")
     decrypt_bundle(bundle_path, private_key_path)
     print("Bundle decrypted successfully")
@@ -491,11 +509,9 @@ def decrypt_bundle_skald(bundle_path, private_key_path):
 
 def fetch_and_decrypt_data(config_path="DPconfig.json"):
     """Fetch encrypted data from Azure Blob Storage and decrypt using fetch_data.py logic."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Fetch_data'))
-    from fetch_data import fetch_and_decrypt_tee
-    
+    fetch_data = _get_fetch_data()
     print("Fetching and decrypting data from Azure Blob Storage...")
-    fetch_and_decrypt_tee()
+    fetch_data.fetch_and_decrypt_tee()
     print("Data fetched and decrypted successfully")
 
 
@@ -514,7 +530,7 @@ def run_docker_containers():
         print(f"ERROR: Docker Compose 'up' failed with exit code {start_result.returncode}", flush=True)
         print(f"Stderr: {start_result.stderr}", flush=True)
         print(f"Stdout: {start_result.stdout}", flush=True)
-        raise RuntimeError(f"SKALD application failed to start. Check logs for details.")
+        raise RuntimeError(f"Application failed to start. Check logs for details.")
     
     print("Containers started. Following container logs live...", flush=True)
     print("="*60, flush=True)
@@ -552,9 +568,7 @@ def run_docker_containers():
 
 def encrypt_and_upload_output(config_path="DPconfig.json"):
     """Encrypt all files in output folder and upload to Azure Blob Storage."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Fetch_data'))
-    from fetch_data import fetch_fernet_key_from_kv, upload_blob
-    
+    fetch_data = _get_fetch_data()
     output_dir = "/tmp/tee_output"
     urls_path = Path("/tmp/urls/decrypted_urls.json")
 
@@ -578,7 +592,7 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     container_base_url = urls["outputContainerUrl"].rstrip("/")
     
     print("Fetching encryption key from Key Vault...")
-    fernet_key = fetch_fernet_key_from_kv(keyvault_url)
+    fernet_key = fetch_data.fetch_fernet_key_from_kv(keyvault_url)
     cipher = create_fernet_cipher(fernet_key)
     
     if not os.path.exists(output_dir):
@@ -612,7 +626,7 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
         print(f"Uploading to blob storage: {upload_blob_url}...")
         
         try:
-            upload_blob(upload_blob_url, temp_encrypted)
+            fetch_data.upload_blob(upload_blob_url, temp_encrypted)
             print(f"Successfully uploaded {encrypted_filename}")
         except Exception as e:
             print(f"Failed to upload {encrypted_filename}: {e}")

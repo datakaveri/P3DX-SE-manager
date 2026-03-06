@@ -8,8 +8,12 @@ import sys
 import traceback
 from pathlib import Path
 from email.utils import formatdate
-
 import requests
+
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+from P3DX_SDK import create_fernet_cipher
 
 # ===============================
 # Managed Identity + Azure helpers
@@ -76,9 +80,6 @@ def upload_blob(blob_url, file_path):
 
 def decrypt_file(encrypted_path, fernet_key_bytes, output_path):
     """Decrypt file using Fernet key bytes."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__))))
-    from PPDX_SKALD import create_fernet_cipher
-
     try:
         cipher = create_fernet_cipher(fernet_key_bytes)
     except Exception as e:
@@ -107,9 +108,6 @@ def decrypt_file(encrypted_path, fernet_key_bytes, output_path):
 
 def encrypt_file(input_path, fernet_key_bytes, encrypted_output_path):
     """Encrypt file using Fernet key bytes."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__))))
-    from PPDX_SKALD import create_fernet_cipher
-
     try:
         cipher = create_fernet_cipher(fernet_key_bytes)
     except Exception as e:

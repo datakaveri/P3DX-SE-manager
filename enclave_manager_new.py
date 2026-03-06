@@ -6,7 +6,7 @@ import os
 import json
 import time
 import logging
-import PPDX_SKALD
+import P3DX_SDK
 
 
 app = Flask(__name__)
@@ -50,7 +50,7 @@ is_app_running = False
 
 
 
-# DEPLOY: Deploys the SKALD enclave (ACTUAL IMPLEMENTATION)
+# DEPLOY: Deploys the TEE enclave
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
     jwt_file_path = "/home/kanonTEE/P3DX-SE-manager/keys/jwt-response.txt"
@@ -62,7 +62,7 @@ def deploy_enclave():
     if is_app_running:
         print("Previous deployment detected. Restarting service to reset state...")
         try:
-            PPDX_SKALD.restart_enclave_manager()
+            P3DX_SDK.restart_enclave_manager()
 
             time.sleep(3)
             is_app_running = False
@@ -95,7 +95,7 @@ def deploy_enclave():
         }), 400
 
     try:
-        cmd = f"python3 -u deploy_enclaveSKALD.py {repr(compose_url)} 2>&1 | systemd-cat -t skald-deployment"
+        cmd = f"python3 -u deploy_enclave.py {repr(compose_url)} 2>&1 | systemd-cat -t tee-deployment"
         subprocess.Popen(
             ["sudo", "sh", "-c", cmd],
             cwd="/home/kanonTEE/P3DX-SE-manager"
@@ -104,7 +104,7 @@ def deploy_enclave():
         is_app_running = True
         response = {
             "title": "Success",
-            "description": "SKALD application execution has started."
+            "description": "Application execution has started."
         }
         return jsonify(response), 200
         
@@ -227,29 +227,29 @@ def get_fresh_jwt():
         
         if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
             print("Keys not found. Generating new key pair...")
-            PPDX_SKALD.generate_and_save_key_pair()
+            P3DX_SDK.generate_and_save_key_pair()
             print("Key pair generated successfully")
 
         try:
             # Measure enclave manager code
-            PPDX_SKALD.measure_enclave_manager_code_vtpm()
+            P3DX_SDK.measure_enclave_manager_code_vtpm()
             print("Enclave manager code hash measured successfully")
             
             # Measure Docker image
-            link = PPDX_SKALD.extract_docker_image_from_compose()
-            PPDX_SKALD.measureDockervTPM(link)        
+            link = P3DX_SDK.extract_docker_image_from_compose()
+            P3DX_SDK.measureDockervTPM(link)        
             print("Application image hash measured successfully")
         except Exception as e:
             print(f"Warning: Failed to measure code/image: {str(e)}")
         
         # new nonce generated every time a fresh endpoint is hit
         print("Generating fresh deployment nonce...")
-        nonce = PPDX_SKALD.generate_nonce()                  
-        PPDX_SKALD.save_nonce(nonce)                         
+        nonce = P3DX_SDK.generate_nonce()                  
+        P3DX_SDK.save_nonce(nonce)                         
         print(f"Generated deployment nonce: {nonce}")
 
         print("Executing guest attestation to generate new JWT...")
-        PPDX_SKALD.execute_guest_attestation()
+        P3DX_SDK.execute_guest_attestation()
         
         subprocess.run(
             ["sudo", "chown", f"{os.getenv('USER', 'kanonTEE')}:{os.getenv('USER', 'kanonTEE')}", jwt_file_path],
@@ -467,7 +467,7 @@ def get_app_status_endpoint():
     print("Fetching application status...")
     
     try:
-        status_response = PPDX_SKALD.get_app_status()
+        status_response = P3DX_SDK.get_app_status()
         return jsonify(status_response), 200
             
     except Exception as e:
@@ -523,7 +523,7 @@ def handle_critical_error(e):
     # Use a flag to prevent infinite restart loops
     restart_attempted = False
     try:
-        PPDX_SKALD.restart_enclave_manager()
+        P3DX_SDK.restart_enclave_manager()
         restart_attempted = True
         print("Service restart initiated successfully")
     except Exception as restart_error:
