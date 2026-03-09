@@ -98,17 +98,18 @@ def main():
     image_hash = P3DX_SDK.hash_docker_image(link)
     P3DX_SDK.save_image_hash(image_hash)
 
-    # Step 4 - Measuring enclave manager code and Docker image into vTPM
+    # Step 4 - Measuring enclave manager code into PCR 15 
     print("\n" + "="*60, flush=True)
-    print("Step 4: Measuring Code and Docker Image into vTPM", flush=True)
+    print("Step 4: Measuring Enclave Manager Code ", flush=True)
     print("="*60, flush=True)
     box_out("Measuring enclave manager code")
     P3DX_SDK.measure_enclave_manager_code_vtpm()
     print("Enclave manager code measured and stored", flush=True)
     
-    box_out("Measuring Docker image...")
-    P3DX_SDK.measureDockervTPM(link)
-    print("Docker image measured and stored", flush=True)
+    # Measure Docker image
+    # box_out("Measuring Docker image...")
+    # P3DX_SDK.measureDockervTPM(link)
+    # print("Docker image measured and stored", flush=True)
 
     # Step 4.5 - Generate deployment nonce
     nonce = P3DX_SDK.generate_nonce()

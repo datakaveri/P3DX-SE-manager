@@ -231,14 +231,14 @@ def get_fresh_jwt():
             print("Key pair generated successfully")
 
         try:
-            # Measure enclave manager code
+            # Measure enclave manager code 
             P3DX_SDK.measure_enclave_manager_code_vtpm()
             print("Enclave manager code hash measured successfully")
             
             # Measure Docker image
-            link = P3DX_SDK.extract_docker_image_from_compose()
-            P3DX_SDK.measureDockervTPM(link)        
-            print("Application image hash measured successfully")
+            # link = P3DX_SDK.extract_docker_image_from_compose()
+            # P3DX_SDK.measureDockervTPM(link)
+            # print("Application image hash measured successfully")
         except Exception as e:
             print(f"Warning: Failed to measure code/image: {str(e)}")
         

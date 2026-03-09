@@ -224,30 +224,63 @@ def save_code_hash(code_hash, path="keys/code_hash.txt"):
         f.write(code_hash)
 
 
+def _is_pcr15_extended():
+    """Check if PCR 15 has already been extended."""
+    try:
+        result = subprocess.run(
+            ["sudo", "tpm2_pcrread", "sha256:15"],
+            capture_output=True, text=True, check=False, timeout=5
+        )
+        if result.returncode != 0:
+            return False
+        # Parse output: "    15 : 0x<64 hex chars>" - PCR 15 value
+        match = re.search(r"15\s*:\s*0x([a-fA-F0-9]{64})", result.stdout)
+        if match:
+            value = match.group(1).lower()
+            return value != "0" * 64
+        return False
+    except Exception:
+        return False
+
+
 def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager"):
     """
-    Hash enclave manager code directory and extend to PCR 14.
+    Hash enclave manager code directory and extend to PCR 15 .
     """
     pcr_values = {}
     pcr_file_path = os.path.join("keys", "pcr_values.json")
     
-    print(f"Hashing enclave manager code directory: {base_dir}")
-    code_hash = hash_enclave_manager_code(base_dir)
-    
-    if code_hash:
-        print(f"SHA256 digest for enclave manager code is: {code_hash}")
-        save_code_hash(code_hash)
+    # Check if already extended - use PCR 15 value 
+    if _is_pcr15_extended():
+        print("Enclave manager code already extended to PCR 15.")
+    else:
+        print(f"Hashing enclave manager code directory: {base_dir}")
+        code_hash = hash_enclave_manager_code(base_dir)
         
-        # Extend to PCR 14
-        extend_result = subprocess.run(
-            ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
-            capture_output=True, text=True, check=False
-        )
-        if extend_result.returncode == 0:
-            print("Enclave manager code hash extended successfully to PCR 14.")
-        else:
-            err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-            print(f"Warning: Failed to extend to PCR 14: {err}")
+        if code_hash:
+            print(f"SHA256 digest for enclave manager code is: {code_hash}")
+            save_code_hash(code_hash)
+            
+            # Extend to PCR 15 (Enclave manager code only, once)
+            extend_result = subprocess.run(
+                ["sudo", "tpm2_pcrextend", f"15:sha256={code_hash}"],
+                capture_output=True, text=True, check=False
+            )
+            if extend_result.returncode == 0:
+                print("Enclave manager code hash extended successfully to PCR 15.")
+            else:
+                err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+                print(f"Warning: Failed to extend to PCR 15: {err}")
+    
+    # extend_result = subprocess.run(
+    #     ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
+    #     capture_output=True, text=True, check=False
+    # )
+    # if extend_result.returncode == 0:
+    #     print("Enclave manager code hash extended successfully to PCR 14.")
+    # else:
+    #     err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+    #     print(f"Warning: Failed to extend to PCR 14: {err}")
     
     # Read PCR values
     try:
@@ -295,18 +328,18 @@ def measureDockervTPM(link):
         except:
             pass
     
-    sha256_digest = hash_docker_image(link)
-    if sha256_digest:
-        print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
-        extend_result = subprocess.run(
-            ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
-            capture_output=True, text=True, check=False
-        )
-        if extend_result.returncode == 0:
-            print("Measurement extended successfully to PCR 15.")
-        else:
-            err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-            print(f"Warning: Failed to extend to PCR 15: {err}")
+    # sha256_digest = hash_docker_image(link)
+    # if sha256_digest:
+    #     print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
+    #     extend_result = subprocess.run(
+    #         ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
+    #         capture_output=True, text=True, check=False
+    #     )
+    #     if extend_result.returncode == 0:
+    #         print("Measurement extended successfully to PCR 15.")
+    #     else:
+    #         err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+    #         print(f"Warning: Failed to extend to PCR 15: {err}")
     
     # Read PCR values from TPM
     try:
