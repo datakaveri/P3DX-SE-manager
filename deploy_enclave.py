@@ -103,6 +103,7 @@ def main():
     print("Step 4: Measuring Enclave Manager Code ", flush=True)
     print("="*60, flush=True)
     box_out("Measuring enclave manager code")
+    P3DX_SDK.setState("Measuring Enclave Manager Code", "Step 4", 4, 11, address)
     P3DX_SDK.measure_enclave_manager_code_vtpm()
     print("Enclave manager code measured and stored", flush=True)
     
@@ -122,6 +123,7 @@ def main():
     print("Step 5: Guest Attestation", flush=True)
     print("="*60, flush=True)
     box_out("Guest Attestation Executing...")
+    P3DX_SDK.setState("Guest Attestation", "Step 5", 5, 11, address)
     P3DX_SDK.execute_guest_attestation()
     print("Guest Attestation complete. JWT received from MAA", flush=True)
     
@@ -130,6 +132,7 @@ def main():
     print("Step 6: Sending JWT to UI", flush=True)
     print("="*60, flush=True)
     box_out("Sending JWT to UI for polling...")
+    P3DX_SDK.setState("Sending JWT to UI", "Step 6", 6, 11, address)
     jwt = P3DX_SDK.get_jwt_from_file()
     P3DX_SDK.send_jwt_to_ui(jwt, address)
     print("JWT sent to UI. Waiting for bundle...", flush=True)

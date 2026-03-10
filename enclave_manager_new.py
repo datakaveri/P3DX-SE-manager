@@ -34,7 +34,7 @@ CORS(app,
 # Default state when application is not running
 state = {
     "step": 0,
-    "maxSteps": 5,
+    "maxSteps": 11,
     "title": "Inactive",
     "description": "Inactive",
 }
@@ -80,7 +80,7 @@ def deploy_enclave():
     global state
     state = {
         "step": 1,
-        "maxSteps": 5,
+        "maxSteps": 11,
         "title": "Spawning Trusted Execution Environment (TEE)",
         "description": "Step 1"
     }
@@ -433,11 +433,14 @@ def setState():
     print("In /enclave/setstate...")
     
     content = request.json
+    if not content or "state" not in content:
+        return jsonify({"status": "error", "message": "Missing 'state' in request body"}), 400
+    
     state = content["state"]
     
     print(f"State updated - Step {state['step']}/{state['maxSteps']}: {state['title']}")
     
-    if state["step"] == 5:
+    if state["step"] == 11:
         is_app_running = False
         print("Deployment completed, resetting is_app_running flag")
     
@@ -454,8 +457,14 @@ def setState():
 @app.route("/enclave/state", methods=["GET"])
 def get_state():
     global state
-    print(f"State requested - Step {state['step']}/{state['maxSteps']}")
-    return jsonify(state)
+    response = {
+        "step": state.get("step", 0),
+        "maxSteps": state.get("maxSteps", 11),
+        "title": state.get("title", "Inactive"),
+        "description": state.get("description", "Inactive"),
+    }
+    print(f"State requested - Step {response['step']}/{response['maxSteps']}")
+    return jsonify(response)
 
 
 # STATUS: Returns application status
