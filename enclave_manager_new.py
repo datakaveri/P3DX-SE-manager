@@ -245,7 +245,8 @@ def get_fresh_jwt():
         # new nonce generated every time a fresh endpoint is hit
         print("Generating fresh deployment nonce...")
         nonce = P3DX_SDK.generate_nonce()                  
-        P3DX_SDK.save_nonce(nonce)                         
+        P3DX_SDK.save_nonce(nonce)
+        P3DX_SDK.extend_nonce_to_pcr8(nonce)
         print(f"Generated deployment nonce: {nonce}")
 
         print("Executing guest attestation to generate new JWT...")

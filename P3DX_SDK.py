@@ -247,10 +247,6 @@ def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager")
     """
     Hash enclave manager code directory and extend to PCR 15 .
     """
-    pcr_values = {}
-    pcr_file_path = os.path.join("keys", "pcr_values.json")
-    
-    # Check if already extended - use PCR 15 value 
     if _is_pcr15_extended():
         print("Enclave manager code already extended to PCR 15.")
     else:
@@ -261,7 +257,6 @@ def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager")
             print(f"SHA256 digest for enclave manager code is: {code_hash}")
             save_code_hash(code_hash)
             
-            # Extend to PCR 15 (Enclave manager code only, once)
             extend_result = subprocess.run(
                 ["sudo", "tpm2_pcrextend", f"15:sha256={code_hash}"],
                 capture_output=True, text=True, check=False
@@ -271,97 +266,23 @@ def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager")
             else:
                 err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
                 print(f"Warning: Failed to extend to PCR 15: {err}")
-    
-    # extend_result = subprocess.run(
-    #     ["sudo", "tpm2_pcrextend", f"14:sha256={code_hash}"],
-    #     capture_output=True, text=True, check=False
-    # )
-    # if extend_result.returncode == 0:
-    #     print("Enclave manager code hash extended successfully to PCR 14.")
-    # else:
-    #     err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-    #     print(f"Warning: Failed to extend to PCR 14: {err}")
-    
-    # Read PCR values
-    try:
-        result = subprocess.run(
-            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n")[1:]:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    pcr_values[parts[0].strip()] = parts[1].strip()
-            print("PCR values read from TPM successfully!")
-        else:
-            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
-            print(f"Warning: Error reading PCR values: {err}")
-    except Exception as exc:
-        print(f"Warning: Error reading PCR values: {exc}")
-    
-    # Update pcr_values.json if it exists, otherwise create new
-    if os.path.exists(pcr_file_path):
-        try:
-            with open(pcr_file_path, "r") as f:
-                existing_values = json.load(f)
-            existing_values.update(pcr_values)
-            pcr_values = existing_values
-        except:
-            pass
-    
-    with open(pcr_file_path, "w") as file:
-        file.write(json.dumps(pcr_values))
-    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
 
 
 def measureDockervTPM(link):
-    """Extend image digest to PCR 15, read PCR values, and save to pcr_values.json."""
-    pcr_file_path = os.path.join("keys", "pcr_values.json")
-    
-    # Load existing PCR values
-    pcr_values = {}
-    if os.path.exists(pcr_file_path):
-        try:
-            with open(pcr_file_path, "r") as f:
-                pcr_values = json.load(f)
-        except:
-            pass
-    
-    # sha256_digest = hash_docker_image(link)
-    # if sha256_digest:
-    #     print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
-    #     extend_result = subprocess.run(
-    #         ["sudo", "tpm2_pcrextend", f"15:sha256={sha256_digest}"],
-    #         capture_output=True, text=True, check=False
-    #     )
-    #     if extend_result.returncode == 0:
-    #         print("Measurement extended successfully to PCR 15.")
-    #     else:
-    #         err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
-    #         print(f"Warning: Failed to extend to PCR 15: {err}")
-    
-    # Read PCR values from TPM
-    try:
-        result = subprocess.run(
-            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,14,15"],
-            capture_output=True, text=True
+    """Extend image digest to PCR 11.
+    """
+    sha256_digest = hash_docker_image(link)
+    if sha256_digest:
+        print(f"SHA256 digest for image '{link}' is: {sha256_digest}")
+        extend_result = subprocess.run(
+            ["sudo", "tpm2_pcrextend", f"11:sha256={sha256_digest}"],
+            capture_output=True, text=True, check=False
         )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n")[1:]:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    pcr_values[parts[0].strip()] = parts[1].strip()
-            print("PCR values read from TPM successfully!")
+        if extend_result.returncode == 0:
+            print("Measurement extended successfully to PCR 11.")
         else:
-            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
-            print(f"Warning: Error reading PCR values: {err}")
-    except Exception as exc:
-        print(f"Warning: Error reading PCR values: {exc}")
-    
-    with open(pcr_file_path, "w") as file:
-        file.write(json.dumps(pcr_values))
-    print(f"PCR values written to {pcr_file_path} ({len(pcr_values)} entries)")
+            err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+            print(f"Warning: Failed to extend to PCR 11: {err}")
 
 
 def generate_nonce(size=32):
@@ -373,6 +294,42 @@ def generate_nonce(size=32):
 def save_nonce(nonce, path="keys/deployment_nonce.txt"):
     with open(path, "w") as f:
         f.write(nonce)
+
+
+def extend_nonce_to_pcr8(nonce, pcr_file_path="keys/pcr_values.json"):
+    """Extend nonce hash into PCR 8.
+    """
+    nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
+    extend_result = subprocess.run(
+        ["sudo", "tpm2_pcrextend", f"8:sha256={nonce_hash}"],
+        capture_output=True, text=True, check=False
+    )
+    if extend_result.returncode == 0:
+        print("Nonce extended successfully to PCR 8.")
+    else:
+        err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
+        print(f"Warning: Failed to extend nonce to PCR 8: {err}")
+
+    pcr_values = {}
+    try:
+        result = subprocess.run(
+            ["sudo", "tpm2_pcrread", "sha256:0,1,2,3,4,5,6,7,8,11,15"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n")[1:]:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    pcr_values[parts[0].strip()] = parts[1].strip()
+            with open(pcr_file_path, "w") as f:
+                f.write(json.dumps(pcr_values))
+            print(f"PCR values written to {pcr_file_path} (PCRs 0-8, 11, 15)")
+        else:
+            err = result.stderr.strip() if result.stderr else "tpm2_pcrread not available"
+            print(f"Warning: Error reading PCR values: {err}")
+    except Exception as exc:
+        print(f"Warning: Error writing pcr_values.json: {exc}")
+
 
 def execute_guest_attestation():
     """Run guest attestation sample app to generate a JWT."""

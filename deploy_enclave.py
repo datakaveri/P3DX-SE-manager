@@ -106,14 +106,15 @@ def main():
     P3DX_SDK.measure_enclave_manager_code_vtpm()
     print("Enclave manager code measured and stored", flush=True)
     
-    # Measure Docker image
-    # box_out("Measuring Docker image...")
-    # P3DX_SDK.measureDockervTPM(link)
-    # print("Docker image measured and stored", flush=True)
+    # # Measure Docker image
+    box_out("Measuring Docker image...")
+    P3DX_SDK.measureDockervTPM(link)
+    print("Docker image measured and stored", flush=True)
 
     # Step 4.5 - Generate deployment nonce
     nonce = P3DX_SDK.generate_nonce()
     P3DX_SDK.save_nonce(nonce)
+    P3DX_SDK.extend_nonce_to_pcr8(nonce)
     print(f"Generated deployment nonce: {nonce}", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
