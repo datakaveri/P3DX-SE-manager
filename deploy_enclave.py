@@ -3,14 +3,19 @@ import os
 import shutil
 import sys
 import traceback
-import PPDX_SKALD as PPDX_SKALD
+import P3DX_SDK
+from lib.config import config
 
 # Force unbuffered output for live logging
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 
-DOCKER_COMPOSE_URL = "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml"
+def get_compose_url():
+    """Get Docker Compose URL from command line argument."""
+    if len(sys.argv) < 2:
+        raise ValueError("compose_url is required. Usage: python deploy_enclave.py <compose_url>")
+    return sys.argv[1]
 
 
 
@@ -29,36 +34,38 @@ def box_out(message):
 
 
 def cleanup_and_prepare_folders():
-    """Clean up old files and prepare SKALD folders."""
+    """Clean up old files and prepare TEE folders."""
     print("Cleaning up and preparing folders...", flush=True)
     
-    docker_compose_file = os.path.join('.', 'docker-compose.yml')
+    docker_compose_file = config.get_path('docker_compose')
     if os.path.exists(docker_compose_file):
         os.remove(docker_compose_file)
         print(f"Removed: {docker_compose_file}", flush=True)
     
-    keys_folder = os.path.join('.', 'keys')
+    keys_folder = config.paths.keys_dir
     if os.path.exists(keys_folder):
         shutil.rmtree(keys_folder)
         print(f"Removed: {keys_folder} (keys and JWT token)", flush=True)
     
-    bundle_file = os.path.join('.', 'Bundle', 'encrypted.json')
+    bundle_file = config.get_path('encrypted_bundle')
     if os.path.exists(bundle_file):
         os.remove(bundle_file)
         print(f"Removed: {bundle_file}", flush=True)
     
-    PPDX_SKALD.ensure_skald_folders()
+    P3DX_SDK.ensure_tee_folders()
 
 
 def main():
     """Main deployment workflow."""
+    compose_url = get_compose_url()
+    
     print("="*60, flush=True)
-    print("SKALD Enclave Deployment", flush=True)
+    print("TEE Enclave Deployment", flush=True)
     print("="*60, flush=True)
     
-    config_file = "DPconfig.json"
-    config = PPDX_SKALD.load_config_file(config_file)
-    address = config["enclaveManagerAddress"]
+    config_file_path = "DPconfig.json"
+    dp_config = P3DX_SDK.load_config_file(config_file_path)
+    address = dp_config["enclaveManagerAddress"]
     
     cleanup_and_prepare_folders()
     
@@ -67,10 +74,10 @@ def main():
     print("Step 1: Pulling Docker Compose from GitHub", flush=True)
     print("="*60, flush=True)
     box_out("Pulling Docker Compose from GitHub...")
-    PPDX_SKALD.pull_compose_file(DOCKER_COMPOSE_URL)
+    P3DX_SDK.pull_compose_file(compose_url)
     print('Extracting docker image link...', flush=True)
     
-    link = PPDX_SKALD.extract_docker_image_from_compose()
+    link = P3DX_SDK.extract_docker_image_from_compose()
     print(f"Docker image: {link}", flush=True)
     
     # Step 2 - Key generation
@@ -78,8 +85,8 @@ def main():
     print("Step 2: Generating Key Pair", flush=True)
     print("="*60, flush=True)
     box_out("Generating and saving key pair...")
-    PPDX_SKALD.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address)
-    PPDX_SKALD.generate_and_save_key_pair()
+    P3DX_SDK.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address)
+    P3DX_SDK.generate_and_save_key_pair()
     print("Key pair generated", flush=True)
     
     # Step 3 - Docker image pulling
@@ -87,26 +94,29 @@ def main():
     print("Step 3: Pulling Docker Image", flush=True)
     print("="*60, flush=True)
     box_out("Pulling docker image...")
-    PPDX_SKALD.pull_docker_image(link)
+    P3DX_SDK.pull_docker_image(link)
     print("Docker image pulled", flush=True)
-    image_hash = PPDX_SKALD.hash_docker_image(link)
-    PPDX_SKALD.save_image_hash(image_hash)
+    image_hash = P3DX_SDK.hash_docker_image(link)
+    P3DX_SDK.save_image_hash(image_hash)
 
-    # Step 4 - Measuring enclave manager code and Docker image into vTPM
+    # Step 4 - Measuring enclave manager code into PCR 15 
     print("\n" + "="*60, flush=True)
-    print("Step 4: Measuring Code and Docker Image into vTPM", flush=True)
+    print("Step 4: Measuring Enclave Manager Code ", flush=True)
     print("="*60, flush=True)
     box_out("Measuring enclave manager code")
-    PPDX_SKALD.measure_enclave_manager_code_vtpm()
+    P3DX_SDK.setState("Measuring Enclave Manager Code", "Step 4", 4, 11, address)
+    P3DX_SDK.measure_enclave_manager_code_vtpm()
     print("Enclave manager code measured and stored", flush=True)
     
+    # # Measure Docker image
     box_out("Measuring Docker image...")
-    PPDX_SKALD.measureDockervTPM(link)
+    P3DX_SDK.measureDockervTPM(link)
     print("Docker image measured and stored", flush=True)
 
     # Step 4.5 - Generate deployment nonce
-    nonce = PPDX_SKALD.generate_nonce()
-    PPDX_SKALD.save_nonce(nonce)
+    nonce = P3DX_SDK.generate_nonce()
+    P3DX_SDK.save_nonce(nonce)
+    P3DX_SDK.extend_nonce_to_pcr8(nonce)
     print(f"Generated deployment nonce: {nonce}", flush=True)
 
     # Step 5 - Send VTPM & public key to MAA & get attestation token
@@ -114,7 +124,8 @@ def main():
     print("Step 5: Guest Attestation", flush=True)
     print("="*60, flush=True)
     box_out("Guest Attestation Executing...")
-    PPDX_SKALD.execute_guest_attestation()
+    P3DX_SDK.setState("Guest Attestation", "Step 5", 5, 11, address)
+    P3DX_SDK.execute_guest_attestation()
     print("Guest Attestation complete. JWT received from MAA", flush=True)
     
     # Step 6 - Send the JWT to UI
@@ -122,8 +133,9 @@ def main():
     print("Step 6: Sending JWT to UI", flush=True)
     print("="*60, flush=True)
     box_out("Sending JWT to UI for polling...")
-    jwt = PPDX_SKALD.get_jwt_from_file()
-    PPDX_SKALD.send_jwt_to_ui(jwt, address)
+    P3DX_SDK.setState("Sending JWT to UI", "Step 6", 6, 11, address)
+    jwt = P3DX_SDK.get_jwt_from_file()
+    P3DX_SDK.send_jwt_to_ui(jwt, address)
     print("JWT sent to UI. Waiting for bundle...", flush=True)
     
     # Step 7 - Receive encrypted bundle from UI
@@ -131,9 +143,9 @@ def main():
     print("Step 7: Receiving Encrypted Bundle from UI", flush=True)
     print("="*60, flush=True)
     box_out("Waiting for encrypted bundle from UI...")
-    PPDX_SKALD.setState("Receiving encrypted bundle", "Step 7", 7, 11, address)
-    bundle_data = PPDX_SKALD.wait_for_bundle_from_ui(address, timeout=300)
-    bundle_path = PPDX_SKALD.save_bundle_to_file(bundle_data)
+    P3DX_SDK.setState("Receiving encrypted bundle", "Step 7", 7, 11, address)
+    bundle_data = P3DX_SDK.wait_for_bundle_from_ui(address, timeout=300)
+    bundle_path = P3DX_SDK.save_bundle_to_file(bundle_data)
     print("Bundle received and saved", flush=True)
     
     # Step 8 - Decrypt bundle
@@ -141,9 +153,9 @@ def main():
     print("Step 8: Decrypting Bundle", flush=True)
     print("="*60, flush=True)
     box_out("Decrypting bundle...")
-    PPDX_SKALD.setState("Decrypting bundle", "Step 8", 8, 11, address)
-    private_key_path = "keys/private_key.pem"
-    PPDX_SKALD.decrypt_bundle_skald(bundle_path, private_key_path)
+    P3DX_SDK.setState("Decrypting bundle", "Step 8", 8, 11, address)
+    private_key_path = config.get_path('private_key')
+    P3DX_SDK.decrypt_bundle_tee(bundle_path, private_key_path)
     print("Bundle decrypted. Config and URLs saved", flush=True)
     
     # Step 9 - Fetch and decrypt data
@@ -151,25 +163,25 @@ def main():
     print("Step 9: Fetching and Decrypting Data", flush=True)
     print("="*60, flush=True)
     box_out("Fetching encrypted data from Azure Blob Storage...")
-    PPDX_SKALD.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
-    PPDX_SKALD.fetch_and_decrypt_data(config_file)
+    P3DX_SDK.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
+    P3DX_SDK.fetch_and_decrypt_data(config_file_path)
     print("Data fetched, decrypted, and saved", flush=True)
     
     # Step 10 - Running the application in docker
     print("\n" + "="*60, flush=True)
-    print("Step 10: Running SKALD Application", flush=True)
+    print("Step 10: Running Application", flush=True)
     print("="*60, flush=True)
     box_out("Running the Application in Docker...")
-    PPDX_SKALD.setState("Performing secure de-identification in TEE", "Step 10", 10, 11, address)
-    PPDX_SKALD.run_docker_containers()
+    P3DX_SDK.setState("Running application in TEE", "Step 10", 10, 11, address)
+    P3DX_SDK.run_docker_containers()
     
     # Step 11 - Encrypt inference and upload
     print("\n" + "="*60, flush=True)
     print("Step 11: Encrypting and Uploading Inference", flush=True)
     print("="*60, flush=True)
     box_out("Encrypting inference output...")
-    PPDX_SKALD.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
-    PPDX_SKALD.encrypt_inference_skald(config_file)
+    P3DX_SDK.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
+    P3DX_SDK.encrypt_and_upload_output(config_file_path)
     print("Inference encrypted and uploaded to Azure Blob Storage", flush=True)
     
     
@@ -177,9 +189,9 @@ def main():
     print("\n" + "="*60, flush=True)
     print("DEPLOYMENT COMPLETE", flush=True)
     print("="*60, flush=True)
-    PPDX_SKALD.setState("Secure Computation Complete", "Step 11", 11, 11, address)
+    P3DX_SDK.setState("Secure Computation Complete", "Step 11", 11, 11, address)
     print("All steps completed successfully!", flush=True)
-    PPDX_SKALD.restart_enclave_manager()
+    P3DX_SDK.restart_enclave_manager()
 
 
 if __name__ == "__main__":
@@ -187,10 +199,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\nDeployment interrupted by user", flush=True)
-        PPDX_SKALD.restart_enclave_manager()
+        P3DX_SDK.restart_enclave_manager()
         exit(1)
     except Exception as e:
         print(f"\n\nERROR: {e}", flush=True)
         traceback.print_exc()
-        PPDX_SKALD.restart_enclave_manager()
+        P3DX_SDK.restart_enclave_manager()
         exit(1)

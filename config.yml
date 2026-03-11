@@ -1,0 +1,87 @@
+# Paths and directories
+paths:
+  # Base directory
+  base_dir: ${BASE_DIR}
+  
+  # Key management
+  keys_dir: ${BASE_DIR}/keys
+  
+  # Bundle directory
+  bundle_dir: ${BASE_DIR}/Bundle
+  
+  # TEE (Trusted Execution Environment) directories
+  tee_input_data: /tmp/tee_input/data
+  tee_input_config: /tmp/tee_input/config
+  tee_output: /tmp/tee_output
+  tee_urls: /tmp/urls
+  
+  # Guest attestation directory
+  guest_attestation: ${BASE_DIR}/guest_attestation/cvm-attestation-sample-app
+
+# File names
+files:
+  # Docker and configuration
+  docker_compose: docker-compose.yml
+  config_file: DPconfig.json
+  
+  # Cryptographic materials
+  public_key: public_key.pem
+  private_key: private_key.pem
+  
+  # Attestation and measurement
+  jwt_response: jwt-response.txt
+  deployment_nonce: deployment_nonce.txt
+  pcr_values: pcr_values.json
+  code_hash: code_hash.txt
+  image_hash: image_hash.txt
+  
+  # Bundle and URLs
+  encrypted_bundle: encrypted.json
+  decrypted_urls: decrypted_urls.json
+  
+  # Application output
+  status: status.json
+
+# Commands and executables
+commands:
+  python: python3
+  docker_compose: docker-compose
+  use_sudo: true  # Whether to prefix commands with sudo
+
+# Service configuration
+service:
+  name: enclavemanager.service
+  port: 4000
+  host: 0.0.0.0
+
+# Azure endpoints (standard Azure URLs)
+azure:
+  # Azure Instance Metadata Service
+  imds_url: http://169.254.169.254/metadata/identity/oauth2/token
+  
+  # Azure resource endpoints for Managed Identity
+  storage_resource: https://storage.azure.com/
+  vault_resource: https://vault.azure.net
+
+# CORS (Cross-Origin Resource Sharing) configuration
+cors:
+  origins:
+    - http://localhost:5173
+    - http://localhost:3000
+    - https://spider.p3dx.iudx.org.in
+  methods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+    - OPTIONS
+    - PATCH
+  allow_headers:
+    - Content-Type
+    - Authorization
+    - X-Requested-With
+  expose_headers:
+    - Content-Type
+    - Authorization
+  supports_credentials: true
+  max_age: 3600

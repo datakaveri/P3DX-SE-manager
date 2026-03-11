@@ -7,10 +7,17 @@ import hmac
 import hashlib
 import os
 import shutil
+import sys
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
+
+# Add parent directory to path to import config
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+from lib.config import config
 
 
 def base64url_decode(data: str) -> bytes:
@@ -155,7 +162,7 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
                 print(f"Warning: Size mismatch: {len(decrypted_data)} vs {expected_size} bytes")
             
             original_filename = file_names.get('config', 'generated-config.json')
-            output_folder = '/tmp/SKALD_input/config'
+            output_folder = config.paths.tee_input_config
             os.makedirs(output_folder, exist_ok=True)
             output_path = os.path.join(output_folder, original_filename)
             
@@ -163,27 +170,14 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
                 f.write(decrypted_data)
             os.chmod(output_path, 0o600)
             
-            # Rename to kconfig_beneficiary.json for SKALD
-            skald_config_path = os.path.join(output_folder, 'kconfig_beneficiary.json')
-            if os.path.exists(skald_config_path):
-                os.remove(skald_config_path)
-            os.rename(output_path, skald_config_path)
-            
-            # Also copy to /tmp/SKALD_input/ for Docker mount
-            skald_root_config_path = '/tmp/SKALD_input/kconfig_beneficiary.json'
-            os.makedirs('/tmp/SKALD_input', exist_ok=True)
-            shutil.copy2(skald_config_path, skald_root_config_path)
-            
             decrypted_files['config'] = {
-                'path': skald_config_path,
-                'root_path': skald_root_config_path,
+                'path': output_path,
                 'size': len(decrypted_data),
                 'original_filename': original_filename
             }
             
             print(f"Config decrypted successfully")
-            print(f"  Saved to: {skald_config_path}")
-            print(f"  Copied to: {skald_root_config_path} (for Docker mount)")
+            print(f"  Saved to: {output_path}")
             print(f"  Size: {len(decrypted_data)} bytes")
             
         except Exception as e:
@@ -192,7 +186,7 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     # Decrypt encrypted URLs
     if encrypted_urls:
         print(f"\nStep 3: Decrypting encrypted URLs...")
-        for url_type in ['blobUrl', 'keyVaultUrl']:
+        for url_type in ['blobUrl', 'keyVaultUrl', 'outputContainerUrl']:
             if url_type in encrypted_urls:
                 try:
                     encrypted_token = encrypted_urls[url_type]
@@ -204,9 +198,9 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
         
         # Save decrypted URLs to a JSON file
         if decrypted_urls:
-            urls_dir = '/tmp/urls'
+            urls_dir = config.paths.tee_urls
             os.makedirs(urls_dir, exist_ok=True)
-            urls_output_path = os.path.join(urls_dir, 'decrypted_urls.json')
+            urls_output_path = os.path.join(urls_dir, config.files.decrypted_urls)
             with open(urls_output_path, 'w') as f:
                 json.dump(decrypted_urls, f, indent=2)
             os.chmod(urls_output_path, 0o600)

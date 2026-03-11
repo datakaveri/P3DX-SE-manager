@@ -8,8 +8,13 @@ import sys
 import traceback
 from pathlib import Path
 from email.utils import formatdate
-
 import requests
+
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+from P3DX_SDK import create_fernet_cipher
+from lib.config import config
 
 # ===============================
 # Managed Identity + Azure helpers
@@ -17,7 +22,7 @@ import requests
 
 def get_mi_token(resource):
 
-    url = "http://169.254.169.254/metadata/identity/oauth2/token"
+    url = config.azure.imds_url
     params = {
         "api-version": "2019-08-01",
         "resource": resource
@@ -30,7 +35,7 @@ def get_mi_token(resource):
 
 
 def download_blob(url, output_path):
-    token = get_mi_token("https://storage.azure.com/")
+    token = get_mi_token(config.azure.storage_resource)
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ms-version": "2020-10-02",
@@ -46,7 +51,7 @@ def download_blob(url, output_path):
 
 def fetch_fernet_key_from_kv(secret_url):
     """Fetch Fernet key from Azure Key Vault using Managed Identity."""
-    token = get_mi_token("https://vault.azure.net")
+    token = get_mi_token(config.azure.vault_resource)
     headers = {"Authorization": f"Bearer {token}"}
 
     r = requests.get(f"{secret_url}?api-version=7.4", headers=headers, timeout=10)
@@ -56,7 +61,7 @@ def fetch_fernet_key_from_kv(secret_url):
 
 def upload_blob(blob_url, file_path):
     """Upload file to Azure Blob Storage using Managed Identity."""
-    token = get_mi_token("https://storage.azure.com/")
+    token = get_mi_token(config.azure.storage_resource)
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ms-version": "2020-10-02",
@@ -71,14 +76,11 @@ def upload_blob(blob_url, file_path):
     # Use PUT method for blob upload
     r = requests.put(blob_url, headers=headers, data=file_content, timeout=30)
     r.raise_for_status()
-    return r.status_code == 201
+    return r.status_code in (201, 202)
 
 
 def decrypt_file(encrypted_path, fernet_key_bytes, output_path):
     """Decrypt file using Fernet key bytes."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__))))
-    from PPDX_SKALD import create_fernet_cipher
-
     try:
         cipher = create_fernet_cipher(fernet_key_bytes)
     except Exception as e:
@@ -105,11 +107,30 @@ def decrypt_file(encrypted_path, fernet_key_bytes, output_path):
     
     os.chmod(output_path, 0o600)
 
+def encrypt_file(input_path, fernet_key_bytes, encrypted_output_path):
+    """Encrypt file using Fernet key bytes."""
+    try:
+        cipher = create_fernet_cipher(fernet_key_bytes)
+    except Exception as e:
+        raise ValueError(f"Failed to create Fernet cipher: {e}")
+
+    with open(input_path, 'rb') as f:
+        plaintext = f.read()
+
+    encrypted_data = cipher.encrypt(plaintext)
+
+    os.makedirs(os.path.dirname(encrypted_output_path), exist_ok=True)
+    with open(encrypted_output_path, 'wb') as f:
+        f.write(encrypted_data)
+
+    os.chmod(encrypted_output_path, 0o600)
+
+
 def fetch_and_decrypt_tee():
     """Fetch encrypted data from Azure Blob Storage and decrypt using Key Vault secret."""
-    encrypted_path = "/tmp/dataset.enc"
-    output_dir = "/tmp/SKALD_input/input_file"
-    urls_path = Path("/tmp/urls/decrypted_urls.json")
+    encrypted_path = os.path.join(config.paths.tee_input_data, "dataset.enc")
+    output_dir = config.paths.tee_input_data
+    urls_path = Path(config.get_path('decrypted_urls'))
 
     if not urls_path.exists():
         raise FileNotFoundError(
@@ -166,6 +187,36 @@ def fetch_and_decrypt_tee():
     print("Data fetch and decryption completed successfully")
     print("=" * 60)
 
+    # --------------------------------------------------
+    # Encrypt processed output and upload to output blob
+    # --------------------------------------------------
+
+    print("\nEncrypting output file before upload...")
+
+    encrypted_output_path = output_path + ".enc"
+
+    encrypt_file(output_path, fernet_key, encrypted_output_path)
+
+    print(f"Encrypted output saved to: {encrypted_output_path}")
+
+    if "outputContainerUrl" not in urls:
+        raise ValueError("Missing 'outputContainerUrl' in decrypted_urls.json")
+
+    output_container_url = urls["outputContainerUrl"].rstrip("/")
+    
+    # Extract filename from encrypted output path
+    blob_filename = os.path.basename(encrypted_output_path)
+    
+    # Construct full blob URL: container_url/blob_filename
+    output_blob_url = f"{output_container_url}/{blob_filename}"
+
+    print(f"\nUploading encrypted output to blob: {output_blob_url}")
+    upload_blob(output_blob_url, encrypted_output_path)
+
+    print("Encrypted output uploaded successfully")
+
+    # Optional cleanup
+    os.remove(encrypted_output_path)
 
 if __name__ == '__main__':
     try:

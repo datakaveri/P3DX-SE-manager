@@ -8,6 +8,7 @@ __pycache__
 /keys/
 DPconfig.json
 docker-compose.yml
+.env
 
 #Directories
 /token_verification/
