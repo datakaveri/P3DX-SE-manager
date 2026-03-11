@@ -6,26 +6,23 @@ import os
 import json
 import time
 import logging
+import traceback
 import P3DX_SDK
+from lib.config import config
 
 
 app = Flask(__name__)
 
-# Enable CORS for all routes with proper configuration
-# Remove trailing slashes from origins - CORS matching is strict
+# Enable CORS for all routes with configuration from config.yml
 CORS(app, 
      resources={
          r"/*": {
-             "origins": [
-                 "http://localhost:5173",
-                 "http://localhost:3000", 
-                 "https://spider.p3dx.iudx.org.in"
-             ],
-             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-             "expose_headers": ["Content-Type", "Authorization"],
-             "supports_credentials": True,
-             "max_age": 3600
+             "origins": config.cors.origins,
+             "methods": config.cors.methods,
+             "allow_headers": config.cors.allow_headers,
+             "expose_headers": config.cors.expose_headers,
+             "supports_credentials": config.cors.supports_credentials,
+             "max_age": config.cors.max_age
          }
      },
      supports_credentials=True)
@@ -53,7 +50,7 @@ is_app_running = False
 # DEPLOY: Deploys the TEE enclave
 @app.route("/enclave/deploy", methods=["POST"])
 def deploy_enclave():
-    jwt_file_path = "/home/kanonTEE/P3DX-SE-manager/keys/jwt-response.txt"
+    jwt_file_path = config.get_path('jwt_response')
     subprocess.run(["sudo", "rm", "-rf", jwt_file_path], check=False, capture_output=True)
     
     print("STARTING deploy")
@@ -98,7 +95,7 @@ def deploy_enclave():
         cmd = f"python3 -u deploy_enclave.py {repr(compose_url)} 2>&1 | systemd-cat -t tee-deployment"
         subprocess.Popen(
             ["sudo", "sh", "-c", cmd],
-            cwd="/home/kanonTEE/P3DX-SE-manager"
+            cwd=config.base_dir
         )
         
         is_app_running = True
@@ -132,8 +129,7 @@ def receive_jwt():
 @app.route("/enclave/jwt", methods=["GET"])
 def get_jwt():
     print("Fetching JWT token...")
-    base_dir = "/home/kanonTEE/P3DX-SE-manager"
-    jwt_file_path = os.path.join(base_dir, "keys", "jwt-response.txt")
+    jwt_file_path = config.get_path('jwt_response')
     
     if not os.path.exists(jwt_file_path):
         response = {
@@ -194,20 +190,19 @@ def get_fresh_jwt():
     """
     print("Generating fresh JWT token...")
     
-    base_dir = "/home/kanonTEE/P3DX-SE-manager"
-    keys_dir = os.path.join(base_dir, "keys")
-    jwt_file_path = os.path.join(keys_dir, "jwt-response.txt")
-    private_key_path = os.path.join(keys_dir, "private_key.pem")
-    public_key_path = os.path.join(keys_dir, "public_key.pem")
+    jwt_file_path = config.get_path('jwt_response')
+    private_key_path = config.get_path('private_key')
+    public_key_path = config.get_path('public_key')
+    keys_dir = config.paths.keys_dir
     
     original_cwd = os.getcwd()
     
     try:
-        os.chdir(base_dir)
+        os.chdir(config.base_dir)
         os.makedirs(keys_dir, exist_ok=True)
         
         subprocess.run(
-            ["sudo", "chown", "-R", f"{os.getenv('USER', 'kanonTEE')}:{os.getenv('USER', 'kanonTEE')}", keys_dir],
+            ["sudo", "chown", "-R", f"{config.user}:{config.user}", keys_dir],
             check=False,
             capture_output=True
         )
@@ -253,7 +248,7 @@ def get_fresh_jwt():
         P3DX_SDK.execute_guest_attestation()
         
         subprocess.run(
-            ["sudo", "chown", f"{os.getenv('USER', 'kanonTEE')}:{os.getenv('USER', 'kanonTEE')}", jwt_file_path],
+            ["sudo", "chown", f"{config.user}:{config.user}", jwt_file_path],
             check=False,
             capture_output=True
         )
@@ -304,7 +299,7 @@ def get_fresh_jwt():
 def get_bundle():
     global stored_bundle
     
-    bundle_file = "/home/kanonTEE/P3DX-SE-manager/Bundle/encrypted.json"
+    bundle_file = config.get_path('encrypted_bundle')
     if os.path.exists(bundle_file):
         try:
             with open(bundle_file, 'r') as f:
@@ -332,13 +327,13 @@ def upload_encrypted_bundle():
             }
             return jsonify(response), 400
         
-        bundle_dir = "/home/kanonTEE/P3DX-SE-manager/Bundle"
+        bundle_dir = config.paths.bundle_dir
         os.makedirs(bundle_dir, exist_ok=True)
         
         global stored_bundle
         stored_bundle = content
         
-        output_file = os.path.join(bundle_dir, "encrypted.json")
+        output_file = config.get_path('encrypted_bundle')
         
         with open(output_file, 'w') as f:
             json.dump(content, f, indent=2)
@@ -383,7 +378,7 @@ def get_inference():
         return jsonify(response), 403
 
 
-    output_file = "/tmp/tee_output/status.json"
+    output_file = config.get_path('status')
     
     if os.path.exists(output_file):
         try:
@@ -551,7 +546,7 @@ def handle_critical_error(e):
 if __name__ == "__main__":
     print("=" * 60)
     print("Starting Enclave Manager")
-    print("Port: 4000")
+    print(f"Port: {config.service.port}")
     print("Endpoints available:")
     print("  - POST /enclave/deploy")
     print("  - GET  /enclave/jwt")
@@ -560,4 +555,4 @@ if __name__ == "__main__":
     print("  - GET  /enclave/inference")
     print("  - GET  /enclave/status")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=4000, debug=True)
+    app.run(host=config.service.host, port=config.service.port, debug=True)

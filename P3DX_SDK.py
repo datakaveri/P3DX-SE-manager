@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
 
+from lib.config import config
+
 # Ensure Bundle directory is in path for decryption import
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _bundle_dir = os.path.join(_script_dir, 'Bundle')
@@ -101,10 +103,10 @@ def extract_docker_image_from_compose(compose_file="docker-compose.yml"):
 
 def generate_and_save_key_pair():
     """Generate RSA key pair and save to keys/ directory."""
-    public_key_file = "public_key.pem"
-    private_key_file = "private_key.pem"
+    public_key_file = config.files.public_key
+    private_key_file = config.files.private_key
 
-    os.makedirs("keys", exist_ok=True)
+    os.makedirs(config.paths.keys_dir, exist_ok=True)
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key = (
@@ -126,19 +128,22 @@ def generate_and_save_key_pair():
         .decode()
     )
 
-    with open(os.path.join("keys", public_key_file), "w") as public_key_out:
+    public_key_path = os.path.join(config.paths.keys_dir, public_key_file)
+    private_key_path = os.path.join(config.paths.keys_dir, private_key_file)
+
+    with open(public_key_path, "w") as public_key_out:
         public_key_out.write("".join(public_key))
 
-    with open(os.path.join("keys", private_key_file), "w") as private_key_out:
+    with open(private_key_path, "w") as private_key_out:
         private_key_out.write("".join(private_key_bytes))
 
     print("Public and private keys generated and saved successfully in the 'keys' folder!")
 
     # Strip PEM markers
-    with open(os.path.join("keys", public_key_file), "r") as file:
+    with open(public_key_path, "r") as file:
         lines = file.readlines()
     cleaned_lines = [line.split("----")[0] if "----" in line else line for line in lines]
-    with open(os.path.join("keys", public_key_file), "w") as file:
+    with open(public_key_path, "w") as file:
         file.writelines(cleaned_lines)
 
     print("Private key generated and saved successfully")
@@ -168,15 +173,20 @@ def hash_docker_image(image):
     return hashlib.sha256(json.dumps(json.loads(result.stdout)[0], sort_keys=True).encode()).hexdigest()
 
 
-def save_image_hash(image_hash, path="keys/image_hash.txt"):
+def save_image_hash(image_hash, path=None):
+    if path is None:
+        path = config.get_path('image_hash')
     with open(path, "w") as f:
         f.write(image_hash)
 
 
-def hash_enclave_manager_code(base_dir="/home/kanonTEE/P3DX-SE-manager"):
+def hash_enclave_manager_code(base_dir=None):
     """
     Deterministically hash enclave manager code directory.
     """
+    if base_dir is None:
+        base_dir = config.base_dir
+    
     sha256_digest = hashlib.sha256()
 
     # Files to include in hash (deterministic order)
@@ -218,8 +228,10 @@ def hash_enclave_manager_code(base_dir="/home/kanonTEE/P3DX-SE-manager"):
     return sha256_digest.hexdigest()
 
 
-def save_code_hash(code_hash, path="keys/code_hash.txt"):
+def save_code_hash(code_hash, path=None):
     """Save enclave manager code hash to file."""
+    if path is None:
+        path = config.get_path('code_hash')
     with open(path, "w") as f:
         f.write(code_hash)
 
@@ -243,10 +255,13 @@ def _is_pcr15_extended():
         return False
 
 
-def measure_enclave_manager_code_vtpm(base_dir="/home/kanonTEE/P3DX-SE-manager"):
+def measure_enclave_manager_code_vtpm(base_dir=None):
     """
-    Hash enclave manager code directory and extend to PCR 15 .
+    Hash enclave manager code directory and extend to PCR 15.
     """
+    if base_dir is None:
+        base_dir = config.base_dir
+    
     if _is_pcr15_extended():
         print("Enclave manager code already extended to PCR 15.")
     else:
@@ -291,14 +306,18 @@ def generate_nonce(size=32):
     return base64.urlsafe_b64encode(nonce).decode("utf-8")
 
 
-def save_nonce(nonce, path="keys/deployment_nonce.txt"):
+def save_nonce(nonce, path=None):
+    if path is None:
+        path = config.get_path('deployment_nonce')
     with open(path, "w") as f:
         f.write(nonce)
 
 
-def extend_nonce_to_pcr8(nonce, pcr_file_path="keys/pcr_values.json"):
-    """Extend nonce hash into PCR 8.
-    """
+def extend_nonce_to_pcr8(nonce, pcr_file_path=None):
+    """Extend nonce hash into PCR 8"""
+    if pcr_file_path is None:
+        pcr_file_path = config.get_path('pcr_values')
+    
     nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
     extend_result = subprocess.run(
         ["sudo", "tpm2_pcrextend", f"8:sha256={nonce_hash}"],
@@ -333,12 +352,9 @@ def extend_nonce_to_pcr8(nonce, pcr_file_path="keys/pcr_values.json"):
 
 def execute_guest_attestation():
     """Run guest attestation sample app to generate a JWT."""
-    script_dir = os.path.dirname(__file__)
-    commands_folder = os.path.join(
-        script_dir, "guest_attestation/cvm-attestation-sample-app"
-    )
+    commands_folder = config.paths.guest_attestation
+    jwt_file = config.get_path('jwt_response')
     original_cwd = os.getcwd()
-    jwt_file = os.path.join(script_dir, "keys", "jwt-response.txt")
     
     try:
         if not os.path.exists(commands_folder):
@@ -346,7 +362,7 @@ def execute_guest_attestation():
         
         os.chdir(commands_folder)
         result = subprocess.run(
-            ["python3", "generate-token.py"],
+            config.get_command('python') + ["generate-token.py"],
             capture_output=True,
             text=True,
             check=False
@@ -411,10 +427,10 @@ def setState(title, description, step, maxSteps, address):
 def ensure_tee_folders():
     """Create TEE folders if they don't exist and clean old files."""
     folders = [
-        '/tmp/tee_input/data',
-        '/tmp/tee_input/config',
-        '/tmp/tee_output',
-        '/tmp/urls'
+        config.paths.tee_input_data,
+        config.paths.tee_input_config,
+        config.paths.tee_output,
+        config.paths.tee_urls
     ]
     
     for folder in folders:
@@ -433,7 +449,7 @@ def ensure_tee_folders():
 
 def get_jwt_from_file():
     """Read JWT from jwt-response.txt file."""
-    jwt_file = "keys/jwt-response.txt"
+    jwt_file = config.get_path('jwt_response')
     if not os.path.exists(jwt_file):
         raise FileNotFoundError(f"JWT file not found: {jwt_file}")
     with open(jwt_file, 'r') as f:
@@ -481,8 +497,10 @@ def wait_for_bundle_from_ui(address, timeout=300):
     raise TimeoutError(f"Timeout waiting for bundle from UI after {timeout} seconds")
 
 
-def save_bundle_to_file(bundle_data, bundle_path="Bundle/encrypted.json"):
+def save_bundle_to_file(bundle_data, bundle_path=None):
     """Save bundle data to file."""
+    if bundle_path is None:
+        bundle_path = config.get_path('encrypted_bundle')
     os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
     with open(bundle_path, 'w') as f:
         json.dump(bundle_data, f, indent=2)
@@ -508,11 +526,11 @@ def fetch_and_decrypt_data(config_path="DPconfig.json"):
 def run_docker_containers():
     """Start docker containers in detached mode and follow logs live."""
     print("Stopping existing containers...", flush=True)
-    subprocess.run(["sudo", "docker-compose", "down"], capture_output=True, text=True)
+    subprocess.run(config.get_docker_command("down"), capture_output=True, text=True)
     
     print("Starting containers in detached mode...", flush=True)
     start_result = subprocess.run(
-        ["sudo", "docker-compose", "up", "--build", "-d"],
+        config.get_docker_command("up", "--build", "-d"),
         capture_output=True,
         text=True
     )
@@ -528,7 +546,7 @@ def run_docker_containers():
     print("="*60, flush=True)
     
     log_process = subprocess.Popen(
-        ["sudo", "docker-compose", "logs", "-f"],
+        config.get_docker_command("logs", "-f"),
         stdout=sys.stdout,
         stderr=sys.stderr,
         text=True,
@@ -538,13 +556,13 @@ def run_docker_containers():
     log_process.wait()
     
     ps_result = subprocess.run(
-        ["sudo", "docker-compose", "ps", "-q"],
+        config.get_docker_command("ps", "-q"),
         capture_output=True,
         text=True
     )
     if ps_result.returncode == 0 and ps_result.stdout.strip():
         ps_status = subprocess.run(
-            ["sudo", "docker-compose", "ps"],
+            config.get_docker_command("ps"),
             capture_output=True,
             text=True
         )
@@ -553,14 +571,14 @@ def run_docker_containers():
         print(ps_status.stdout, flush=True)
     
     print("\n" + "="*60, flush=True)
-    print("Application execution complete. Output saved to /tmp/tee_output", flush=True)
+    print(f"Application execution complete. Output saved to {config.paths.tee_output}", flush=True)
 
 
 def encrypt_and_upload_output(config_path="DPconfig.json"):
     """Encrypt all files in output folder and upload to Azure Blob Storage."""
     fetch_data = _get_fetch_data()
-    output_dir = "/tmp/tee_output"
-    urls_path = Path("/tmp/urls/decrypted_urls.json")
+    output_dir = config.paths.tee_output
+    urls_path = Path(config.get_path('decrypted_urls'))
 
     if not urls_path.exists():
         raise FileNotFoundError(
@@ -635,7 +653,7 @@ def get_app_status():
             - {"status": "processing", "message": "..."} if status.json doesn't exist yet
             - status.json content as-is on success/error (app controls structure)
     """
-    status_file = "/tmp/tee_output/status.json"
+    status_file = config.get_path('status')
     
     if not os.path.exists(status_file):
         return {
@@ -671,7 +689,7 @@ def restart_enclave_manager():
     """Restart the enclave manager systemd service."""
     print("Restarting enclavemanager service...", flush=True)
     result = subprocess.run(
-        ["sudo", "systemctl", "restart", "enclavemanager.service"],
+        ["sudo", "systemctl", "restart", config.service.name],
         capture_output=True,
         text=True
     )

@@ -4,6 +4,7 @@ import shutil
 import sys
 import traceback
 import P3DX_SDK
+from lib.config import config
 
 # Force unbuffered output for live logging
 sys.stdout.reconfigure(line_buffering=True)
@@ -36,17 +37,17 @@ def cleanup_and_prepare_folders():
     """Clean up old files and prepare TEE folders."""
     print("Cleaning up and preparing folders...", flush=True)
     
-    docker_compose_file = os.path.join('.', 'docker-compose.yml')
+    docker_compose_file = config.get_path('docker_compose')
     if os.path.exists(docker_compose_file):
         os.remove(docker_compose_file)
         print(f"Removed: {docker_compose_file}", flush=True)
     
-    keys_folder = os.path.join('.', 'keys')
+    keys_folder = config.paths.keys_dir
     if os.path.exists(keys_folder):
         shutil.rmtree(keys_folder)
         print(f"Removed: {keys_folder} (keys and JWT token)", flush=True)
     
-    bundle_file = os.path.join('.', 'Bundle', 'encrypted.json')
+    bundle_file = config.get_path('encrypted_bundle')
     if os.path.exists(bundle_file):
         os.remove(bundle_file)
         print(f"Removed: {bundle_file}", flush=True)
@@ -62,9 +63,9 @@ def main():
     print("TEE Enclave Deployment", flush=True)
     print("="*60, flush=True)
     
-    config_file = "DPconfig.json"
-    config = P3DX_SDK.load_config_file(config_file)
-    address = config["enclaveManagerAddress"]
+    config_file_path = "DPconfig.json"
+    dp_config = P3DX_SDK.load_config_file(config_file_path)
+    address = dp_config["enclaveManagerAddress"]
     
     cleanup_and_prepare_folders()
     
@@ -153,7 +154,7 @@ def main():
     print("="*60, flush=True)
     box_out("Decrypting bundle...")
     P3DX_SDK.setState("Decrypting bundle", "Step 8", 8, 11, address)
-    private_key_path = "keys/private_key.pem"
+    private_key_path = config.get_path('private_key')
     P3DX_SDK.decrypt_bundle_tee(bundle_path, private_key_path)
     print("Bundle decrypted. Config and URLs saved", flush=True)
     
@@ -163,7 +164,7 @@ def main():
     print("="*60, flush=True)
     box_out("Fetching encrypted data from Azure Blob Storage...")
     P3DX_SDK.setState("Fetching and decrypting data", "Step 9", 9, 11, address)
-    P3DX_SDK.fetch_and_decrypt_data(config_file)
+    P3DX_SDK.fetch_and_decrypt_data(config_file_path)
     print("Data fetched, decrypted, and saved", flush=True)
     
     # Step 10 - Running the application in docker
@@ -180,7 +181,7 @@ def main():
     print("="*60, flush=True)
     box_out("Encrypting inference output...")
     P3DX_SDK.setState("Encrypting and uploading inference", "Step 11", 11, 11, address)
-    P3DX_SDK.encrypt_and_upload_output(config_file)
+    P3DX_SDK.encrypt_and_upload_output(config_file_path)
     print("Inference encrypted and uploaded to Azure Blob Storage", flush=True)
     
     

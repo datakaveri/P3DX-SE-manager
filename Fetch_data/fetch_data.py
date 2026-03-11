@@ -14,6 +14,7 @@ _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 from P3DX_SDK import create_fernet_cipher
+from lib.config import config
 
 # ===============================
 # Managed Identity + Azure helpers
@@ -21,7 +22,7 @@ from P3DX_SDK import create_fernet_cipher
 
 def get_mi_token(resource):
 
-    url = "http://169.254.169.254/metadata/identity/oauth2/token"
+    url = config.azure.imds_url
     params = {
         "api-version": "2019-08-01",
         "resource": resource
@@ -34,7 +35,7 @@ def get_mi_token(resource):
 
 
 def download_blob(url, output_path):
-    token = get_mi_token("https://storage.azure.com/")
+    token = get_mi_token(config.azure.storage_resource)
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ms-version": "2020-10-02",
@@ -50,7 +51,7 @@ def download_blob(url, output_path):
 
 def fetch_fernet_key_from_kv(secret_url):
     """Fetch Fernet key from Azure Key Vault using Managed Identity."""
-    token = get_mi_token("https://vault.azure.net")
+    token = get_mi_token(config.azure.vault_resource)
     headers = {"Authorization": f"Bearer {token}"}
 
     r = requests.get(f"{secret_url}?api-version=7.4", headers=headers, timeout=10)
@@ -60,7 +61,7 @@ def fetch_fernet_key_from_kv(secret_url):
 
 def upload_blob(blob_url, file_path):
     """Upload file to Azure Blob Storage using Managed Identity."""
-    token = get_mi_token("https://storage.azure.com/")
+    token = get_mi_token(config.azure.storage_resource)
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ms-version": "2020-10-02",
@@ -127,9 +128,9 @@ def encrypt_file(input_path, fernet_key_bytes, encrypted_output_path):
 
 def fetch_and_decrypt_tee():
     """Fetch encrypted data from Azure Blob Storage and decrypt using Key Vault secret."""
-    encrypted_path = "/tmp/dataset.enc"
-    output_dir = "/tmp/tee_input/data"
-    urls_path = Path("/tmp/urls/decrypted_urls.json")
+    encrypted_path = os.path.join(config.paths.tee_input_data, "dataset.enc")
+    output_dir = config.paths.tee_input_data
+    urls_path = Path(config.get_path('decrypted_urls'))
 
     if not urls_path.exists():
         raise FileNotFoundError(

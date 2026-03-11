@@ -11,3 +11,7 @@ packaging==23.1
 werkzeug==2.3.7
 zipp==3.16.2
 cryptography>=41.0.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+requests>=2.31.0
+Flask-CORS>=4.0.0

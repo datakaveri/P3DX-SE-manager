@@ -7,10 +7,17 @@ import hmac
 import hashlib
 import os
 import shutil
+import sys
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
+
+# Add parent directory to path to import config
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+from lib.config import config
 
 
 def base64url_decode(data: str) -> bytes:
@@ -155,7 +162,7 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
                 print(f"Warning: Size mismatch: {len(decrypted_data)} vs {expected_size} bytes")
             
             original_filename = file_names.get('config', 'generated-config.json')
-            output_folder = '/tmp/tee_input/config'
+            output_folder = config.paths.tee_input_config
             os.makedirs(output_folder, exist_ok=True)
             output_path = os.path.join(output_folder, original_filename)
             
@@ -191,9 +198,9 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
         
         # Save decrypted URLs to a JSON file
         if decrypted_urls:
-            urls_dir = '/tmp/urls'
+            urls_dir = config.paths.tee_urls
             os.makedirs(urls_dir, exist_ok=True)
-            urls_output_path = os.path.join(urls_dir, 'decrypted_urls.json')
+            urls_output_path = os.path.join(urls_dir, config.files.decrypted_urls)
             with open(urls_output_path, 'w') as f:
                 json.dump(decrypted_urls, f, indent=2)
             os.chmod(urls_output_path, 0o600)
