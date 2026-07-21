@@ -63,6 +63,14 @@ azure:
   storage_resource: https://storage.azure.com/
   vault_resource: https://vault.azure.net
 
+# ImmuDB (run_history audit log)
+immudb:
+  host: ${IMMUDB_HOST}
+  port: ${IMMUDB_PORT}
+  user: ${IMMUDB_USER}
+  database: ${IMMUDB_DATABASE}
+  # IMMUDB_PASSWORD is read from env only — not stored here
+
 # CORS (Cross-Origin Resource Sharing) configuration
 cors:
   origins:

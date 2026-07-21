@@ -167,8 +167,9 @@ def fetch_and_decrypt_tee():
     fernet_key = fetch_fernet_key_from_kv(keyvault_url)
     print("Fernet key retrieved successfully")
 
-    # Determine output filename
-    filename = os.path.basename(dataset_url)
+    # Determine output filename (parse path only, ignoring any query string)
+    from urllib.parse import urlparse
+    filename = os.path.basename(urlparse(dataset_url).path)
     if filename.endswith(".enc"):
         filename = filename[:-4]
     if not filename.endswith(".csv"):

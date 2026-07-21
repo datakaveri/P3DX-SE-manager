@@ -7,8 +7,10 @@ import json
 import time
 import logging
 import traceback
+import threading
 import P3DX_SDK
 from lib.config import config
+from lib import immudb_client
 
 
 app = Flask(__name__)
@@ -487,6 +489,166 @@ def get_app_status_endpoint():
         }), 500
 
 
+# ---------------------------------------------------------------------------
+# Pipeline helpers
+# ---------------------------------------------------------------------------
+
+def _run_pipeline_background(job_id: str, username: str, blob_url: str,
+                              technique: str, run_config: dict,
+                              session_id: str, started_at: str):
+    """
+    Background thread: execute the anonymisation pipeline, then write the
+    completed/failed row to immuDB.
+
+    Execution steps mirror deploy_enclave.py steps 9-11:
+      1. Fetch & decrypt data from blob_url
+      2. Write run_config as SKALD config, run Docker containers
+      3. Encrypt & upload output
+    """
+    t0 = time.time()
+    try:
+        config_file_path = config.get_path('config_file')
+        with open(config_file_path, 'r') as f:
+            dp_config = json.load(f)
+
+        # Merge caller-supplied run_config into the on-disk config so SKALD
+        # picks up technique-specific parameters (k, epsilon, chunk_size, …)
+        dp_config.update(run_config or {})
+        dp_config["technique"] = technique
+        with open(config_file_path, 'w') as f:
+            json.dump(dp_config, f, indent=2)
+
+        P3DX_SDK.fetch_and_decrypt_data(config_file_path)
+        P3DX_SDK.run_docker_containers()
+        P3DX_SDK.encrypt_and_upload_output(config_file_path)
+
+        # Derive output blob URL from the decrypted URLs written during fetch
+        import pathlib
+        urls_path = pathlib.Path(config.get_path('decrypted_urls'))
+        output_blob_url = ""
+        if urls_path.exists():
+            with open(urls_path) as f:
+                urls = json.load(f)
+            container = urls.get("outputContainerUrl", "").rstrip("/")
+            output_blob_url = f"{container}/pipeline.log.enc" if container else ""
+
+        duration_ms = int((time.time() - t0) * 1000)
+        immudb_client.write_run_complete(
+            job_id=job_id,
+            username=username,
+            blob_url=blob_url,
+            technique=technique,
+            run_config=run_config,
+            session_id=session_id,
+            started_at=started_at,
+            output_blob_url=output_blob_url,
+            duration_ms=duration_ms,
+        )
+        print(f"Pipeline {technique} job {job_id} completed in {duration_ms}ms")
+
+    except Exception as exc:
+        duration_ms = int((time.time() - t0) * 1000)
+        print(f"Pipeline {technique} job {job_id} failed after {duration_ms}ms: {exc}")
+        traceback.print_exc()
+        immudb_client.write_run_fail(
+            job_id=job_id,
+            username=username,
+            blob_url=blob_url,
+            technique=technique,
+            run_config=run_config,
+            session_id=session_id,
+            started_at=started_at,
+            error_message=str(exc),
+        )
+
+
+def _start_pipeline(technique: str):
+    """
+    Common handler for all three pipeline endpoints.
+    Validates the request, writes the 'running' immuDB row, spawns the
+    background thread, and returns {run_id, status} immediately.
+    """
+    content = request.get_json(silent=True) or {}
+
+    blob_url   = content.get("blob_url")
+    username   = content.get("username", "")
+    run_config = content.get("run_config", {})
+    session_id = content.get("session_id", "")
+
+    if not blob_url:
+        return jsonify({"title": "Error", "description": "blob_url is required"}), 400
+
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    job_id = immudb_client.write_run_start(
+        username=username,
+        blob_url=blob_url,
+        technique=technique,
+        run_config=run_config,
+        session_id=session_id,
+    )
+
+    thread = threading.Thread(
+        target=_run_pipeline_background,
+        args=(job_id, username, blob_url, technique, run_config,
+              session_id, started_at),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({
+        "title":   "Started",
+        "run_id":  job_id,
+        "status":  "running",
+        "technique": technique,
+    }), 202
+
+
+# ---------------------------------------------------------------------------
+# Pipeline endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/run/k_anon_pipeline", methods=["POST"])
+def run_k_anon_pipeline():
+    return _start_pipeline("k_anonymisation")
+
+
+@app.route("/run/dp_pipeline", methods=["POST"])
+def run_dp_pipeline():
+    return _start_pipeline("differential_privacy")
+
+
+@app.route("/run/chunkanon_pipeline", methods=["POST"])
+def run_chunkanon_pipeline():
+    return _start_pipeline("chunk_anonymisation")
+
+
+# ---------------------------------------------------------------------------
+# Run status endpoint (called by LLM VM to build chat context)
+# ---------------------------------------------------------------------------
+
+@app.route("/run/status", methods=["GET"])
+def get_run_status():
+    """
+    GET /run/status?blob_url=<url>&username=<user>
+
+    Queries run_history for the latest row matching blob_url (and optionally
+    username) and returns it so the LLM VM can join session context.
+    """
+    blob_url = request.args.get("blob_url")
+    username = request.args.get("username")
+
+    if not blob_url:
+        return jsonify({"title": "Error", "description": "blob_url query param required"}), 400
+
+    record = immudb_client.get_latest_run(blob_url=blob_url, username=username or None)
+    if record is None:
+        return jsonify({"title": "Not Found", "description": "No run found for given blob_url"}), 404
+
+    return jsonify(record), 200
+
+
 # Error handler for critical errors that require service restart
 @app.errorhandler(Exception)
 def handle_critical_error(e):
@@ -554,5 +716,9 @@ if __name__ == "__main__":
     print("  - POST /enclave/setstate")
     print("  - GET  /enclave/inference")
     print("  - GET  /enclave/status")
+    print("  - POST /run/k_anon_pipeline")
+    print("  - POST /run/dp_pipeline")
+    print("  - POST /run/chunkanon_pipeline")
+    print("  - GET  /run/status")
     print("=" * 60)
     app.run(host=config.service.host, port=config.service.port, debug=True)
