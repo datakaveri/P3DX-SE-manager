@@ -42,6 +42,9 @@ files:
   # Application output
   status: status.json
 
+  # Minimal anonymisation demo (run_anonymisation.py)
+  skald_config: skald_config.json
+
 # Commands and executables
 commands:
   python: python3
@@ -62,6 +65,31 @@ azure:
   # Azure resource endpoints for Managed Identity
   storage_resource: https://storage.azure.com/
   vault_resource: https://vault.azure.net
+
+# Minimal anonymisation demo (run_anonymisation.py).
+#
+# This path deliberately skips the attestation/bundle handshake that
+# deploy_enclave.py performs: the dataset key is fetched straight from Key Vault
+# by the CVM's managed identity over IMDS, so no provider key bundle is needed
+# and nothing has to reach the guest out-of-band. The trade-off is that the
+# TEE's *trust* properties are not demonstrated on this path, only its execution
+# — deploy_enclave.py remains the flow that proves attestation.
+demo:
+  # Key Vault secret holding the Fernet key the dataset was encrypted with.
+  kms_secret_url: https://anon-kv-p3dx.vault.azure.net/secrets/dataset-encryption-key
+
+  # Encrypted dataset blob. Read with the managed identity's Storage Blob Data
+  # Reader grant on the encrypted-data container.
+  dataset_blob_url: https://anondata2.blob.core.windows.net/encrypted-data/healthcare_standard.csv.enc
+
+  # Compose file describing the SKALD container and its three volume mounts.
+  compose_url: https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml
+
+  # Filename SKALD looks for inside /app/config. This mirrors the name the
+  # bundle flow used (metadata.fileNames.config in Bundle/encrypted.json), which
+  # is the only evidence available for what the image expects — the image is
+  # private and could not be inspected. Override here if SKALD wants another name.
+  config_file_name: generated-config.json
 
 # CORS (Cross-Origin Resource Sharing) configuration
 cors:

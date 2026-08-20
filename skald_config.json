@@ -1,0 +1,88 @@
+{
+  "operations": [
+    "suppress",
+    "hashing_with_salt",
+    "encrypt",
+    "masking",
+    "generalize"
+  ],
+  "data_type": "healthcare_standard",
+  "healthcare_standard": {
+    "k_anonymize": {
+      "k": 10
+    },
+    "suppression_limit": 0.1,
+    "flow_mode": "DIRECT",
+    "insensitive_columns": [
+      "Gender",
+      "Diagnosis",
+      "MedicationPrescribed",
+      "HospitalName"
+    ],
+    "pass": "no_bounds",
+    "quasi_identifiers": {
+      "categorical": [
+        {
+          "column": "BloodGroup"
+        }
+      ],
+      "numerical": [
+        {
+          "column": "Age",
+          "type": "int",
+          "size": 2
+        },
+        {
+          "column": "PINCode",
+          "type": "int",
+          "size": 2
+        }
+      ]
+    },
+    "generalize": [
+      "Age",
+      "BloodGroup",
+      "PINCode"
+    ],
+    "suppress": [
+      "Name",
+      "PhoneNumber"
+    ],
+    "hashing_with_salt": [
+      "PatientID",
+      "AadhaarNumber",
+      "DoctorID"
+    ],
+    "encrypt": [
+      {
+        "Email": {
+          "format_preserving": false
+        }
+      },
+      {
+        "InsuranceID": {
+          "format_preserving": true
+        }
+      }
+    ],
+    "masking": [
+      {
+        "column": "DateOfBirth",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          6,
+          7,
+          9,
+          10
+        ]
+      }
+    ],
+    "size": {
+      "Age": 2,
+      "PINCode": 2
+    }
+  }
+}

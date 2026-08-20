@@ -126,6 +126,60 @@ def encrypt_file(input_path, fernet_key_bytes, encrypted_output_path):
     os.chmod(encrypted_output_path, 0o600)
 
 
+def fetch_and_decrypt_minimal(dataset_url=None, keyvault_url=None):
+    """Fetch and decrypt the dataset for the minimal anonymisation demo.
+
+    Same download/decrypt path as fetch_and_decrypt_tee(), with two differences:
+    the URLs come from config.demo instead of the bundle-derived
+    decrypted_urls.json, and the output is NOT encrypted and uploaded to blob
+    storage — the anonymised result leaves via GET /enclave/output instead.
+
+    Returns the path of the decrypted dataset.
+    """
+    dataset_url = dataset_url or config.demo.dataset_blob_url
+    keyvault_url = keyvault_url or config.demo.kms_secret_url
+
+    output_dir = config.paths.tee_input_data
+    encrypted_path = os.path.join(output_dir, "dataset.enc")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("Fetching and Decrypting Data (minimal demo path)")
+    print("=" * 60)
+    print(f"Blob URL: {dataset_url}")
+    print(f"Key Vault URL: {keyvault_url}")
+
+    print("\nDownloading encrypted dataset from blob storage...")
+    download_blob(dataset_url, encrypted_path)
+    print(f"Downloaded to: {encrypted_path}")
+
+    # Managed identity fetches the key over IMDS; it is never persisted.
+    print("\nFetching Fernet key from Key Vault...")
+    fernet_key = fetch_fernet_key_from_kv(keyvault_url)
+    print("Fernet key retrieved successfully")
+
+    # Mirror fetch_and_decrypt_tee()'s naming: strip .enc, ensure a .csv suffix.
+    filename = os.path.basename(dataset_url)
+    if filename.endswith(".enc"):
+        filename = filename[:-4]
+    if not filename.endswith(".csv"):
+        filename += ".csv"
+
+    output_path = os.path.join(output_dir, filename)
+
+    print("\nDecrypting dataset...")
+    decrypt_file(encrypted_path, fernet_key, output_path)
+    print(f"Decrypted data saved to: {output_path}")
+
+    os.remove(encrypted_path)
+
+    print("\n" + "=" * 60)
+    print("Data fetch and decryption completed successfully")
+    print("=" * 60)
+
+    return output_path
+
+
 def fetch_and_decrypt_tee():
     """Fetch encrypted data from Azure Blob Storage and decrypt using Key Vault secret."""
     encrypted_path = os.path.join(config.paths.tee_input_data, "dataset.enc")

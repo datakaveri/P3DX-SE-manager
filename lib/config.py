@@ -129,6 +129,12 @@ class Config:
         self.cors = PathNamespace()
         for key, value in cors_config.items():
             setattr(self.cors, key, value)
+
+        # Minimal anonymisation demo (run_anonymisation.py)
+        demo_config = self._config.get('demo', {})
+        self.demo = PathNamespace()
+        for key, value in demo_config.items():
+            setattr(self.demo, key, value)
     
     def _validate_and_create_dirs(self):
         """Validate paths and auto-create missing directories."""

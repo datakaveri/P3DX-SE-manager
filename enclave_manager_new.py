@@ -1,12 +1,15 @@
-from flask import Flask, jsonify, Response, request
+from flask import Flask, jsonify, Response, request, send_file
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 import subprocess
 import os
 import json
+import re
+import shlex
 import time
 import logging
 import traceback
+from urllib.parse import urlparse
 import P3DX_SDK
 from lib.config import config
 
@@ -114,6 +117,219 @@ def deploy_enclave():
 
 
 
+def _is_safe_blob_url(url):
+    """Accept only absolute https URLs.
+
+    The dataset and Key Vault URLs arrive over HTTP and are handed to the
+    fetcher, which signs requests with this VM's managed identity. Requiring
+    https keeps the identity's token off plaintext connections and rejects
+    scheme tricks (file://, http://169.254.169.254/... aimed at IMDS itself).
+    """
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    return u.scheme == "https" and bool(u.netloc)
+
+
+# RUN: minimal anonymisation path — fetch data + key, decrypt, run SKALD.
+# Unlike /enclave/deploy this needs no bundle from the UI and performs no
+# attestation handshake; see run_anonymisation.py for the trade-off.
+@app.route("/enclave/run", methods=["POST"])
+def run_anonymisation():
+    global is_app_running, state
+
+    print("STARTING anonymisation run")
+
+    if is_app_running:
+        print("Previous run detected. Restarting service to reset state...")
+        try:
+            P3DX_SDK.restart_enclave_manager()
+            time.sleep(3)
+            is_app_running = False
+        except Exception as e:
+            return jsonify({
+                "title": "Error",
+                "description": f"Previous run detected but failed to restart service: {str(e)}"
+            }), 500
+
+    content = request.json if request.json else {}
+    contract_id = content.get("contract_id", "")
+    tee_id = content.get("tee_id", "")
+    # Dataset location comes from the contract (datasetDetails.resourceUrl),
+    # relayed by the governance layer. Falls back to config.demo when absent.
+    dataset_url = content.get("dataset_url", "")
+    keyvault_url = content.get("keyvault_url", "")
+
+    if dataset_url and not _is_safe_blob_url(dataset_url):
+        return jsonify({
+            "title": "Error",
+            "description": "dataset_url must be an https:// URL"
+        }), 400
+    if keyvault_url and not _is_safe_blob_url(keyvault_url):
+        return jsonify({
+            "title": "Error",
+            "description": "keyvault_url must be an https:// URL"
+        }), 400
+
+    state = {
+        "step": 1,
+        "maxSteps": 6,
+        "title": "Preparing TEE folders",
+        "description": "Step 1"
+    }
+
+    try:
+        # Logs stream to journalctl -t tee-anon, matching the deploy path's
+        # systemd-cat convention. The run parameters originate in a request
+        # body, so every one is shell-quoted before landing in `sh -c`.
+        argv = ["python3", "-u", "run_anonymisation.py"]
+        for flag, value in (("--dataset-url", dataset_url),
+                            ("--keyvault-url", keyvault_url),
+                            ("--contract-id", contract_id),
+                            ("--tee-id", tee_id)):
+            if value:
+                argv += [flag, value]
+        cmd = f"{shlex.join(argv)} 2>&1 | systemd-cat -t tee-anon"
+        subprocess.Popen(["sudo", "sh", "-c", cmd], cwd=config.base_dir)
+
+        is_app_running = True
+        print(f"Anonymisation started (contract_id={contract_id!r} tee_id={tee_id!r})")
+        return jsonify({
+            "title": "Success",
+            "description": "Anonymisation run has started.",
+            "contract_id": contract_id,
+            "tee_id": tee_id,
+            "maxSteps": 6
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "title": "Error",
+            "description": f"Failed to start anonymisation: {str(e)}"
+        }), 500
+
+
+# Cap on how much file content is inlined into the JSON manifest. Larger files
+# are listed with their size only and must be fetched individually via ?file=.
+MAX_INLINE_OUTPUT_BYTES = 5 * 1024 * 1024
+
+INLINE_OUTPUT_SUFFIXES = (".csv", ".json", ".txt", ".log", ".tsv", ".yaml", ".yml")
+
+# SKALD writes the keys for its own encrypt/FPE operations into the output
+# directory (symmetric_keys.json, fpe_encrypt_keys.json). Serving those next to
+# the anonymised data would hand the consumer the means to reverse the very
+# columns the config asked to be encrypted, so they are withheld here — both
+# from the manifest and from ?file=. Suffix-matched rather than hardcoded so a
+# future key file is withheld by default rather than leaking until noticed.
+KEY_MATERIAL_SUFFIXES = ("_keys.json",)
+
+
+def _is_key_material(name):
+    """True if name looks like key material that must not leave the enclave."""
+    return name.lower().endswith(KEY_MATERIAL_SUFFIXES)
+
+
+def _readable_output_path(filename):
+    """Resolve a filename inside the output dir, relaxing docker's root-owned perms.
+
+    Returns the absolute path, or None if the name escapes the output directory.
+    """
+    output_dir = os.path.abspath(config.paths.tee_output)
+    candidate = os.path.abspath(os.path.join(output_dir, filename))
+
+    # Reject traversal: the resolved path must stay inside the output dir.
+    if candidate != output_dir and not candidate.startswith(output_dir + os.sep):
+        return None
+
+    if os.path.exists(candidate):
+        # SKALD writes as root inside the container; make it readable like
+        # /enclave/inference already does for status.json.
+        subprocess.run(["sudo", "chmod", "644", candidate], check=False, capture_output=True)
+
+    return candidate
+
+
+# OUTPUT: Returns the anonymised output produced by the run.
+# Default: a JSON manifest with small text files inlined.
+# ?file=<name>: that single file as a download.
+@app.route("/enclave/output", methods=["GET"])
+def get_output():
+    output_dir = config.paths.tee_output
+    print(f"Fetching anonymisation output from {output_dir}...")
+
+    if not os.path.isdir(output_dir):
+        return jsonify({
+            "title": "Error: No output",
+            "description": f"Output directory does not exist: {output_dir}"
+        }), 404
+
+    requested = request.args.get("file")
+    if requested:
+        if _is_key_material(os.path.basename(requested)):
+            return jsonify({
+                "title": "Error: Forbidden",
+                "description": "Encryption key material is not served from the enclave."
+            }), 403
+        path = _readable_output_path(requested)
+        if path is None:
+            return jsonify({
+                "title": "Error: Invalid file",
+                "description": "file must name a file inside the output directory"
+            }), 400
+        if not os.path.isfile(path):
+            return jsonify({
+                "title": "Error: Not found",
+                "description": f"No such output file: {requested}"
+            }), 404
+        return send_file(path, as_attachment=True,
+                         download_name=os.path.basename(path))
+
+    files = []
+    withheld = []
+    for name in sorted(os.listdir(output_dir)):
+        if _is_key_material(name):
+            withheld.append(name)
+            continue
+        path = _readable_output_path(name)
+        if path is None or not os.path.isfile(path):
+            continue
+
+        size = os.path.getsize(path)
+        entry = {"name": name, "size_bytes": size}
+
+        inlineable = (name.lower().endswith(INLINE_OUTPUT_SUFFIXES)
+                      and size <= MAX_INLINE_OUTPUT_BYTES)
+        if inlineable:
+            try:
+                with open(path, "r", errors="replace") as f:
+                    entry["content"] = f.read()
+            except OSError as e:
+                entry["error"] = f"could not read: {e}"
+        else:
+            entry["note"] = "fetch individually via ?file=" + name
+
+        files.append(entry)
+
+    if not files:
+        return jsonify({
+            "title": "Error: No output",
+            "description": f"No output files found in {output_dir}. Has the run finished?",
+            "step": state.get("step", 0),
+            "maxSteps": state.get("maxSteps", 6)
+        }), 404
+
+    return jsonify({
+        "title": "Success",
+        "output_dir": output_dir,
+        "file_count": len(files),
+        "files": files,
+        # Named but not served, so the caller knows they exist and are withheld
+        # rather than silently missing.
+        "withheld": withheld
+    }), 200
+
+
 stored_bundle = None
 
 @app.route("/enclave/jwt", methods=["POST"])
@@ -178,6 +394,87 @@ def get_jwt():
         }
         return jsonify(response), 500
 
+
+
+# ATTEST: Produce an MAA attestation token bound to a caller-supplied nonce.
+#
+# Differs from GET /enclave/jwt/fresh, which mints its own nonce: here the
+# governance layer supplies the challenge, so the token it gets back cannot be a
+# replay of an earlier genuine attestation. The nonce reaches the hardware via
+# AttestationClient -n and comes back as a signed claim.
+@app.route("/enclave/attest", methods=["POST"])
+def attest():
+    content = request.json if request.json else {}
+    nonce = str(content.get("nonce", "")).strip()
+
+    if not nonce:
+        return jsonify({
+            "title": "Error",
+            "description": "nonce is required"
+        }), 400
+    # AttestationClient takes the nonce as a CLI argument; keep it to an
+    # unambiguous base64 alphabet so it can never be read as another flag.
+    if len(nonce) > 128 or not re.fullmatch(r"[A-Za-z0-9+/=_-]+", nonce):
+        return jsonify({
+            "title": "Error",
+            "description": "nonce must be <=128 chars of base64 ([A-Za-z0-9+/=_-])"
+        }), 400
+
+    print(f"Attesting with caller-supplied nonce (len={len(nonce)})...")
+
+    jwt_file_path = config.get_path('jwt_response')
+    keys_dir = config.paths.keys_dir
+    original_cwd = os.getcwd()
+
+    try:
+        os.chdir(config.base_dir)
+        os.makedirs(keys_dir, exist_ok=True)
+        subprocess.run(["sudo", "chown", "-R", f"{config.user}:{config.user}", keys_dir],
+                       check=False, capture_output=True)
+        subprocess.run(["sudo", "chmod", "-R", "755", keys_dir],
+                       check=False, capture_output=True)
+
+        # A stale token must not be mistaken for a fresh one if attestation fails.
+        if os.path.exists(jwt_file_path):
+            subprocess.run(["sudo", "rm", "-f", jwt_file_path], check=False, capture_output=True)
+
+        P3DX_SDK.save_nonce(nonce)
+        try:
+            P3DX_SDK.extend_nonce_to_pcr8(nonce)
+        except Exception as e:
+            # PCR 8 is not in MAA's attested PCR set (it reports 0-7), so the
+            # nonce binding does not depend on this. Log and carry on.
+            print(f"Note: PCR8 extension failed, not fatal for token binding: {e}")
+
+        P3DX_SDK.execute_guest_attestation()
+
+        subprocess.run(["sudo", "chown", f"{config.user}:{config.user}", jwt_file_path],
+                       check=False, capture_output=True)
+        subprocess.run(["sudo", "chmod", "644", jwt_file_path],
+                       check=False, capture_output=True)
+
+        with open(jwt_file_path, "r") as f:
+            token = f.read().strip()
+
+        if not token:
+            return jsonify({
+                "title": "Error",
+                "description": "Attestation produced an empty token"
+            }), 500
+
+        print(f"Attestation token generated (length: {len(token)})")
+        return jsonify({"title": "Success", "jwt": token, "nonce": nonce}), 200
+
+    except RuntimeError as e:
+        return jsonify({"title": "Error", "description": str(e)}), 500
+    except Exception as e:
+        print(f"Unexpected error during attestation: {e}")
+        return jsonify({
+            "title": "Error",
+            "description": f"Attestation failed: {e}"
+        }), 500
+    finally:
+        os.chdir(original_cwd)
 
 
 # GET FRESH JWT: Returns a fresh JWT token
@@ -435,9 +732,11 @@ def setState():
     
     print(f"State updated - Step {state['step']}/{state['maxSteps']}: {state['title']}")
     
-    if state["step"] == 11:
+    # Compare against the run's own maxSteps rather than a literal 11: the
+    # minimal anonymisation path (run_anonymisation.py) finishes at step 6.
+    if state["step"] >= state.get("maxSteps", 11):
         is_app_running = False
-        print("Deployment completed, resetting is_app_running flag")
+        print("Run completed, resetting is_app_running flag")
     
     response = app.response_class(
         response='{"status": "ok"}', 
@@ -549,6 +848,9 @@ if __name__ == "__main__":
     print(f"Port: {config.service.port}")
     print("Endpoints available:")
     print("  - POST /enclave/deploy")
+    print("  - POST /enclave/run")
+    print("  - POST /enclave/attest")
+    print("  - GET  /enclave/output")
     print("  - GET  /enclave/jwt")
     print("  - GET  /enclave/state")
     print("  - POST /enclave/setstate")

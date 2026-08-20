@@ -150,9 +150,24 @@ def generate_and_save_key_pair():
 
 
 def pull_docker_image(app_name):
-    """Pull a Docker image."""
+    """Pull a Docker image, failing loudly if the pull is refused.
+
+    The exit code matters: ghcr.io/datakaveri images are private, so a guest
+    without a valid registry credential gets "denied" here. Ignoring that let
+    the run continue to `docker compose up` and fail later with a much less
+    obvious error, so surface it at the point of failure instead.
+    """
     print("Pulling docker image")
-    subprocess.run(["docker", "pull", app_name])
+    result = subprocess.run(["docker", "pull", app_name],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"docker pull {app_name} failed (exit {result.returncode}): {detail}. "
+            "If this is 'denied', the guest needs a registry login: "
+            "echo $PAT | docker login ghcr.io -u <user> --password-stdin"
+        )
+    print(result.stdout.strip())
 
 
 def hash_docker_image(image):
@@ -521,6 +536,42 @@ def fetch_and_decrypt_data(config_path="DPconfig.json"):
     print("Fetching and decrypting data from Azure Blob Storage...")
     fetch_data.fetch_and_decrypt_tee()
     print("Data fetched and decrypted successfully")
+
+
+def fetch_and_decrypt_minimal(dataset_url=None, keyvault_url=None):
+    """Fetch and decrypt the dataset for the minimal anonymisation demo.
+
+    Unlike fetch_and_decrypt_data(), this does not depend on a decrypted bundle
+    having produced /tmp/urls/decrypted_urls.json — the blob and Key Vault URLs
+    come from config.demo. Returns the decrypted dataset path.
+    """
+    fetch_data = _get_fetch_data()
+    print("Fetching and decrypting data from Azure Blob Storage (minimal path)...")
+    path = fetch_data.fetch_and_decrypt_minimal(dataset_url, keyvault_url)
+    print("Data fetched and decrypted successfully")
+    return path
+
+
+def stage_skald_config():
+    """Copy the fixed SKALD config into the TEE config mount.
+
+    On the bundle flow this file arrives encrypted from the UI and is written by
+    decryption.py. On the minimal demo path the config is fixed and baked into
+    the image, so it is copied straight in under the filename SKALD expects
+    (config.demo.config_file_name).
+    """
+    src = config.get_path('skald_config')
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"SKALD config not found: {src}")
+
+    dest_dir = config.paths.tee_input_config
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, config.demo.config_file_name)
+
+    shutil.copyfile(src, dest)
+    os.chmod(dest, 0o644)
+    print(f"Staged SKALD config: {src} -> {dest}")
+    return dest
 
 
 def run_docker_containers():
