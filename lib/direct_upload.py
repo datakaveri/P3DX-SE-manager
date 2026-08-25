@@ -16,17 +16,18 @@ import sys
 import threading
 import time
 
+from cryptography.hazmat.primitives import serialization
+
 from lib.config import config
 from enclave.enclave_direct_upload import (
     UploadManager,
     UploadError,
-    load_private_key,
     write_output_container,
 )
 
 _lock = threading.Lock()
 _manager = None
-_manager_key_mtime = None
+_manager_key_fingerprint = None
 _sweeper_started = False
 
 # How often the background sweeper checks for idle sessions. Independent of
@@ -91,21 +92,28 @@ def get_manager():
     not just convenient. Either way (fresh process or rotation), any files
     already in scratch_dir are swept first — see _sweep_stray_scratch_files.
     """
-    global _manager, _manager_key_mtime, _sweeper_started
+    global _manager, _manager_key_fingerprint, _sweeper_started
 
-    key_path = config.get_path('private_key')
-    if not os.path.exists(key_path):
+    # Keyed on the public key's fingerprint rather than the private key file's
+    # mtime. The private key is normally a sealed blob whose mtime says nothing
+    # useful, and a fingerprint answers the actual question — "is this still the
+    # same keypair?" — instead of a proxy for it.
+    import P3DX_SDK  # deferred: P3DX_SDK imports this module at load time
+
+    if not P3DX_SDK.keypair_exists():
         raise UploadError(503, "TEE keys not yet generated — attest before uploading")
 
-    mtime = os.path.getmtime(key_path)
+    fingerprint = P3DX_SDK.public_key_fingerprint()
     with _lock:
-        if _manager is None or _manager_key_mtime != mtime:
+        if _manager is None or _manager_key_fingerprint != fingerprint:
             scratch_dir = _scratch_dir()
             os.makedirs(scratch_dir, exist_ok=True)
             _sweep_stray_scratch_files(scratch_dir)
-            private_key = load_private_key(key_path)
+            private_key = serialization.load_pem_private_key(
+                P3DX_SDK.load_enclave_private_key_pem(), password=None
+            )
             _manager = UploadManager(private_key, scratch_dir=scratch_dir)
-            _manager_key_mtime = mtime
+            _manager_key_fingerprint = fingerprint
         if not _sweeper_started:
             threading.Thread(target=_run_background_sweeper, name="direct-upload-sweeper", daemon=True).start()
             _sweeper_started = True

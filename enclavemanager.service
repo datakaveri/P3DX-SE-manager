@@ -4,7 +4,23 @@ Description=AMD enclave manager systemd service
 [Service]
 User=kanonTEE
 WorkingDirectory=/home/kanonTEE/P3DX-SE-manager
-ExecStart=/home/kanonTEE/.env/enclaveManager/bin/gunicorn --bind 0.0.0.0:4000 enclave_manager_new:app
+
+# Fleet identity and the scheduler's completion callback. TEE_ID must match the
+# tee_id in the middleware's fleet.json. Without the callback pair, a finished
+# job stays RUNNING until the middleware's stall timer reaps it — a successful
+# run that looks like a failure.
+Environment=TEE_ID=tee-1
+Environment=TEE_CALLBACK_URL=https://buffer.iudx.org.in
+# Set via a drop-in (systemctl edit) or an EnvironmentFile so the secret is not
+# committed:  Environment=TEE_CALLBACK_SECRET=...
+
+# --workers 1: the upload session store and the deploy state are in-process
+# globals, so a second worker would serve requests that cannot see them.
+# --threads 8 and a 300s timeout because a 64 MiB chunk PUT can legitimately
+# take minutes on a slow uplink.
+ExecStart=/home/kanonTEE/.env/enclaveManager/bin/gunicorn \
+    --workers 1 --threads 8 --timeout 300 \
+    --bind 0.0.0.0:4000 enclave_manager_new:app
 Restart=always
 RestartSec=10
 StartLimitIntervalSec=300

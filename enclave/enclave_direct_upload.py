@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -53,6 +54,13 @@ MAX_TOTAL_BYTES_BY_FORMAT = {
 MAX_CONCURRENT_SESSIONS_PER_USER = 1
 SESSION_TTL_SECONDS = 30 * 60
 OUTPUT_TTL_SECONDS = 2 * 60 * 60
+
+# A caller-supplied session id becomes a filename in the scratch directory, so it
+# is constrained to a UUID and nothing else. The middleware only ever sends a
+# job_id, which is a uuid4, so this costs nothing and closes a path-traversal
+# write.
+SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                           r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
 # Scratch MUST be tmpfs. DC2as_v5 has no local temp disk, so RAM is the only
 # storage inside the SEV-SNP encrypted-memory boundary. Mount it size-capped so a
@@ -204,6 +212,23 @@ class UploadManager:
     # -- init ------------------------------------------------------------- #
 
     def init(self, user_sub: str, body: dict) -> dict:
+        # The caller may name the session, because the browser encrypted these
+        # chunks before any enclave was chosen and baked that name into every
+        # chunk's AAD ("{session_id}:{index}:{total_chunks}"). Minting a fresh
+        # uuid here instead would make every chunk fail its AEAD check, with no
+        # error that points at the cause.
+        #
+        # Validated first, and constrained to a UUID, because it becomes a
+        # filename in the scratch directory further down. Absent, we mint our
+        # own, so a direct caller with no queue in front of it still works.
+        session_id = body.get("session_id")
+        if session_id is not None:
+            if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+                raise UploadError(400, "session_id must be a UUID")
+            with self._lock:
+                if session_id in self._sessions:
+                    raise UploadError(409, "That session_id is already in use")
+
         fmt = str(body.get("format", "")).lower()
         if fmt not in MAX_TOTAL_BYTES_BY_FORMAT:
             raise UploadError(400, f"Unsupported format '{fmt}'")
@@ -247,7 +272,7 @@ class UploadManager:
         if len(base_iv) != 12 or len(output_base_iv) != 12:
             raise UploadError(400, "base_iv and output_base_iv must be 12 bytes")
 
-        upload_id = str(uuid.uuid4())
+        upload_id = session_id or str(uuid.uuid4())
         scratch_path = os.path.join(self._scratch_dir, f"{upload_id}.bin")
         with open(scratch_path, "wb") as fh:
             fh.truncate(total_bytes)          # sparse preallocation
@@ -333,7 +358,14 @@ class UploadManager:
             "expires_at": _iso(session.last_activity + SESSION_TTL_SECONDS),
         }
 
-    def complete(self, user_sub: str, upload_id: str, plaintext_sha256: str) -> dict:
+    def complete(self, user_sub: str, upload_id: str, digest_root: str) -> dict:
+        """Verify the whole-file commitment and close the session.
+
+        `digest_root` is the chunk digest root — SHA-256 over the concatenated
+        raw per-chunk digests — not a SHA-256 of the plaintext. This parameter
+        was called `plaintext_sha256` for a while, which described neither what
+        callers sent nor what this compares it against.
+        """
         session = self._require(user_sub, upload_id)
 
         missing = [i for i in range(session.total_chunks) if i not in session.received]
@@ -345,7 +377,7 @@ class UploadManager:
             raise UploadError(400, "Reassembled size does not match total_bytes")
 
         root = chunk_digest_root([session.received[i] for i in range(session.total_chunks)])
-        if root != plaintext_sha256.lower():
+        if root != digest_root.lower():
             raise UploadError(400, "Reassembled dataset does not match the client checksum")
 
         session.completed = True
@@ -659,4 +691,53 @@ if __name__ == "__main__":
     print("output round    -> byte-identical after decrypt")
 
     manager.release(upload_id)
+
+    # ----------------------------------------------------------------------- #
+    # Caller-supplied session id.
+    #
+    # Under the job queue the browser encrypts before any enclave is chosen, so
+    # the AAD is bound to the middleware's job_id. If init mints its own id
+    # instead, every chunk fails its AEAD check with nothing pointing at why —
+    # which is exactly why this is tested rather than assumed.
+    # ----------------------------------------------------------------------- #
+
+    job_id = str(uuid.uuid4())
+    small = os.urandom(4096)
+    dkey, okey2 = os.urandom(32), os.urandom(32)
+    div, oiv2 = os.urandom(12), os.urandom(12)
+
+    init = manager.init("user-123", {
+        "session_id": job_id,
+        "filename": "queued.csv", "format": "csv",
+        "total_bytes": len(small), "chunk_size": len(small), "total_chunks": 1,
+        "cipher": "AES-256-GCM", "key_wrap": "RSA-OAEP-SHA256",
+        "wrapped_key": wrap(dkey), "base_iv": base64.b64encode(div).decode(),
+        "output_wrapped_key": wrap(okey2),
+        "output_base_iv": base64.b64encode(oiv2).decode(),
+    })
+    if init["upload_id"] != job_id:
+        raise SystemExit(f"FAIL: init minted {init['upload_id']} instead of adopting {job_id}")
+    print(f"session_id      -> adopted {job_id}")
+
+    # The decisive check: ciphertext whose AAD was sealed under job_id must
+    # decrypt, which it only can if the enclave reconstructs the same AAD.
+    digest = hashlib.sha256(small).hexdigest()
+    manager.put_chunk("user-123", job_id, 0,
+                      encrypt_chunk(dkey, div, job_id, 0, 1, small), digest)
+    manager.complete("user-123", job_id, chunk_digest_root([digest]))
+    assert open(manager.resolve_dataset_ref("user-123",
+                f"enclave://upload/{job_id}"), "rb").read() == small
+    print("session_id AAD  -> chunks sealed under job_id decrypt correctly")
+    manager.release(job_id)
+
+    for bad in ("../../etc/passwd", "not-a-uuid", "", "a" * 36):
+        try:
+            manager.init("user-123", {"session_id": bad, "format": "csv",
+                                      "total_bytes": 1, "chunk_size": 1, "total_chunks": 1,
+                                      "cipher": "AES-256-GCM", "key_wrap": "RSA-OAEP-SHA256"})
+            raise SystemExit(f"FAIL: session_id {bad!r} was accepted")
+        except UploadError:
+            pass
+    print("session_id       -> non-UUID ids rejected (they become filenames)")
+
     print("\nAll self-tests passed.")

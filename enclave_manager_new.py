@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, Response, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+import base64
+import re
 import subprocess
 import os
 import json
@@ -12,6 +14,7 @@ import P3DX_SDK
 from lib.config import config
 from lib import immudb_client
 from lib import direct_upload
+from lib import sealed_key
 from enclave.enclave_direct_upload import UploadError, MAX_CHUNK_BYTES
 
 
@@ -33,11 +36,40 @@ CORS(app,
 
 
 # Default state when application is not running
+def _bootstrap_measurement():
+    """Extend PCR15 with the enclave-manager code hash at startup.
+
+    A reboot resets every PCR to zero, but the KEK protecting the private key is
+    sealed against PCR15 holding the code hash. So the measurement has to happen
+    before anything needs the key — and the first thing to need it may well be an
+    inbound upload, not an attestation call.
+
+    This used to run only inside /enclave/jwt/fresh, which meant a freshly booted
+    node with a valid sealed key could not open it until something happened to
+    ask for a new attestation. Idempotent: a no-op once PCR15 is non-zero.
+    """
+    try:
+        P3DX_SDK.measure_enclave_manager_code_vtpm()
+    except Exception as e:
+        # Not fatal — the node still serves /enclave/state and reports itself
+        # unhealthy — but every unseal will fail until this succeeds, so say so
+        # loudly rather than failing mysteriously later.
+        print(f"CRITICAL: PCR15 measurement failed at startup: {e}. "
+              f"The sealed private key cannot be unsealed until this is fixed.")
+
+
+_bootstrap_measurement()
+
+
 state = {
     "step": 0,
     "maxSteps": 11,
     "title": "Inactive",
     "description": "Inactive",
+    # Scheduler's job id for the run currently in flight. Lets a status poll
+    # arriving just after a previous job finished be told apart from this job's
+    # own status — the hazard of a singleton status endpoint.
+    "job_id": "",
 }
 
 
@@ -78,16 +110,9 @@ def deploy_enclave():
     
     stored_bundle = None
 
-    global state
-    state = {
-        "step": 1,
-        "maxSteps": 11,
-        "title": "Spawning Trusted Execution Environment (TEE)",
-        "description": "Step 1"
-    }
-    
     content = request.json if request.json else {}
     compose_url = content.get("compose_url")
+    job_id = str(content.get("job_id", "") or "")
 
     if not compose_url:
         return jsonify({
@@ -95,8 +120,27 @@ def deploy_enclave():
             "description": "compose_url is required in request payload"
         }), 400
 
+    # job_id reaches a shell command line below, so constrain it to a UUID.
+    # compose_url is quoted with repr(); this gets the same discipline rather
+    # than relying on it.
+    if job_id and not re.fullmatch(r"[0-9a-fA-F-]{36}", job_id):
+        return jsonify({
+            "title": "Error",
+            "description": "job_id must be a UUID"
+        }), 400
+
+    global state
+    state = {
+        "step": 1,
+        "maxSteps": 11,
+        "title": "Spawning Trusted Execution Environment (TEE)",
+        "description": "Step 1",
+        "job_id": job_id,
+    }
+
     try:
-        cmd = f"python3 -u deploy_enclave.py {repr(compose_url)} 2>&1 | systemd-cat -t tee-deployment"
+        cmd = (f"python3 -u deploy_enclave.py {repr(compose_url)} {repr(job_id)} "
+               f"2>&1 | systemd-cat -t tee-deployment")
         subprocess.Popen(
             ["sudo", "sh", "-c", cmd],
             cwd=config.base_dir
@@ -129,6 +173,102 @@ def receive_jwt():
         return jsonify({"status": "success", "message": "JWT stored"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def _jwt_expiry(token):
+    """`exp` from a JWT payload, without verifying the signature.
+
+    Safe here because this is our *own* token being reported for scheduling, not
+    a credential being trusted: the middleware uses it only to avoid handing a
+    browser a token that will fail validation. The browser does the real
+    verification against MAA's JWKS.
+    """
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(payload_b64)).get("exp", 0))
+    except Exception:
+        return 0
+
+
+@app.route("/enclave/identity", methods=["GET"])
+def get_identity():
+    """Everything the scheduler needs to route work to this enclave.
+
+    Polled every ~30s per TEE, so it stays cache-only: read the files already on
+    disk, do no TPM work, run no attestation. `/enclave/jwt/fresh` is the
+    expensive path and the scheduler calls it deliberately, only when a token is
+    close to expiring and no job is running.
+
+    The public key is returned in the same bare-base64 form the attestation
+    client payload carries, so the middleware's fingerprint of it matches the
+    one derived from the token.
+    """
+    try:
+        public_key_path = config.get_path('public_key')
+        if not os.path.exists(public_key_path):
+            return jsonify({
+                "title": "Not ready",
+                "description": "No keypair yet; the enclave has not completed startup.",
+            }), 503
+
+        with open(public_key_path, "r") as f:
+            public_key = f.read().strip()
+
+        jwt_token, jwt_exp = "", 0
+        jwt_file_path = config.get_path('jwt_response')
+        if os.path.exists(jwt_file_path):
+            with open(jwt_file_path, "r") as f:
+                jwt_token = f.read().strip()
+            jwt_exp = _jwt_expiry(jwt_token)
+
+        image_digest = ""
+        image_hash_path = config.get_path('image_hash')
+        if os.path.exists(image_hash_path):
+            with open(image_hash_path, "r") as f:
+                image_digest = f.read().strip()
+
+        return jsonify({
+            "tee_id": os.getenv("TEE_ID", ""),
+            "public_key_pem": public_key,
+            "key_fingerprint": P3DX_SDK.public_key_fingerprint(),
+            "key_generation": P3DX_SDK.load_key_generation(),
+            "maa_jwt": jwt_token,
+            "jwt_exp": jwt_exp,
+            "image_digest": image_digest,
+            "job_id": state.get("job_id", ""),
+            "step": state.get("step", 0),
+            "sealed": sealed_key.enabled(),
+        }), 200
+    except Exception as e:
+        print(f"Identity lookup failed: {e}")
+        return jsonify({"title": "Error", "description": str(e)}), 500
+
+
+@app.route("/enclave/key/rotate", methods=["POST"])
+def rotate_key():
+    """Mint a new keypair and reseal it.
+
+    Refused while a job is running: any data key already wrapped for the old
+    public key becomes undecryptable the moment this returns, and an in-flight
+    job would fail at its next decrypt with no useful error. The scheduler only
+    calls this on an idle enclave.
+    """
+    if is_app_running or 0 < state.get("step", 0) < 11:
+        return jsonify({
+            "title": "Busy",
+            "description": "Refusing to rotate keys while a job is running.",
+        }), 409
+    try:
+        fingerprint = P3DX_SDK.rotate_key_pair()
+    except Exception as e:
+        return jsonify({"title": "Rotation failed", "description": str(e)}), 500
+    # The old attestation quotes the old public key, so it is now misleading.
+    # Drop it; the scheduler re-attests on its next poll.
+    jwt_file_path = config.get_path('jwt_response')
+    if os.path.exists(jwt_file_path):
+        subprocess.run(["sudo", "rm", "-f", jwt_file_path], check=False, capture_output=True)
+    return jsonify({"status": "rotated", "key_fingerprint": fingerprint}), 200
+
 
 @app.route("/enclave/jwt", methods=["GET"])
 def get_jwt():
@@ -195,8 +335,6 @@ def get_fresh_jwt():
     print("Generating fresh JWT token...")
     
     jwt_file_path = config.get_path('jwt_response')
-    private_key_path = config.get_path('private_key')
-    public_key_path = config.get_path('public_key')
     keys_dir = config.paths.keys_dir
     
     original_cwd = os.getcwd()
@@ -210,12 +348,21 @@ def get_fresh_jwt():
             check=False,
             capture_output=True
         )
+        # 0700 on the directory only — never `-R`, which would flatten the
+        # per-file modes generate_and_save_key_pair() sets (0600 on the sealed
+        # blobs, 0644 on the public key).
+        #
+        # This used to be `-R 755`, i.e. world-readable. That was already bad and
+        # became indefensible once the keypair started outliving a single deploy:
+        # a long-lived private key readable by every local account is a standing
+        # exposure, not a momentary one.
         subprocess.run(
-            ["sudo", "chmod", "-R", "755", keys_dir],
+            ["sudo", "chmod", "700", keys_dir],
             check=False,
             capture_output=True
         )
-        
+
+
         if os.path.exists(jwt_file_path):
             subprocess.run(
                 ["sudo", "rm", "-rf", jwt_file_path],
@@ -224,13 +371,11 @@ def get_fresh_jwt():
             )
             print("Old JWT file deleted")
         
-        if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
-            print("Keys not found. Generating new key pair...")
-            P3DX_SDK.generate_and_save_key_pair()
-            print("Key pair generated successfully")
-
+        # PCR15 must be extended BEFORE the keypair is created or used: the KEK
+        # protecting the private key is sealed against PCR15's value, so sealing
+        # while it still reads zero would produce a blob that stops unsealing the
+        # moment the code is measured. Idempotent — a no-op once extended.
         try:
-            # Measure enclave manager code 
             P3DX_SDK.measure_enclave_manager_code_vtpm()
             print("Enclave manager code hash measured successfully")
             
@@ -240,7 +385,12 @@ def get_fresh_jwt():
             # print("Application image hash measured successfully")
         except Exception as e:
             print(f"Warning: Failed to measure code/image: {str(e)}")
-        
+
+        # Only now — with PCR15 holding the code hash — is it safe to create or
+        # reuse the sealed keypair. This is a no-op when one already exists,
+        # which is the normal case: the key is long-lived and outlives deploys.
+        P3DX_SDK.generate_and_save_key_pair()
+
         # new nonce generated every time a fresh endpoint is hit
         print("Generating fresh deployment nonce...")
         nonce = P3DX_SDK.generate_nonce()                  
@@ -490,6 +640,7 @@ def get_state():
         "maxSteps": state.get("maxSteps", 11),
         "title": state.get("title", "Inactive"),
         "description": state.get("description", "Inactive"),
+        "job_id": state.get("job_id", ""),
     }
     print(f"State requested - Step {response['step']}/{response['maxSteps']}")
     return jsonify(response)
@@ -720,7 +871,11 @@ def upload_complete(upload_id):
         body = request.get_json(silent=True)
         if body is None:
             raise UploadError(400, "Request body must be JSON")
-        result = manager.complete(sub, upload_id, str(body.get("plaintext_sha256", "")))
+        # `chunk_digest_root` is the accurate name; `plaintext_sha256` is the
+        # older one for the same value and is still accepted so an existing
+        # client is not broken by the rename.
+        digest_root = body.get("chunk_digest_root") or body.get("plaintext_sha256") or ""
+        result = manager.complete(sub, upload_id, str(digest_root))
         return jsonify(result), 200
     except UploadError as e:
         return _upload_error_response(e)
@@ -761,8 +916,7 @@ def _peek_bundle_blob_url(content):
     if not wrapped_key or not blob_token:
         return None
     from decryption import decrypt_rsa_wrapped_key, decrypt_fernet_token
-    private_key_path = config.get_path('private_key')
-    fernet_key = decrypt_rsa_wrapped_key(wrapped_key, private_key_path)
+    fernet_key = decrypt_rsa_wrapped_key(wrapped_key, P3DX_SDK.load_enclave_private_key_pem())
     return decrypt_fernet_token(blob_token, fernet_key).decode('utf-8')
 
 
@@ -896,7 +1050,20 @@ def _start_pipeline(technique: str):
     Common handler for all three pipeline endpoints.
     Validates the request, writes the 'running' immuDB row, spawns the
     background thread, and returns {run_id, status} immediately.
+
+    Gated on the enclave being idle. These endpoints bypass the deploy path
+    entirely — no attestation, no is_app_running check — and mutate the shared
+    DPconfig.json and /tmp/tee_* directories that a scheduled job is using. On a
+    single hand-driven enclave that was merely untidy; on a fleet node it is a
+    way to corrupt someone else's run from outside the scheduler.
     """
+    if is_app_running or 0 < state.get("step", 0) < 11:
+        return jsonify({
+            "title": "Busy",
+            "description": "A job is running on this enclave; re-run endpoints are "
+                           "disabled while it holds the shared input/output paths.",
+        }), 409
+
     content = request.get_json(silent=True) or {}
 
     blob_url   = content.get("blob_url")

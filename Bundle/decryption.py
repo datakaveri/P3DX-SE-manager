@@ -67,13 +67,25 @@ def decrypt_fernet_token(token_b64url: str, fernet_key: bytes) -> bytes:
     return plaintext
 
 
-def decrypt_rsa_wrapped_key(wrapped_key_b64: str, private_key_path: str, password: bytes = None) -> bytes:
+def _load_private_key(private_key: "str | bytes", password: bytes = None):
+    """Accept either a PEM path or the PEM itself.
+
+    Passing bytes is the path that matters: the private key normally lives on
+    disk only as ciphertext under a vTPM-sealed KEK, so callers unseal it into
+    memory and hand the PEM straight here rather than writing it out. The
+    path form is kept for development runs with KEY_SEALING=off.
+    """
+    pem = private_key if isinstance(private_key, (bytes, bytearray)) else open(private_key, 'rb').read()
+    return serialization.load_pem_private_key(pem, password=password, backend=default_backend())
+
+
+def decrypt_rsa_wrapped_key(wrapped_key_b64: str, private_key: "str | bytes", password: bytes = None) -> bytes:
     """Decrypt RSA-OAEP wrapped Fernet key."""
     ciphertext = base64.b64decode(wrapped_key_b64)
-    
-    with open(private_key_path, 'rb') as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=password, backend=default_backend())
-    
+
+    private_key = _load_private_key(private_key, password)
+
+
     fernet_key = private_key.decrypt(
         ciphertext,
         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
@@ -85,7 +97,7 @@ def decrypt_rsa_wrapped_key(wrapped_key_b64: str, private_key_path: str, passwor
     return fernet_key
 
 
-def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = None, key_password: str = None, debug: bool = False):
+def decrypt_bundle(bundle_path: str, private_key_path: "str | bytes", output_dir: str = None, key_password: str = None, debug: bool = False):
     """
     Decrypt the bundle and save decrypted files and URLs.
     

@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
 
 from lib.config import config
+from lib import sealed_key
 
 # Ensure Bundle directory is in path for decryption import
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -144,52 +145,211 @@ def extract_docker_image_from_compose(compose_file="docker-compose.yml"):
 
 
 
-def generate_and_save_key_pair():
-    """Generate RSA key pair and save to keys/ directory."""
-    public_key_file = config.files.public_key
-    private_key_file = config.files.private_key
+def _expected_pcr15(code_hash):
+    """PCR15's value after a single extend from a freshly-booted (zero) PCR.
 
+    TPM PCR extension is PCR_new = SHA256(PCR_old || measurement), and PCR_old is
+    32 zero bytes at boot.
+    """
+    return hashlib.sha256(bytes(32) + bytes.fromhex(code_hash)).hexdigest()
+
+
+def _read_pcr15():
+    result = subprocess.run(["sudo", "tpm2_pcrread", "sha256:15"],
+                            capture_output=True, text=True, check=False, timeout=10)
+    match = re.search(r"15\s*:\s*0x([a-fA-F0-9]{64})", result.stdout)
+    return match.group(1).lower() if match else None
+
+
+def assert_pcr15_matches_code():
+    """Refuse to seal a key against a PCR15 that does not describe this code.
+
+    The trap this closes: `measure_enclave_manager_code_vtpm` skips extending
+    when PCR15 is already non-zero, because a PCR can only be extended, never
+    set. So after deploying new code and restarting only the *service*, PCR15
+    still holds the hash of the code that was running at the last boot. Sealing
+    then produces a key that works right up until the next reboot re-measures the
+    new code — at which point it is unrecoverable, with nothing to link the
+    failure back to the deploy that caused it.
+
+    Reboot after changing enclave code, before generating a key.
+    """
+    if not sealed_key.enabled():
+        return
+    actual = _read_pcr15()
+    if actual is None:
+        raise RuntimeError("could not read PCR15; refusing to seal a key blindly")
+    expected = _expected_pcr15(hash_enclave_manager_code(config.base_dir))
+    if actual != expected:
+        raise RuntimeError(
+            "PCR15 does not match this code's hash, so a key sealed now would "
+            "stop unsealing at the next reboot.\n"
+            f"  PCR15 reads : {actual}\n"
+            f"  code implies: {expected}\n"
+            "  Cause: enclave-manager code changed since this machine booted, and "
+            "a PCR cannot be re-set without a reboot.\n"
+            "  Fix: reboot this node, then generate the keypair."
+        )
+
+
+def keypair_exists():
+    """True if this enclave already has a usable keypair.
+
+    Sealed mode needs the encrypted private key and both TPM blobs; unsealed
+    (development) mode needs the PEM. In either case the public key must be
+    there too, since that is what the attestation payload carries.
+    """
+    if not os.path.exists(config.get_path('public_key')):
+        return False
+    if sealed_key.enabled():
+        return all(os.path.exists(config.get_path(name))
+                   for name in ('private_key_enc', 'kek_pub', 'kek_priv'))
+    return os.path.exists(config.get_path('private_key'))
+
+
+def public_key_fingerprint():
+    """SHA-256 over the DER SubjectPublicKeyInfo, hex.
+
+    The middleware uses this to decide whether a data key wrapped earlier can
+    still be opened by this enclave. It is computed the same way on both sides,
+    from the key bytes, so neither has to trust the other's label for it.
+    """
+    with open(config.get_path('public_key'), "r") as fh:
+        body = "".join(line for line in fh.read().splitlines()
+                       if not line.startswith("-----")).strip()
+    return hashlib.sha256(base64.b64decode(body)).hexdigest()
+
+
+def load_key_generation():
+    """Metadata about the current keypair: when it was made, how many rotations
+    in. Used to decide whether a rotation is due."""
+    path = config.get_path('key_generation')
+    if not os.path.exists(path):
+        return {"generation": 0, "created_at": 0}
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"generation": 0, "created_at": 0}
+
+
+def _save_key_generation(generation):
+    path = config.get_path('key_generation')
+    with open(path, "w") as fh:
+        json.dump({"generation": generation, "created_at": int(time.time())}, fh)
+    os.chmod(path, 0o600)
+
+
+def generate_and_save_key_pair(force=False):
+    """Create the enclave keypair, once.
+
+    Previously this ran unconditionally on every deploy, and the deploy script
+    deleted keys/ first — so a key lived exactly one job. That cannot work with a
+    job queue: the browser wraps its data key for a named enclave public key
+    while the job sits waiting, and a deploy in between would silently invalidate
+    it. So the keypair now persists, and this is a no-op unless it is missing or
+    a rotation is explicitly requested.
+
+    The private key does not stay in the clear. It is written encrypted under a
+    KEK sealed to the vTPM against PCR15, so a copied disk is useless without
+    this machine's TPM. See lib/sealed_key.py for what that does and does not
+    protect against.
+    """
     os.makedirs(config.paths.keys_dir, exist_ok=True)
+    os.chmod(config.paths.keys_dir, 0o700)
+
+    if keypair_exists() and not force:
+        print(f"Reusing existing keypair (fingerprint {public_key_fingerprint()[:16]}...)")
+        return
+
+    if sealed_key.enabled() and not sealed_key.tpm_available():
+        raise RuntimeError(
+            "KEY_SEALING is on but the vTPM is unreachable — refusing to write a "
+            "long-lived private key in the clear. Set KEY_SEALING=off only for "
+            "development."
+        )
+
+    # Fail here, loudly, rather than at the next reboot when the key is gone.
+    assert_pcr15_matches_code()
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = (
-        private_key.public_key()
-        .public_bytes(
-            encoding=serialization.Encoding.PEM,
+
+    # Stored as bare single-line base64 of the DER SubjectPublicKeyInfo — no PEM
+    # armour, no newlines. This is the exact form the attestation client copies
+    # into its payload and the browser re-armours, so the shape is load-bearing:
+    # a stray marker here produces a PEM the UI cannot import.
+    #
+    # Encoded from DER directly rather than by slicing a PEM string. The old
+    # `split("\n")[1:-1]` kept the trailing "-----END PUBLIC KEY-----" line and
+    # relied on a second pass to strip markers afterwards; doing it in one step
+    # removes the chance of that pass going missing.
+    public_key = base64.b64encode(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        .decode()
-        .split("\n")[1:-1]
+    ).decode()
+    private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
     )
 
-    private_key_bytes = (
-        private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        .decode()
-    )
-
-    public_key_path = os.path.join(config.paths.keys_dir, public_key_file)
-    private_key_path = os.path.join(config.paths.keys_dir, private_key_file)
-
+    public_key_path = config.get_path('public_key')
     with open(public_key_path, "w") as public_key_out:
-        public_key_out.write("".join(public_key))
+        public_key_out.write(public_key)
+    os.chmod(public_key_path, 0o644)
 
-    with open(private_key_path, "w") as private_key_out:
-        private_key_out.write("".join(private_key_bytes))
+    if sealed_key.enabled():
+        sealed_key.seal_private_key(
+            private_key_bytes,
+            config.get_path('kek_pub'),
+            config.get_path('kek_priv'),
+            config.get_path('private_key_enc'),
+        )
+        # Remove any plaintext PEM left by an older build or a previous
+        # development run — otherwise sealing is theatre.
+        legacy = config.get_path('private_key')
+        if os.path.exists(legacy):
+            os.unlink(legacy)
+            print("Removed legacy plaintext private_key.pem")
+        print("Private key sealed to the vTPM (PCR%s policy)" % sealed_key.POLICY_PCR)
+    else:
+        private_key_path = config.get_path('private_key')
+        fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "wb") as private_key_out:
+            private_key_out.write(private_key_bytes)
+        print("WARNING: KEY_SEALING=off — long-lived private key written IN THE "
+              "CLEAR. Development only.")
 
-    print("Public and private keys generated and saved successfully in the 'keys' folder!")
+    generation = load_key_generation().get("generation", 0) + (1 if force else 0)
+    _save_key_generation(generation)
+    print(f"Keypair ready (fingerprint {public_key_fingerprint()[:16]}...)")
 
-    # Strip PEM markers
-    with open(public_key_path, "r") as file:
-        lines = file.readlines()
-    cleaned_lines = [line.split("----")[0] if "----" in line else line for line in lines]
-    with open(public_key_path, "w") as file:
-        file.writelines(cleaned_lines)
 
-    print("Private key generated and saved successfully")
+def load_enclave_private_key_pem():
+    """Return the private key PEM in memory. Never writes it to disk.
+
+    Single entry point for everything that needs the private key — bundle
+    decryption and the direct-upload manager both go through here, so there is
+    one place that knows whether the key is sealed.
+    """
+    if sealed_key.enabled():
+        return sealed_key.load_private_key(
+            config.get_path('kek_pub'),
+            config.get_path('kek_priv'),
+            config.get_path('private_key_enc'),
+        )
+    with open(config.get_path('private_key'), "rb") as fh:
+        return fh.read()
+
+
+def rotate_key_pair():
+    """Mint a new keypair and reseal. Callers must ensure no job is running:
+    any data key already wrapped for the old public key becomes undecryptable,
+    and the middleware only learns that at its next registry poll."""
+    generate_and_save_key_pair(force=True)
+    return public_key_fingerprint()
 
 
 def pull_docker_image(app_name):
@@ -456,15 +616,89 @@ def call_set_state_endpoint(state, address):
     print(response.text)
 
 
-def setState(title, description, step, maxSteps, address):
-    """Update enclave state via the manager endpoint."""
+def setState(title, description, step, maxSteps, address, job_id=""):
+    """Update enclave state via the manager endpoint.
+
+    `job_id` stamps the state with the scheduler's job, so a status poll that
+    lands just after a previous job finished can be distinguished from this
+    job's own status — the hazard of a singleton status endpoint.
+    """
     state = {
         "title": title,
         "description": description,
         "step": step,
-        "maxSteps": maxSteps
+        "maxSteps": maxSteps,
+        "job_id": job_id,
     }
     call_set_state_endpoint(state, address)
+
+
+#: Root-owned fallback for the callback settings. The deploy script runs as a
+#: `sudo sh -c` subprocess, and sudo scrubs the environment, so the systemd
+#: Environment= lines that configure the manager do NOT reach it. Without this
+#: file every queued job finishes silently and the scheduler only learns of it
+#: when its stall timer fires — a successful run that looks like a dead TEE.
+#:
+#: A file rather than passing the values on the command line: an argv is visible
+#: in `ps` to every local user, and one of these values is a shared secret.
+CALLBACK_CONFIG_PATH = os.getenv("TEE_CALLBACK_CONFIG", "/etc/p3dx/callback.conf")
+
+
+def _callback_config():
+    """(url, secret) from the environment, falling back to the config file."""
+    url = os.getenv("TEE_CALLBACK_URL", "").rstrip("/")
+    secret = os.getenv("TEE_CALLBACK_SECRET", "")
+    if url and secret:
+        return url, secret
+
+    try:
+        with open(CALLBACK_CONFIG_PATH) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key == "TEE_CALLBACK_URL" and not url:
+                    url = value.rstrip("/")
+                elif key == "TEE_CALLBACK_SECRET" and not secret:
+                    secret = value
+    except OSError:
+        pass
+    return url, secret
+
+
+def report_job_complete(job_id, output_url=None, error=None):
+    """Tell the middleware a queued job finished.
+
+    This callback is the scheduler's ground truth. Its stall timer exists only
+    to catch an enclave that died without reporting, so a job that finishes and
+    stays silent burns a full stall window before anyone notices — and a job
+    that *failed* and stays silent looks identical to one still working.
+
+    Never raises: a delivery failure must not turn a completed run into a crashed
+    deployment. The scheduler's timeout covers us if this does not land.
+    """
+    if not job_id:
+        return  # hand-run deploy, nothing is waiting on a callback
+
+    callback_url, secret = _callback_config()
+    if not callback_url or not secret:
+        print("No TEE_CALLBACK_URL/SECRET configured; skipping completion callback",
+              flush=True)
+        return
+
+    payload = {"error": error} if error else {"output_url": output_url}
+    try:
+        resp = requests.post(
+            f"{callback_url}/internal/jobs/{job_id}/callback",
+            json=payload,
+            headers={"X-Callback-Secret": secret},
+            timeout=15,
+        )
+        print(f"Completion callback for {job_id}: HTTP {resp.status_code}", flush=True)
+    except requests.exceptions.RequestException as e:
+        print(f"Completion callback for {job_id} failed: {e}", flush=True)
 
 
 def ensure_tee_folders():
@@ -1686,7 +1920,9 @@ def _upload_direct_output(output_dir, urls):
         message = f"finalize-output failed: {response.status_code} {response.text}"
         _write_direct_error_status(message)
         raise RuntimeError(message)
-    print(f"Direct-upload output finalised: {response.json()}")
+    result = response.json()
+    print(f"Direct-upload output finalised: {result}")
+    return result.get("output_url") or result.get("blob_url")
 
 
 def _write_dicom_status(output_blob_url, manifest=None):
@@ -1855,6 +2091,7 @@ def _upload_dicom_output(fetch_data, output_dir, container_base_url, urls):
     manifest = _read_stripped_manifest(output_dir)
     _write_dicom_status(primary_blob_url, manifest=manifest)
     print("DICOM output stored to blob; status written")
+    return primary_blob_url
 
 
 # skald-image writes exactly one redacted image into /app/output (mirrors
@@ -2018,10 +2255,16 @@ def _upload_image_output(fetch_data, output_dir, container_base_url, urls):
     manifest = _read_image_manifest(output_dir)
     _write_image_status(blob_url, os.path.basename(src_path), plaintext_bytes, run_config, manifest)
     print("Image output stored to blob; status written")
+    return blob_url
 
 
 def encrypt_and_upload_output(config_path="DPconfig.json"):
-    """Encrypt all files in output folder and upload to Azure Blob Storage."""
+    """Encrypt all files in output folder and upload to Azure Blob Storage.
+
+    Returns the primary output blob URL so the deploy script can hand it to the
+    scheduler's completion callback — without it the user's job completes but
+    their result has no address.
+    """
     fetch_data = _get_fetch_data()
     output_dir = config.paths.tee_output
     urls_path = Path(config.get_path('decrypted_urls'))
@@ -2051,22 +2294,19 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     # must come BEFORE the dicom-format check — a direct-mode DICOM run would
     # otherwise be wrongly routed into the SAS/plaintext DICOM path instead.
     if urls.get("outputContainerUrl", "") == "enclave://download":
-        _upload_direct_output(output_dir, urls)
-        return
+        return _upload_direct_output(output_dir, urls)
 
     # DICOM (SKALD-DICOM) output takes a separate path: unencrypted upload +
     # SAS + status contract. The tabular flow below is unchanged.
     output_format = fetch_data.read_output_format()
     if output_format == "dicom":
-        _upload_dicom_output(fetch_data, output_dir, container_base_url, urls)
-        return
+        return _upload_dicom_output(fetch_data, output_dir, container_base_url, urls)
 
     # skald-image output: single redacted image, Fernet-encrypted with the
     # same dataset key used for input, uploaded to the output container with
     # its own status contract (outputs.image).
     if output_format == "image":
-        _upload_image_output(fetch_data, output_dir, container_base_url, urls)
-        return
+        return _upload_image_output(fetch_data, output_dir, container_base_url, urls)
 
     print("Fetching encryption key from Key Vault...")
     fernet_key = fetch_data.fetch_fernet_key_from_kv(keyvault_url)
@@ -2091,7 +2331,12 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
         raise FileNotFoundError(f"No files found in output directory: {output_dir}")
     
     print(f"Found {len(output_files)} file(s) to encrypt and upload")
-    
+
+    # A tabular run can emit several files; the first is reported to the
+    # scheduler as the job's address. The rest sit beside it in the same
+    # container, which is how this flow has always worked.
+    primary_blob_url = None
+
     # Upload each encrypted file
     for output_file in output_files:
         print(f"Encrypting {output_file}...")
@@ -2114,10 +2359,14 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
         except Exception as e:
             print(f"Failed to upload {encrypted_filename}: {e}")
             raise
-        
+
+        if primary_blob_url is None:
+            primary_blob_url = upload_blob_url
+
         os.remove(temp_encrypted)
-    
+
     print("Output encryption and upload complete")
+    return primary_blob_url
 
 
 def get_app_status():

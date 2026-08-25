@@ -209,9 +209,10 @@ class Config:
         if hasattr(self.files, path_name):
             file_name = getattr(self.files, path_name)
             # Most files go in keys directory
-            if path_name in ['jwt_response', 'deployment_nonce', 'pcr_values', 
+            if path_name in ['jwt_response', 'deployment_nonce', 'pcr_values',
                            'public_key', 'private_key', 'code_hash', 'image_hash',
-                           'fta_image_hash', 'fta_artifacts']:
+                           'fta_image_hash', 'fta_artifacts',
+                           'private_key_enc', 'kek_pub', 'kek_priv', 'key_generation']:
                 base = self.paths.keys_dir
             elif path_name == 'encrypted_bundle':
                 base = self.paths.bundle_dir

@@ -31,7 +31,14 @@ files:
   
   # Cryptographic materials
   public_key: public_key.pem
+  # Written only when KEY_SEALING=off (development). In normal operation the
+  # private key exists on disk solely as private_key_enc, encrypted under a
+  # vTPM-sealed KEK. See lib/sealed_key.py.
   private_key: private_key.pem
+  private_key_enc: private_key.enc
+  kek_pub: kek.pub
+  kek_priv: kek.priv
+  key_generation: key_generation.json
   
   # Attestation and measurement
   jwt_response: jwt-response.txt
