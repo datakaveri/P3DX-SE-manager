@@ -83,23 +83,33 @@ for _ in $(seq 1 30); do
 done
 
 say "4/8 scrub inherited identity and key material"
-ssh -o BatchMode=yes "$REPO_USER@$IP" "sudo bash -s" <<'REMOTE'
+# Unquoted heredoc so $VM substitutes locally; every variable meant for the
+# REMOTE shell is escaped, or local bash eats it and the loop runs on nothing.
+ssh -o BatchMode=yes "$REPO_USER@$IP" "sudo bash -s" <<REMOTE_SCRUB
 set -e
 systemctl stop enclavemanager.service || true
 KEYS=/home/kanonTEE/P3DX-SE-manager/keys
 # The clone boots holding the SOURCE enclave's private key. Destroy it before
 # the node is reachable for anything else.
-for f in private_key.pem public_key.pem private_key.enc kek.pub kek.priv \
-         key_generation.json jwt-response.txt deployment_nonce.txt \
+for f in private_key.pem public_key.pem private_key.enc kek.pub kek.priv \\
+         key_generation.json jwt-response.txt deployment_nonce.txt \\
          pcr_values.json code_hash.txt image_hash.txt; do
-  [ -f "$KEYS/$f" ] && { shred -u "$KEYS/$f" 2>/dev/null || rm -f "$KEYS/$f"; }
+  [ -f "\$KEYS/\$f" ] && { shred -u "\$KEYS/\$f" 2>/dev/null || rm -f "\$KEYS/\$f"; }
 done
-mkdir -p "$KEYS"; chown -R kanonTEE:kanonTEE "$KEYS"; chmod 700 "$KEYS"
+mkdir -p "\$KEYS"; chown -R kanonTEE:kanonTEE "\$KEYS"; chmod 700 "\$KEYS"
 # Clones otherwise share SSH host keys and machine-id with the source.
 rm -f /etc/ssh/ssh_host_*; ssh-keygen -A
 truncate -s 0 /etc/machine-id; systemd-machine-id-setup
-REMOTE
-ssh -o BatchMode=yes "$REPO_USER@$IP" "sudo hostnamectl set-hostname $VM"
+hostnamectl set-hostname $VM
+REMOTE_SCRUB
+
+# Everything that had to happen over the OLD host key is now done. Regenerating
+# those keys invalidated the entry accepted in step 3, so drop it and re-accept
+# before any further SSH — otherwise the next connection stops on a "POSSIBLE
+# NASTY" host-key warning that looks nothing like a provisioning bug, and the
+# run hangs there.
+ssh-keygen -q -f "$HOME/.ssh/known_hosts" -R "$IP" >/dev/null 2>&1 || true
+ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$REPO_USER@$IP" true
 
 say "5/8 deploy fleet code (before the reboot — see header)"
 TARBALL=$(mktemp /tmp/fleet-XXXX.tgz)
