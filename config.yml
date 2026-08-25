@@ -14,6 +14,11 @@ paths:
   tee_input_config: /tmp/tee_input/config
   tee_output: /tmp/tee_output
   tee_urls: /tmp/urls
+  # skald-fta opens /app/config/config.json by exact name, while the bundle
+  # lands the config under whatever metadata.fileNames.config said (default
+  # generated-config.json). This staging dir holds a byte-identical copy under
+  # the name skald-fta needs, so the config mount SKALD sees stays untouched.
+  tee_fta_config: /tmp/tee_input/fta_config
   
   # Guest attestation directory
   guest_attestation: ${BASE_DIR}/guest_attestation/cvm-attestation-sample-app
@@ -34,6 +39,8 @@ files:
   pcr_values: pcr_values.json
   code_hash: code_hash.txt
   image_hash: image_hash.txt
+  fta_image_hash: fta_image_hash.txt
+  fta_artifacts: fta_artifacts.json
   
   # Bundle and URLs
   encrypted_bundle: encrypted.json
@@ -62,6 +69,64 @@ azure:
   # Azure resource endpoints for Managed Identity
   storage_resource: https://storage.azure.com/
   vault_resource: https://vault.azure.net
+
+# DICOM de-identification (SKALD-DICOM application)
+dicom:
+  # The de-identified .dcm output is Fernet-encrypted (same shared Key Vault
+  # key as the input) before it is stored back to the output container. Set to
+  # false only if the policy allows plaintext output.
+  encrypt_output: true
+
+# Free-text anonymisation (skald-fta) — the pipeline stage that runs BEFORE
+# SKALD when the client's app config sets
+# <data_type>.free_text_anonymization.enabled = true. It masks PII/NER hits
+# inside the configured free-text columns and writes a sanitised CSV that SKALD
+# then consumes instead of the raw file in data/ (SKALD's own config parser
+# picks up staged_input_path from that same block — the enclave never rewrites
+# the config to arrange this, it only shares the output/ mount).
+free_text_anonymization:
+  # Pinned image ref. Prefer an immutable digest for TEE reproducibility, e.g.
+  #   image: ghcr.io/datakaveri/skald-fta@sha256:<digest>
+  # A mutable tag can be repushed and breaks the trust model, exactly as noted
+  # for the SKALD image in docker-compose.yml.
+  image: ghcr.io/datakaveri/skald-fta:latest
+  # If the client-supplied docker-compose.yml declares a service with this
+  # name, its `image:` wins over the pin above — that is how the forthcoming
+  # skald-fta compose entry gets honoured without a code change.
+  compose_service: skald-fta
+  # Hard wall-clock cap on the container. A hung NER model would otherwise
+  # block the run forever, since the enclave waits on this stage.
+  timeout_seconds: 3600
+  # Default staged/audit filenames, used only to seed the upload exclusion set
+  # when the config omits the corresponding field. The authoritative exclusion
+  # list is the set of files skald-fta actually created (see
+  # P3DX_SDK._record_free_text_artifacts).
+  default_staged_name: sanitized_input.csv
+  default_audit_name: free_text_audit.json
+
+# Direct dataset upload (chunked, browser-encrypted, no Azure Blob for input).
+# Limits are pinned to backend-changes-direct-upload.md §2.7 and MUST stay in
+# lockstep with the frontend's `direct_upload` block in
+# src/environments/environments.ts — a mismatch surfaces as a confusing 413
+# after the user has already picked a file, so flag any change on both sides.
+direct_upload:
+  chunk_size: 67108864                # 64 MiB
+  max_chunks: 16
+  max_chunk_bytes: 67108928           # chunk_size + 64
+  max_concurrent_sessions_per_user: 1
+  max_total_bytes:
+    csv: 104857600                    # 100 MB
+    json: 104857600
+    excel: 26214400                   #  25 MB
+    dicom: 104857600
+  session_ttl_seconds: 1800           # 30 min idle
+  output_ttl_seconds: 7200            #  2 hours
+  # Reuses the same account/container + Managed Identity as the DICOM/tabular
+  # output path (access already proven there).
+  output_container: anondata2/output-data
+  # Must be a tmpfs mount, NOT host disk. This process is host gunicorn (not
+  # containerized) on this CVM — see the note where this key is consumed.
+  scratch_dir: /enclave/scratch
 
 # ImmuDB (run_history audit log)
 immudb:

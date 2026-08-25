@@ -11,6 +11,8 @@ import hashlib
 import secrets
 from pathlib import Path
 
+import yaml
+
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -25,9 +27,20 @@ _fetch_data_dir = os.path.join(_script_dir, 'Fetch_data')
 if _bundle_dir not in sys.path:
     sys.path.insert(0, _bundle_dir)
 from decryption import decrypt_bundle
+from enclave.enclave_direct_upload import write_output_container
 
 # Lazy import for fetch_data
 _fetch_data_module = None
+
+# Per-run output key unwrapped from the current bundle's payload.outputWrappedKey
+# (see decrypt_bundle_tee) - held in memory only, for the lifetime of this
+# process, never written to disk. None when the bundle didn't send one (older
+# UI), in which case output uploads fall back to the shared Fernet key.
+_output_crypto = None
+
+
+def _get_output_crypto():
+    return _output_crypto
 
 
 def _get_fetch_data():
@@ -85,13 +98,43 @@ def pull_compose_file(url, filename="docker-compose.yml"):
 
 
 def extract_docker_image_from_compose(compose_file="docker-compose.yml"):
-    """Extract docker image name from docker-compose.yml file."""
+    """Extract the application docker image name from docker-compose.yml.
+
+    Parses the compose file properly and skips the skald-fta service. This is
+    the image that gets pulled, hashed, and extended into PCR 11, so picking
+    the wrong one silently attests the wrong workload — and the previous
+    first-`image:`-in-the-file regex would return skald-fta's image the moment a
+    compose file declares that service ahead of skald-anonymisation.
+
+    Falls back to the original regex only when the file isn't parseable as
+    compose, so no deployment that works today stops working.
+    """
     if not os.path.exists(compose_file):
         raise FileNotFoundError(f"Docker compose file not found: {compose_file}")
-    
+
+    fta_service = getattr(config.free_text_anonymization, 'compose_service', 'skald-fta')
+
+    try:
+        with open(compose_file, 'r') as f:
+            doc = yaml.safe_load(f) or {}
+        services = doc.get("services") or {}
+        for name, svc in services.items():
+            if name == fta_service or not isinstance(svc, dict):
+                continue
+            image = svc.get("image")
+            if isinstance(image, str) and image.strip():
+                return image.strip()
+        if services:
+            raise ValueError(
+                f"docker-compose.yml declares no application image outside the "
+                f"'{fta_service}' service: {sorted(services)}"
+            )
+    except (OSError, yaml.YAMLError):
+        pass
+
     with open(compose_file, 'r') as f:
         content = f.read()
-    
+
     match = re.search(r'^\s*image:\s*([^\s\n#]+)', content, re.MULTILINE)
     if match:
         return match.group(1).strip()
@@ -510,8 +553,10 @@ def save_bundle_to_file(bundle_data, bundle_path=None):
 
 def decrypt_bundle_tee(bundle_path, private_key_path):
     """Decrypt bundle using decryption.py logic."""
+    global _output_crypto
     print("Decrypting bundle...")
-    decrypt_bundle(bundle_path, private_key_path)
+    result = decrypt_bundle(bundle_path, private_key_path)
+    _output_crypto = result.get('output') if isinstance(result, dict) else None
     print("Bundle decrypted successfully")
 
 
@@ -523,8 +568,830 @@ def fetch_and_decrypt_data(config_path="DPconfig.json"):
     print("Data fetched and decrypted successfully")
 
 
+# ---------------------------------------------------------------------------
+# Free-text anonymisation (skald-fta) pre-stage
+# ---------------------------------------------------------------------------
+#
+# When the client's app config sets <data_type>.free_text_anonymization.enabled
+# = true, skald-fta runs BEFORE SKALD over the same three mounts, masks
+# PII/NER hits inside the configured free-text columns, and writes a sanitised
+# CSV to staged_input_path plus a detection audit to audit_output_path — both
+# under the shared output/ mount.
+#
+# The handoff is the output/ mount, not the config: SKALD's own parser already
+# reads free_text_anonymization.staged_input_path/enabled out of the very same
+# config.json and consumes the staged CSV instead of scanning data/. So the
+# enclave passes the config through byte-for-byte and only has to guarantee
+# both containers see the same output directory.
+#
+# Two containers, not one compose project, on purpose. `docker compose up`
+# starts services concurrently, so adding skald-fta as a second service would
+# race it against SKALD and hand SKALD a half-written staged file. `docker
+# run` gives strict ordering and a clean exit code to gate on.
+
+_FTA_BLOCK_KEY = "free_text_anonymization"
+
+# Reserved output/ filenames skald-fta may not be pointed at. status.json is
+# the contract /enclave/status returns verbatim to the UI, and pipeline.log /
+# generalized.* are SKALD's own results — letting a config redirect the staged
+# CSV or the audit JSON onto any of these would either forge the status the UI
+# trusts or get SKALD's real output filtered out of the upload as an
+# intermediate.
+_FTA_RESERVED_OUTPUT_NAMES = {
+    "status.json", "pipeline.log", "manifest.json",
+    "generalized.csv", "generalized.json", "generalized.xlsx", "generalized.xls",
+}
+
+
+def _fta_setting(name, default=None):
+    """Read one key from config.yml's free_text_anonymization block."""
+    return getattr(config.free_text_anonymization, name, default)
+
+
+def _iter_app_configs():
+    """Yield (filename, dict) for each JSON app config the bundle delivered."""
+    cfg_dir = config.paths.tee_input_config
+    try:
+        names = sorted(os.listdir(cfg_dir))
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(cfg_dir, name)) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            yield name, data
+
+
+def _find_free_text_block(cfg):
+    """Locate the free_text_anonymization block in one app config.
+
+    The stage is specified as config[data_type].free_text_anonymization, but
+    which key plays data_type is the client's to choose and the block is also
+    seen at the top level, so three shapes are accepted, in order:
+      1. cfg["free_text_anonymization"]
+      2. cfg[cfg["data_type"]]["free_text_anonymization"]  (also dataType/format)
+      3. cfg[<first dict-valued key that has one>]["free_text_anonymization"]
+
+    Searching this broadly is deliberate. Failing to find a block that is
+    there means the stage is skipped and unmasked free text reaches the
+    requester — unrecoverable, because the output has already left. Finding
+    one that the client did not mean as the gate only costs an extra container
+    run that masks columns the client itself named. The asymmetry is the whole
+    argument; do not narrow this to a single shape without a config contract
+    pinned by the UI.
+
+    Returns (block, dotted-path) or (None, None).
+    """
+    block = cfg.get(_FTA_BLOCK_KEY)
+    if isinstance(block, dict):
+        return block, _FTA_BLOCK_KEY
+
+    for key_name in ("data_type", "dataType", "format"):
+        named = cfg.get(key_name)
+        if isinstance(named, str) and isinstance(cfg.get(named), dict):
+            block = cfg[named].get(_FTA_BLOCK_KEY)
+            if isinstance(block, dict):
+                return block, f"{named}.{_FTA_BLOCK_KEY}"
+
+    for key, value in cfg.items():
+        if isinstance(value, dict):
+            block = value.get(_FTA_BLOCK_KEY)
+            if isinstance(block, dict):
+                return block, f"{key}.{_FTA_BLOCK_KEY}"
+
+    return None, None
+
+
+def read_free_text_config():
+    """Return (block, provenance) for this run's free_text_anonymization block.
+
+    provenance is a "<config filename>:<dotted path>" string for the log, so a
+    run that unexpectedly did or didn't anonymise free text can be traced back
+    to where the gate was read from. (None, None) when no config declares one.
+    """
+    for name, cfg in _iter_app_configs():
+        block, where = _find_free_text_block(cfg)
+        if block is not None:
+            return block, f"{name}:{where}"
+    return None, None
+
+
+def _as_bool(value):
+    """Coerce a JSON-ish flag to bool, tolerating "true"/1 from hand-edited configs."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return False
+
+
+def _fta_output_basename(raw, fallback, field):
+    """Resolve one configured artifact path to a basename inside output/.
+
+    staged_input_path and audit_output_path are container-relative (e.g.
+    "output/sanitized_input.csv"). Both MUST land in /app/output: that mount is
+    the only directory skald-fta and SKALD share, so a path anywhere else means
+    SKALD will never see the staged CSV and would silently fall back to
+    scanning data/ for the raw, un-masked file. Rejecting it up front turns a
+    silent privacy regression into a startup error.
+    """
+    value = raw.strip() if isinstance(raw, str) and raw.strip() else fallback
+    if not value:
+        raise RuntimeError(
+            f"free_text_anonymization.{field} is empty and config.yml declares "
+            f"no default — cannot tell where skald-fta will write."
+        )
+
+    normalized = os.path.normpath(value)
+    parts = [p for p in normalized.split(os.sep) if p not in ("", ".")]
+    if os.path.isabs(normalized):
+        if parts[:2] != ["app", "output"]:
+            raise RuntimeError(
+                f"free_text_anonymization.{field} must live under /app/output "
+                f"(the only mount skald-fta and SKALD share), got {value!r}"
+            )
+        parts = parts[2:]
+    elif parts and parts[0] == "output":
+        parts = parts[1:]
+    elif len(parts) > 1:
+        raise RuntimeError(
+            f"free_text_anonymization.{field} must live under the shared "
+            f"output/ mount, got {value!r}"
+        )
+
+    if len(parts) != 1:
+        raise RuntimeError(
+            f"free_text_anonymization.{field} must name a file directly inside "
+            f"output/ (no subdirectories, no traversal), got {value!r}"
+        )
+
+    name = parts[0]
+    if name in _FTA_RESERVED_OUTPUT_NAMES:
+        raise RuntimeError(
+            f"free_text_anonymization.{field} may not be {name!r} — that name "
+            f"is reserved for the pipeline's own status/result files"
+        )
+    return name
+
+
+def _fta_declared_artifacts(block):
+    """Basenames skald-fta is configured to write, as {field: basename}."""
+    return {
+        "staged_input_path": _fta_output_basename(
+            block.get("staged_input_path"),
+            _fta_setting("default_staged_name", "sanitized_input.csv"),
+            "staged_input_path",
+        ),
+        "audit_output_path": _fta_output_basename(
+            block.get("audit_output_path"),
+            _fta_setting("default_audit_name", "free_text_audit.json"),
+            "audit_output_path",
+        ),
+    }
+
+
+def _output_snapshot():
+    """Set of regular-file basenames currently in the shared output/ mount."""
+    out = config.paths.tee_output
+    try:
+        return {n for n in os.listdir(out) if os.path.isfile(os.path.join(out, n))}
+    except OSError:
+        return set()
+
+
+def _fta_ledger_path():
+    return config.get_path('fta_artifacts')
+
+
+def clear_free_text_artifacts():
+    """Purge the previous run's ledger AND its leftover artifacts from output/.
+
+    Called unconditionally before every pipeline run, ahead of the enabled gate,
+    because both halves matter in opposite directions:
+
+      * a stale LEDGER would keep excluding those basenames from the upload on a
+        later run that never ran skald-fta, withholding files the requester
+        should get;
+      * a stale STAGED CSV is worse. deploy_enclave.py clears output/ via
+        ensure_tee_folders(), but the /run/*_pipeline path does not, so a
+        previous free-text run's sanitized_input.csv can still be sitting there.
+        On a run with free_text_anonymization disabled, nothing would mark it as
+        an intermediate and it would be encrypted and uploaded as though it were
+        a result — a partially-anonymised dataset shipped as the real one.
+
+    Purging up front also means that when the stage does run, the artifacts it
+    finds afterwards are provably its own, which is what
+    run_free_text_anonymization() relies on to detect a container that exited 0
+    without writing anything.
+    """
+    try:
+        os.remove(_fta_ledger_path())
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"Warning: could not clear skald-fta artifact ledger: {exc}", flush=True)
+
+    # Names this stage could have written: whatever the current config declares,
+    # plus the config.yml defaults for a run whose config omits the fields.
+    stale_names = {
+        _fta_setting("default_staged_name", "sanitized_input.csv"),
+        _fta_setting("default_audit_name", "free_text_audit.json"),
+    }
+    block, _ = read_free_text_config()
+    if isinstance(block, dict):
+        try:
+            stale_names.update(_fta_declared_artifacts(block).values())
+        except RuntimeError:
+            pass  # invalid paths are reported by the stage itself
+
+    for name in sorted(n for n in stale_names
+                       if n and n not in _FTA_RESERVED_OUTPUT_NAMES):
+        path = os.path.join(config.paths.tee_output, name)
+        try:
+            os.remove(path)
+            print(f"Removed stale output/{name} left by an earlier run", flush=True)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"Warning: could not remove stale output/{name}: {exc}", flush=True)
+
+
+def _record_free_text_artifacts(names):
+    """Persist the intermediates skald-fta left in output/.
+
+    Written under keys/, never output/, precisely because every file in
+    output/ is a candidate for encryption and upload — a ledger stored there
+    would list itself.
+    """
+    path = _fta_ledger_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(sorted(names), f, indent=2)
+    except OSError as exc:
+        print(f"Warning: could not write skald-fta artifact ledger: {exc}", flush=True)
+
+
+def free_text_artifact_names():
+    """Basenames in output/ that belong to skald-fta, not to SKALD.
+
+    These are pipeline intermediates and MUST NOT be uploaded:
+
+      * the staged CSV has had free text masked but has NOT been through
+        SKALD's k-anonymisation, generalisation, hashing or suppression — it
+        still carries every quasi-identifier the run exists to treat, so
+        shipping it alongside the anonymised result defeats the entire second
+        stage;
+      * the audit JSON is a per-cell detection record, an internal artifact
+        that was never part of the result contract.
+
+    Union of two independent signals so a gap in either still holds the line:
+    the ledger of files skald-fta actually created, and the basenames the app
+    config declares (which survives a re-run in a fresh process where the
+    ledger is gone).
+    """
+    names = set()
+
+    try:
+        with open(_fta_ledger_path()) as f:
+            recorded = json.load(f)
+        if isinstance(recorded, list):
+            names.update(str(n) for n in recorded)
+    except (OSError, ValueError):
+        pass
+
+    block, _ = read_free_text_config()
+    if isinstance(block, dict) and _as_bool(block.get("enabled")):
+        try:
+            names.update(_fta_declared_artifacts(block).values())
+        except RuntimeError:
+            # An invalid path config already failed the run in
+            # run_free_text_anonymization(); nothing to exclude here.
+            pass
+
+    return {n for n in names if n not in _FTA_RESERVED_OUTPUT_NAMES}
+
+
+def _compose_output_mounts(compose_file, fta_service):
+    """Host paths that compose binds to /app/output, per non-fta service.
+
+    Returns {service_name: host_path_or_None}. host_path is None when the
+    service mounts *something* at /app/output that isn't a host bind (a named
+    volume), which cannot be the shared directory. Services with no
+    /app/output mapping at all are omitted — nothing to check there.
+
+    Handles both compose volume forms: the short "host:container[:opts]"
+    string and the long {type, source, target} mapping. Relative host paths
+    resolve against the compose file's own directory, as compose does.
+    """
+    with open(compose_file) as f:
+        doc = yaml.safe_load(f) or {}
+
+    named_volumes = set((doc.get("volumes") or {}) if isinstance(doc.get("volumes"), dict) else ())
+    compose_dir = os.path.dirname(os.path.abspath(compose_file))
+    found = {}
+
+    for name, svc in (doc.get("services") or {}).items():
+        if name == fta_service or not isinstance(svc, dict):
+            continue
+        for entry in svc.get("volumes") or []:
+            source, target = None, None
+            if isinstance(entry, str):
+                # Split from the right so a Windows-style or option-suffixed
+                # spec still yields the container path in the middle field.
+                bits = entry.split(":")
+                if len(bits) >= 2:
+                    source, target = bits[0], bits[1]
+            elif isinstance(entry, dict):
+                target = entry.get("target")
+                if entry.get("type", "bind") == "bind":
+                    source = entry.get("source")
+
+            if not isinstance(target, str) or os.path.normpath(target) != "/app/output":
+                continue
+
+            if not isinstance(source, str) or not source or source in named_volumes:
+                found[name] = None
+            elif os.path.isabs(source):
+                found[name] = os.path.normpath(source)
+            else:
+                found[name] = os.path.normpath(os.path.join(compose_dir, source))
+            break
+
+    return found
+
+
+def _verify_shared_output_mount(fta_service):
+    """Fail early unless SKALD's /app/output is the directory skald-fta writes to.
+
+    The shared output volume IS the handoff. skald-fta writes the staged CSV to
+    /app/output (host: tee_output) and SKALD resolves
+    free_text_anonymization.staged_input_path against its own /app/output. Give
+    the two stages different host directories and SKALD hard-fails with
+    "DATA_MISSING: Configured input file not found" — it does not fall back to
+    the raw input, so nothing leaks, but the run dies on an error that points at
+    a missing file rather than at the mount that caused it. Checking the compose
+    file before starting skald-fta names the real cause instead, and costs
+    nothing on a correctly wired compose.
+
+    Only advisory when the compose file declares no /app/output mount at all:
+    that shape can't be distinguished from a compose this code doesn't
+    understand, and refusing to run would break deployments that work today.
+    """
+    compose_file = config.get_path('docker_compose')
+    if not os.path.exists(compose_file):
+        print(f"Warning: {compose_file} not found — cannot verify that SKALD "
+              f"shares skald-fta's output directory.", flush=True)
+        return
+
+    try:
+        mounts = _compose_output_mounts(compose_file, fta_service)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        print(f"Warning: could not parse {compose_file} to verify the shared "
+              f"output mount: {exc}", flush=True)
+        return
+
+    if not mounts:
+        print(f"Warning: no service in {os.path.basename(compose_file)} mounts "
+              f"/app/output — cannot confirm SKALD will see skald-fta's staged "
+              f"input. Proceeding; SKALD will report DATA_MISSING if the mount "
+              f"is wrong.", flush=True)
+        return
+
+    expected = os.path.realpath(config.paths.tee_output)
+    mismatched = {
+        svc: host for svc, host in mounts.items()
+        if host is None or os.path.realpath(host) != expected
+    }
+    if mismatched:
+        detail = ", ".join(
+            f"{svc} -> {host if host else 'named volume (not a host bind)'}"
+            for svc, host in sorted(mismatched.items())
+        )
+        raise RuntimeError(
+            f"free_text_anonymization is enabled, but {os.path.basename(compose_file)} "
+            f"does not give SKALD the same host output directory skald-fta writes "
+            f"to. skald-fta writes the staged CSV into {expected}; compose maps "
+            f"/app/output for: {detail}. Both stages must bind the SAME host "
+            f"directory at /app/output — otherwise SKALD hard-fails with "
+            f"'DATA_MISSING: Configured input file not found'. Fix the compose "
+            f"file's output volume and redeploy."
+        )
+
+    print(f"Shared output mount verified: {sorted(mounts)} -> {expected}", flush=True)
+
+
+_FTA_CONFIG_FILENAME = "config.json"
+
+
+def _prepare_fta_config_dir(source_name):
+    """Stage the run's app config as the single file /app/config/config.json.
+
+    skald-fta opens /app/config/config.json by exact name. The bundle lands the
+    config under whatever metadata.fileNames.config said, defaulting to
+    generated-config.json (Bundle/decryption.py), so skald-fta fails with
+    "Could not read config /app/config/config.json". SKALD is handed no
+    config-path argument at all — the compose file gives it only the three
+    mounts — so it discovers the file itself and never noticed the name.
+
+    Staged into a directory of its own rather than by dropping a second file
+    into the shared config mount: that mount is also SKALD's, and a second
+    .json alongside the real one could change which config SKALD discovers.
+
+    Exactly one file is staged, deliberately. If skald-fta later grows the same
+    scan-the-directory discovery SKALD has, a directory holding both
+    generated-config.json and config.json would look ambiguous to it; one file
+    named config.json satisfies the current exact-name lookup and any future
+    single-config discovery. The copy is byte-for-byte, so both containers read
+    an identical, unmodified config — only the filename differs.
+
+    Returns the host dir to mount at /app/config.
+    """
+    src = os.path.join(config.paths.tee_input_config, source_name)
+    staging = config.get_path('tee_fta_config')
+
+    # Rebuilt every run: a config left here by a previous run must never be the
+    # one skald-fta reads.
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    try:
+        os.makedirs(staging, exist_ok=True)
+        os.chmod(staging, 0o700)
+    except OSError as exc:
+        _fail_free_text(f"Could not create the skald-fta config staging dir {staging}: {exc}")
+
+    target = os.path.join(staging, _FTA_CONFIG_FILENAME)
+    try:
+        shutil.copy2(src, target)
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        # The bundle writes the config 0600 and root-owned, so a read failure
+        # here means the stage is running without the deploy path's privileges.
+        _fail_free_text(
+            f"Could not stage the app config for skald-fta: copying {src} to "
+            f"{target} failed ({exc}). The bundle writes the config 0600 and "
+            f"root-owned, so this stage needs the same privileges as the deploy "
+            f"path."
+        )
+
+    if source_name != _FTA_CONFIG_FILENAME:
+        print(f"Staged {source_name} as {_FTA_CONFIG_FILENAME} for skald-fta "
+              f"(content unchanged; skald-fta opens that exact filename).",
+              flush=True)
+    return staging
+
+
+# The extensions both containers auto-discover in data/. Anything else in that
+# directory (a leftover dataset.enc, say) is not a candidate input.
+_DATA_INPUT_EXTENSIONS = (".csv", ".json", ".xls", ".xlsx")
+
+
+def _discover_data_input():
+    """Return the single data file in data/, the way both containers find it."""
+    data_dir = config.paths.tee_input_data
+    try:
+        names = sorted(os.listdir(data_dir))
+    except OSError as exc:
+        _fail_free_text(f"Could not read the data directory {data_dir}: {exc}")
+
+    candidates = [
+        n for n in names
+        if os.path.isfile(os.path.join(data_dir, n))
+        and n.lower().endswith(_DATA_INPUT_EXTENSIONS)
+    ]
+    if len(candidates) != 1:
+        _fail_free_text(
+            f"Expected exactly one {'/'.join(_DATA_INPUT_EXTENSIONS)} file in "
+            f"{data_dir} for the free-text stage, found {len(candidates)}: "
+            f"{candidates}. Both containers auto-discover a single input, so "
+            f"this is ambiguous."
+        )
+    return os.path.join(data_dir, candidates[0])
+
+
+def _swap_staged_input_into_data(staged_path):
+    """Put the sanitised CSV in data/ as the only input, replacing the raw file.
+
+    The documented handoff — SKALD reading
+    free_text_anonymization.staged_input_path out of the shared output/ mount —
+    is NOT implemented in the deployed skald image. Observed on a real run:
+    SKALD logged the staged CSV as "file(s) from an earlier run that this run
+    will not overwrite", then re-read the raw file from data/ and emitted a
+    "success" whose free-text column still carried names, a street address and
+    an application number. A silent leak, which is strictly worse than a crash.
+
+    So the handoff is made structural instead of cooperative. After skald-fta
+    succeeds, the raw file is REPLACED by the sanitised CSV, leaving data/ with
+    exactly one input. SKALD's existing auto-discovery then reads masked data
+    with no change on its side, and — the point — the unmasked text is no
+    longer anywhere SKALD could read it, so no future skald version can
+    reintroduce the leak by ignoring a config field.
+
+    The staged file is left in output/ as well: it is skald-fta's declared
+    artifact, it is what the audit refers to, and free_text_artifact_names()
+    already withholds it from the upload.
+
+    Note the input format necessarily becomes CSV here. That is inherent to
+    skald-fta, which writes a CSV regardless of what was submitted — not a
+    consequence of this swap. _upload_direct_output already labels the returned
+    bytes by the actual output extension rather than the submitted one.
+    """
+    raw_path = _discover_data_input()
+    stem = os.path.splitext(os.path.basename(raw_path))[0]
+    target = os.path.join(config.paths.tee_input_data, stem + ".csv")
+
+    try:
+        shutil.copy2(staged_path, target)
+        os.chmod(target, 0o600)
+        # Only after the sanitised copy is in place, and only if the raw file
+        # is a different filename — otherwise it has just been overwritten.
+        if os.path.realpath(raw_path) != os.path.realpath(target):
+            os.remove(raw_path)
+    except OSError as exc:
+        _fail_free_text(
+            f"Could not stage the sanitised input into {config.paths.tee_input_data}: "
+            f"{exc}. Refusing to start SKALD, which would otherwise read the raw, "
+            f"un-masked file."
+        )
+
+    # Structural guard: prove the raw input is gone and the only thing SKALD can
+    # discover is byte-identical to what skald-fta produced.
+    remaining = _discover_data_input()
+    if os.path.realpath(remaining) != os.path.realpath(target):
+        _fail_free_text(
+            f"After staging, the input SKALD would discover is "
+            f"{os.path.basename(remaining)}, not the sanitised "
+            f"{os.path.basename(target)}. Refusing to start SKALD."
+        )
+    try:
+        with open(staged_path, "rb") as a, open(target, "rb") as b:
+            identical = a.read() == b.read()
+    except OSError as exc:
+        _fail_free_text(f"Could not verify the staged input in data/: {exc}")
+    if not identical:
+        _fail_free_text(
+            f"The input staged into data/ does not match skald-fta's "
+            f"{os.path.basename(staged_path)}. Refusing to start SKALD."
+        )
+
+    print(f"Sanitised input staged as data/{os.path.basename(target)} "
+          f"(raw input removed — SKALD can no longer read un-masked text).",
+          flush=True)
+
+
+def _resolve_fta_image():
+    """Return (image_ref, provenance) for skald-fta.
+
+    The client-supplied docker-compose.yml wins when it declares the service,
+    so the forthcoming skald-fta compose entry is honoured without a code
+    change; otherwise the pin in config.yml is used.
+    """
+    service = _fta_setting("compose_service", "skald-fta")
+    compose_file = config.get_path('docker_compose')
+    if service and os.path.exists(compose_file):
+        try:
+            with open(compose_file) as f:
+                doc = yaml.safe_load(f) or {}
+            svc = (doc.get("services") or {}).get(service) or {}
+            image = svc.get("image")
+            if isinstance(image, str) and image.strip():
+                return image.strip(), f"docker-compose.yml service '{service}'"
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(f"Warning: could not read '{service}' from compose file: {exc}", flush=True)
+
+    pinned = _fta_setting("image")
+    if not isinstance(pinned, str) or not pinned.strip():
+        raise RuntimeError(
+            "free_text_anonymization.enabled is true but no skald-fta image is "
+            "available: the compose file declares no "
+            f"'{service}' service and config.yml sets no "
+            "free_text_anonymization.image."
+        )
+    return pinned.strip(), "config.yml free_text_anonymization.image"
+
+
+def _fail_free_text(message):
+    """Surface a skald-fta stage failure to the UI, then raise.
+
+    Without this the run dies at step 10 having written no status.json, and
+    get_app_status() keeps answering "Application is still running" forever —
+    the UI hangs on a run that is already dead. Mirrors
+    _write_direct_error_status(): /enclave/status returns this file verbatim.
+    """
+    status_path = config.get_path('status')
+    try:
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        # Same remove-then-create dance as _write_direct_error_status: a
+        # previous container may have left a root-owned status.json here.
+        try:
+            if os.path.exists(status_path):
+                os.remove(status_path)
+        except OSError:
+            pass
+        with open(status_path, "w") as f:
+            json.dump({
+                "status": "error",
+                "title": "Error: Free-text anonymisation",
+                "description": message,
+            }, f, indent=2)
+        try:
+            os.chmod(status_path, 0o644)
+        except OSError:
+            pass
+    except OSError as exc:
+        print(f"Warning: could not write error status for the UI: {exc}", flush=True)
+    raise RuntimeError(message)
+
+
+def _assert_image_available(image, source):
+    """Confirm the image is actually present before trying to run it.
+
+    `docker pull` failures are not fatal on their own here — pull_docker_image()
+    doesn't check its exit code, and a cached image is fine offline. But running
+    a missing image exits 125 from the docker CLI *before the container starts*,
+    which the exit-code contract would otherwise report as "skald-fta failed",
+    wrongly implying the stage ran and rejected the data. Registry problems get
+    named as registry problems instead.
+    """
+    probe = subprocess.run(["docker", "image", "inspect", image],
+                           capture_output=True, text=True, check=False)
+    if probe.returncode == 0:
+        return
+    _fail_free_text(
+        f"skald-fta image {image!r} (from {source}) is not available and could "
+        f"not be pulled, so free-text anonymisation could not run and SKALD was "
+        f"not started. Registry said: "
+        f"{(probe.stderr or probe.stdout).strip().splitlines()[0] if (probe.stderr or probe.stdout).strip() else 'image not present locally'}. "
+        f"If the pull was refused as 'unauthorized', the GHCR package is private "
+        f"or not yet published — make it public, or give this host a GHCR pull "
+        f"credential (docker login ghcr.io)."
+    )
+
+
+def run_free_text_anonymization():
+    """Run the skald-fta stage if this run's config asks for it.
+
+    Returns True if skald-fta ran to success, False if the stage was not
+    enabled (no block, or enabled false) and the run should go straight to
+    SKALD exactly as before.
+
+    Raises RuntimeError on any stage failure, which is how every other
+    pipeline-stage failure is reported here: the caller stops, never starts
+    SKALD, and the error surfaces to the UI. That is the on_failure: "fail"
+    contract — skald-fta exits non-zero and writes no staged file. Under
+    on_failure: "continue" it exits 0 and writes the staged file with the
+    failures recorded in the audit JSON, so this function returns normally and
+    SKALD proceeds.
+
+    NOTE (attestation): the skald-fta image digest is recorded to
+    keys/fta_image_hash.txt but deliberately NOT extended into a PCR. PCR 11
+    is measured at deploy step 4 and pcr_values.json is snapshotted at step
+    4.5, both before the bundle — and therefore this gate — is known. Adding
+    an extension here would move live PCR 11 away from the value already sent
+    to the client and break its attestation check. Measuring skald-fta
+    properly means pinning the image ref pre-attestation; see the handover
+    notes.
+    """
+    block, provenance = read_free_text_config()
+    if block is None:
+        print("Free-text anonymisation: no free_text_anonymization block in the "
+              "app config — running SKALD directly.", flush=True)
+        return False
+
+    if not _as_bool(block.get("enabled")):
+        print(f"Free-text anonymisation: disabled at {provenance} — running "
+              "SKALD directly.", flush=True)
+        return False
+
+    print("="*60, flush=True)
+    print("Pipeline stage: free-text anonymisation (skald-fta)", flush=True)
+    print("="*60, flush=True)
+    print(f"Gate read from: {provenance}", flush=True)
+
+    artifacts = _fta_declared_artifacts(block)
+    staged_name = artifacts["staged_input_path"]
+    audit_name = artifacts["audit_output_path"]
+    on_failure = str(block.get("on_failure", "fail")).strip().lower() or "fail"
+
+    columns = block.get("columns")
+    print(f"  columns:            {columns if columns else '(none declared)'}", flush=True)
+    print(f"  minimum_confidence: {block.get('minimum_confidence', '(default)')}", flush=True)
+    print(f"  staged_input_path:  output/{staged_name}", flush=True)
+    print(f"  audit_output_path:  output/{audit_name}", flush=True)
+    print(f"  on_failure:         {on_failure}", flush=True)
+
+    # The shared output/ mount is the whole handoff — check it before doing any
+    # work, so a mis-wired compose fails on the mount instead of on SKALD's
+    # downstream DATA_MISSING.
+    _verify_shared_output_mount(_fta_setting("compose_service", "skald-fta"))
+
+    image, image_src = _resolve_fta_image()
+    print(f"skald-fta image: {image}  (from {image_src})", flush=True)
+
+    pull_docker_image(image)
+    _assert_image_available(image, image_src)
+
+    try:
+        digest = hash_docker_image(image)
+        with open(config.get_path('fta_image_hash'), "w") as f:
+            f.write(digest)
+        print(f"skald-fta image digest: {digest}", flush=True)
+    except Exception as exc:
+        # Auditing aid, not a gate — the image is already pulled and the run
+        # can proceed without the digest on file.
+        print(f"Warning: could not record skald-fta image digest: {exc}", flush=True)
+
+    container_name = "skald-fta"
+    # A leftover container of this name (previous run killed mid-flight) would
+    # fail `docker run` with a name conflict, so clear it first.
+    subprocess.run(["docker", "rm", "-f", container_name],
+                   capture_output=True, text=True, check=False)
+
+    # The same three mounts SKALD gets, pointing at the same host locations.
+    # output/ being the identical directory is the entire handoff mechanism.
+    fta_config_dir = _prepare_fta_config_dir(provenance.split(":", 1)[0])
+
+    cmd = [
+        "docker", "run", "--rm", "--name", container_name,
+        "-v", f"{fta_config_dir}:/app/config:ro",
+        "-v", f"{config.paths.tee_input_data}:/app/data",
+        "-v", f"{config.paths.tee_output}:/app/output",
+        image,
+    ]
+    print(f"Running: {' '.join(cmd)}", flush=True)
+    print("="*60, flush=True)
+    print("skald-fta LOGS (live):", flush=True)
+    print("="*60, flush=True)
+
+    before = _output_snapshot()
+    timeout = _fta_setting("timeout_seconds", 3600)
+    try:
+        result = subprocess.run(
+            cmd, stdout=sys.stdout, stderr=sys.stderr, timeout=timeout, check=False
+        )
+        returncode = result.returncode
+    except subprocess.TimeoutExpired:
+        # subprocess kills the docker *client*; the container itself keeps
+        # running and holding the output mount unless it is removed too.
+        subprocess.run(["docker", "rm", "-f", container_name],
+                       capture_output=True, text=True, check=False)
+        _fail_free_text(
+            f"Free-text anonymisation (skald-fta) exceeded its {timeout}s limit "
+            f"and was terminated. SKALD was not started."
+        )
+
+    created = _output_snapshot() - before
+    if created:
+        _record_free_text_artifacts(created)
+        print(f"\nskald-fta wrote: {sorted(created)}", flush=True)
+
+    if returncode != 0:
+        _fail_free_text(
+            f"Free-text anonymisation (skald-fta) failed with exit code "
+            f"{returncode} (on_failure={on_failure}). No staged input was "
+            f"produced, so SKALD was not started and no output is available."
+        )
+
+    staged_path = os.path.join(config.paths.tee_output, staged_name)
+    if not os.path.isfile(staged_path):
+        _fail_free_text(
+            f"Free-text anonymisation (skald-fta) exited 0 but wrote no staged "
+            f"input at output/{staged_name}. SKALD would hard-fail on this with "
+            f"'DATA_MISSING: Configured input file not found' — stopping here "
+            f"instead, since the missing staged file is the actual fault."
+        )
+
+    _swap_staged_input_into_data(staged_path)
+
+    print(f"\nFree-text anonymisation complete. SKALD will read the sanitised "
+          f"input from data/.", flush=True)
+    print("="*60, flush=True)
+    return True
+
+
 def run_docker_containers():
-    """Start docker containers in detached mode and follow logs live."""
+    """Run the anonymisation pipeline: skald-fta (conditionally), then SKALD.
+
+    The free-text stage is gated here rather than at the call sites so that
+    every entry point gets it — deploy_enclave.py's step 10 and the
+    /run/*_pipeline re-run thread both land in this function, and a gate added
+    to only one of them would silently skip free-text masking on the other.
+    Runs that don't enable free_text_anonymization are byte-for-byte unchanged:
+    the gate short-circuits and compose comes up exactly as before.
+    """
+    # Before the gate, not inside it: a ledger left by an earlier run must not
+    # survive into a run that doesn't enable the stage (see
+    # clear_free_text_artifacts).
+    clear_free_text_artifacts()
+    run_free_text_anonymization()
+
     print("Stopping existing containers...", flush=True)
     subprocess.run(config.get_docker_command("down"), capture_output=True, text=True)
     
@@ -574,6 +1441,585 @@ def run_docker_containers():
     print(f"Application execution complete. Output saved to {config.paths.tee_output}", flush=True)
 
 
+def _read_stripped_manifest(output_dir):
+    """Read the container's manifest.json and return a summary safe to expose.
+
+    Drops the `file` and `output_dir` fields from each entry — they carry the
+    original filename and an internal TEE path — keeping only the de-id summary
+    (counts, per-technique breakdown, pixel_verification_status). Returns None
+    if no manifest is present.
+    """
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return None
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        return None
+
+    _DROP = {"file", "output_dir"}
+    entries = manifest.get("files")
+    if isinstance(entries, list):
+        manifest["files"] = [
+            {k: v for k, v in entry.items() if k not in _DROP}
+            if isinstance(entry, dict) else entry
+            for entry in entries
+        ]
+    return manifest
+
+
+def _write_direct_error_status(description):
+    """Surface a direct-upload failure through /enclave/status instead of
+    leaving whatever the container last wrote there. The UI renders
+    `description` verbatim, so this is the difference between the user seeing
+    the real failure and seeing a stale unrelated "success" block."""
+    status_payload = {
+        "status": "error",
+        "title": "Error: Direct-upload output",
+        "description": description,
+    }
+    status_path = config.get_path('status')
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    # Same remove-then-create dance as _write_dicom_status: the container may
+    # have written a root-owned status.json into this directory already.
+    try:
+        if os.path.exists(status_path):
+            os.remove(status_path)
+    except OSError:
+        pass
+    with open(status_path, "w") as f:
+        json.dump(status_payload, f, indent=2)
+    try:
+        os.chmod(status_path, 0o644)
+    except OSError:
+        pass
+
+
+def _select_tabular_output(output_dir, status_path):
+    """Pick the anonymised artifact SKALD wants returned, per status.json.
+
+    SKALD >= v3.2 returns the result in the input's own format: `generalized.csv`
+    is always written and stays canonical for every statistic in status.json,
+    but json/xlsx input ALSO gets `generalized.json`/`generalized.xlsx`, and
+    that format-matched file is what the requester should get back — otherwise
+    someone who submitted a workbook receives a CSV.
+
+    Preference order is restored_workbook_path, then format_matched_output_path,
+    then final_output_path — most faithful to the submission first. The
+    restored (per-sheet) workbook leads because it reconstructs the sheet
+    structure the requester actually sent, whereas the format-matched workbook
+    is the sheets merged into one worksheet. NOTE: only the latter two are
+    specified; restored_workbook_path's precedence is inferred from SKALD
+    letting the per-sheet workbook win the filename when both apply, and is
+    worth confirming with the container's owner. It is a no-op unless SKALD
+    populates that field, which needs explicit `sheet_joins` in the config.
+
+    Returns None when status.json names none of them (pre-v3.2 SKALD), leaving
+    the caller on its existing single-candidate logic.
+
+    The paths are container-relative ("./output/generalized.xlsx"), so only the
+    basename is used and the result must resolve inside output_dir — status.json
+    is written by the container, so treating a path in it as authoritative would
+    otherwise let a compromised image name any file on the host and have it
+    encrypted and uploaded.
+    """
+    try:
+        with open(status_path) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(status, dict):
+        return None
+
+    for key in ("restored_workbook_path", "format_matched_output_path", "final_output_path"):
+        raw = status.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        candidate = os.path.join(output_dir, os.path.basename(raw.strip()))
+        resolved = os.path.realpath(candidate)
+        output_dir_real = os.path.realpath(output_dir)
+        if not resolved.startswith(output_dir_real + os.sep):
+            continue
+        if os.path.isfile(resolved):
+            return resolved
+    return None
+
+
+def _upload_direct_output(output_dir, urls):
+    """
+    Direct-upload mode: hand the pipeline's single result file to the enclave
+    manager process over its own loopback address, so it — the only process
+    holding the browser's output_key in memory — can encrypt it into the
+    SPIDROU1 container and upload it. This subprocess never receives that
+    key, only a completion result; see lib/direct_upload.finalize_output()
+    and backend-changes-direct-upload.md §2.6.
+
+    Picks exactly one result file. For a DICOM dataset that's the same
+    `after_deidentification.dcm` allow-list _upload_dicom_output uses (the
+    container's output dir also holds the original PHI-bearing image, the
+    re-identification keystore, and audit JSONs, none of which may leave the
+    TEE). For anything else it's whatever single file remains in output_dir
+    after excluding status.json/pipeline.log. Either way, ambiguity is a hard
+    error — guessing wrong here would silently encrypt-and-ship the wrong, or
+    sensitive, file — and the error is written to status.json (not just
+    raised) so /enclave/status reports it instead of a stale prior result.
+
+    Before any of that: the container writes status.json itself on both
+    success and failure (see get_app_status()'s docstring — "the app
+    controls structure"). If it already reports an error, that is the truth
+    and MUST be preserved — treating whatever files happen to remain
+    (pipeline.log, partial output, ...) as a valid result and overwriting
+    that error with a fabricated "success" would be worse than the crash
+    this replaces: it would silently misreport a failed run as succeeded.
+    """
+    status_path = config.get_path('status')
+    if os.path.isfile(status_path):
+        try:
+            with open(status_path) as f:
+                existing_status = json.load(f)
+        except (OSError, ValueError):
+            existing_status = None
+        if isinstance(existing_status, dict) and existing_status.get("status") == "error":
+            raise RuntimeError(
+                "Pipeline reported an error; refusing to treat remaining output "
+                f"files as a successful result: {existing_status.get('error')}"
+            )
+
+    dataset_url = urls.get("blobUrl", "")
+    prefix = "enclave://upload/"
+    if not dataset_url.startswith(prefix):
+        message = f"Direct-upload output requires an enclave upload blobUrl, got: {dataset_url}"
+        _write_direct_error_status(message)
+        raise RuntimeError(message)
+    upload_id = dataset_url[len(prefix):]
+
+    scratch_dir = os.environ.get("ENCLAVE_SCRATCH_DIR", "/enclave/scratch")
+    meta_path = os.path.join(scratch_dir, f"{upload_id}.meta.json")
+    original_name, fmt = "dataset", "csv"
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        original_name = meta.get("filename", original_name)
+        fmt = meta.get("format", fmt)
+    except (OSError, ValueError):
+        pass  # meta sidecar missing/unreadable — fall back to the defaults above
+    finally:
+        try:
+            os.remove(meta_path)
+        except FileNotFoundError:
+            pass
+
+    manifest = None
+    if fmt == "dicom":
+        deid_files = _find_deidentified_outputs(output_dir)
+        if len(deid_files) != 1:
+            message = (
+                f"Direct-upload DICOM output expects exactly one "
+                f"'{_DEID_OUTPUT_NAME}' under {output_dir}, found "
+                f"{len(deid_files)}: {[os.path.relpath(p, output_dir) for p in deid_files]}."
+            )
+            _write_direct_error_status(message)
+            raise RuntimeError(message)
+        output_path = deid_files[0]
+        manifest = _read_stripped_manifest(output_dir)
+    else:
+        # SKALD >= v3.2 writes generalized.csv AND a format-matched sibling for
+        # json/xlsx input, so status.json — not "the only file present" — is
+        # what identifies the result. The count check below still applies to
+        # pre-v3.2 output, where status.json names no path at all.
+        output_path = _select_tabular_output(output_dir, status_path)
+        if output_path is None:
+            status_name = os.path.basename(status_path)
+            # free_text_artifact_names() matters twice over here: without it a
+            # free-text run leaves the staged CSV and audit JSON behind, so
+            # this count is 3 rather than 1 and every such run dies on the
+            # ambiguity check below instead of returning its result.
+            excluded = ({status_name, "pipeline.log"} | _KNOWN_KEY_MATERIAL
+                        | _KNOWN_DIAGNOSTIC_ARTIFACTS | free_text_artifact_names())
+            candidates = [
+                f for f in os.listdir(output_dir)
+                if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
+            ]
+            if len(candidates) != 1:
+                message = (
+                    f"Direct-upload output expects exactly one result file in "
+                    f"{output_dir} (excluding {sorted(excluded)}), found "
+                    f"{len(candidates)}: {candidates}. Narrow the pipeline's output "
+                    "before uploading."
+                )
+                _write_direct_error_status(message)
+                raise RuntimeError(message)
+            output_path = os.path.join(output_dir, candidates[0])
+        print(f"Direct-upload result selected: {os.path.basename(output_path)}")
+
+    stem, _ = os.path.splitext(original_name)
+    # Extension and content type must describe the bytes actually being
+    # uploaded, not the input's format: SKALD may fall back to generalized.csv
+    # for a workbook submission (no format-matched file written), and labelling
+    # those CSV bytes .xlsx would break the reader that opens them.
+    ext = os.path.splitext(output_path)[1]
+    content_type = {
+        ".csv": "text/csv",
+        ".json": "application/json",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".dcm": "application/dicom",
+    }.get(ext.lower(), "application/octet-stream")
+    filename = f"{stem or 'dataset'}_anonymised{ext}"
+
+    dp_config = load_config_file(config.get_path('config_file'))
+    address = dp_config["enclaveManagerAddress"]
+    endpoint = urllib.parse.urljoin(address, f"/internal/upload/{upload_id}/finalize-output")
+
+    payload = {
+        "output_path": output_path,
+        "filename": filename,
+        "content_type": content_type,
+    }
+    if manifest is not None:
+        payload["manifest"] = manifest
+
+    print(f"Handing off output to enclave manager for encryption: {endpoint}")
+    response = requests.post(endpoint, json=payload, timeout=60)
+    if response.status_code != 200:
+        message = f"finalize-output failed: {response.status_code} {response.text}"
+        _write_direct_error_status(message)
+        raise RuntimeError(message)
+    print(f"Direct-upload output finalised: {response.json()}")
+
+
+def _write_dicom_status(output_blob_url, manifest=None):
+    """Write the SKALD-DICOM status.json contract that /enclave/status returns
+    verbatim to the UI/middleware. `output_blob_url` is the bare location of
+    the encrypted de-identified image stored back to the output container."""
+    dicom_output = {"outputBlobUrl": output_blob_url}
+    if manifest is not None:
+        dicom_output["manifest"] = manifest
+    status_payload = {
+        "status": "success",
+        "application": "skald-dicom",
+        "outputs": {"dicom": dicom_output},
+    }
+    status_path = config.get_path('status')
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    # The container runs as root inside Docker and may have already written
+    # its own status.json into this bind-mounted directory. When this runs via
+    # deploy_enclave.py's subprocess (also root) that's a non-issue; when it
+    # runs via the in-process /run/dicom_pipeline re-run thread (this
+    # process, non-root), overwriting a root-owned file in place fails even
+    # though this user owns the directory and can unlink it. Remove-then-
+    # create sidesteps that in both cases.
+    try:
+        if os.path.exists(status_path):
+            os.remove(status_path)
+    except OSError:
+        pass
+    with open(status_path, "w") as f:
+        json.dump(status_payload, f, indent=2)
+    try:
+        os.chmod(status_path, 0o644)
+    except OSError:
+        pass
+    print(f"DICOM status written to {status_path}: {output_blob_url}")
+
+
+# The SKALD-DICOM container writes several artifacts into the shared output
+# volume, and MOST of them must never leave the TEE:
+#   after_deidentification.dcm  -> the de-identified image   (SAFE — we ship this)
+#   before_deidentification.dcm -> the original, still PHI    (NEVER upload)
+#   keystore/*                  -> FPE keys + token_vault, i.e. the material
+#                                  needed to RE-IDENTIFY patients (NEVER upload)
+#   phi_tags.json / *_audit.json / data.json -> extracted PHI + audit (NEVER)
+# We ALLOW-LIST the single de-identified artifact by exact basename rather than
+# deny-listing, so any new sensitive file the container starts emitting is
+# excluded by default instead of being accidentally uploaded.
+_DEID_OUTPUT_NAME = "after_deidentification.dcm"
+
+# The tabular SKALD techniques (k-anonymisation, FPE-based chunk-anonymisation,
+# ...) can write their own re-identification key material alongside the actual
+# result - e.g. symmetric_keys.json / fpe_encrypt_keys.json observed from a
+# live run. That material must never leave the TEE, same as DICOM's keystore/
+# above. Unlike the DICOM case, we do NOT yet have a confirmed contract from
+# the container for a single allow-listed result filename per technique (open
+# item - needs the same SKALD-owner confirmation as the DICOM behaviour did),
+# so this is a deny-list stopgap covering only the filenames observed so far.
+# It does NOT generalise the way the DICOM allow-list does: a new key-material
+# file this doesn't name would be uploaded by default. Extend this set (or
+# replace it with a real allow-list) as soon as the container's per-technique
+# output contract is confirmed.
+_KNOWN_KEY_MATERIAL = {"symmetric_keys.json", "fpe_encrypt_keys.json"}
+
+# Separate from _KNOWN_KEY_MATERIAL on purpose: these are anonymisation-run
+# diagnostics (equivalence-class size histogram, OLA-2 search nodes, the
+# k/suppression parameter sweep) observed alongside generalized.csv on a real
+# tabular run. They carry no PII and no re-identification material — nothing
+# here is dangerous to expose — they just are not the anonymised dataset
+# itself, so they must not be mistaken for "the" single result file. Same
+# stopgap caveat as _KNOWN_KEY_MATERIAL: a deny-list, not a confirmed
+# per-technique contract, so a new diagnostic filename the container starts
+# emitting would be uploaded by default until this set is extended.
+_KNOWN_DIAGNOSTIC_ARTIFACTS = {
+    "parameter_grid.txt", "equivalence_class_stats.json", "top_ola2_nodes.json",
+}
+
+
+def _find_deidentified_outputs(output_dir):
+    """Recursively collect ONLY the de-identified .dcm output(s)."""
+    found = []
+    for root, dirs, files in os.walk(output_dir):
+        # Never descend into the keystore (re-identification material).
+        dirs[:] = [d for d in dirs if d.lower() != "keystore"]
+        for name in sorted(files):
+            if name == _DEID_OUTPUT_NAME:
+                found.append(os.path.join(root, name))
+    return sorted(found)
+
+
+def _upload_dicom_output(fetch_data, output_dir, container_base_url, urls):
+    """Encrypt and store the de-identified DICOM output(s) back to the output
+    container, then write the status contract.
+
+    Only `after_deidentification.dcm` files are uploaded — the original image,
+    the keystore, and the audit JSONs stay inside the TEE (they contain PHI or
+    re-identification keys).
+
+    When the bundle carried a per-run output key (see decrypt_bundle_tee /
+    _get_output_crypto), the output is encrypted into the SPIDROU1 container
+    with write_output_container() so the browser can decrypt and render it
+    directly, using the SAME key it generated for this run — not the shared
+    Key Vault Fernet key, which never leaves this per-run key's job of
+    decrypting the input. Older UIs that don't send that key fall back to the
+    previous behaviour (Fernet with the shared Key Vault key). Either way the
+    status reports the (bare) blob location, not a fetch URL.
+    """
+    output_crypto = _get_output_crypto()
+    encrypt_output = bool(getattr(config.dicom, "encrypt_output", True))
+
+    if not os.path.exists(output_dir):
+        raise FileNotFoundError(f"Output directory not found: {output_dir}")
+
+    deid_files = _find_deidentified_outputs(output_dir)
+    if not deid_files:
+        raise FileNotFoundError(
+            f"No '{_DEID_OUTPUT_NAME}' found under {output_dir}. The container "
+            "did not produce a de-identified image, or wrote it under an "
+            "unexpected name."
+        )
+
+    cipher = None
+    if output_crypto is None and encrypt_output:
+        print("Fetching encryption key from Key Vault (encrypt_output=true)...")
+        fernet_key = fetch_data.fetch_fernet_key_from_kv(urls["keyVaultUrl"])
+        cipher = create_fernet_cipher(fernet_key)
+
+    print(f"Uploading {len(deid_files)} de-identified DICOM output(s)")
+    primary_blob_url = None
+    for src_path in deid_files:
+        # Name the blob after the per-image subdir so batch outputs don't collide.
+        case_name = os.path.basename(os.path.dirname(src_path)) or "output"
+        blob_base = f"{case_name}_deidentified.dcm"
+
+        if output_crypto is not None:
+            upload_name = blob_base + ".enc"
+            upload_src = f"/tmp/{upload_name}"
+            with open(upload_src, "wb") as f:
+                write_output_container(
+                    src_path, f,
+                    run_id=output_crypto["run_id"],
+                    output_key=output_crypto["key"],
+                    output_base_iv=output_crypto["base_iv"],
+                    filename=blob_base,
+                    content_type="application/dicom",
+                )
+        elif encrypt_output:
+            with open(src_path, "rb") as f:
+                payload = cipher.encrypt(f.read())
+            upload_name = blob_base + ".enc"
+            upload_src = f"/tmp/{upload_name}"
+            with open(upload_src, "wb") as f:
+                f.write(payload)
+        else:
+            upload_name = blob_base
+            upload_src = src_path
+
+        blob_url = f"{container_base_url}/{upload_name}"
+        print(f"Uploading {upload_name} to {blob_url}...")
+        fetch_data.upload_blob(blob_url, upload_src)
+        if output_crypto is not None or encrypt_output:
+            os.remove(upload_src)
+
+        if primary_blob_url is None:
+            primary_blob_url = blob_url
+
+    manifest = _read_stripped_manifest(output_dir)
+    _write_dicom_status(primary_blob_url, manifest=manifest)
+    print("DICOM output stored to blob; status written")
+
+
+# skald-image writes exactly one redacted image into /app/output (mirrors
+# tee_output). Unlike the DICOM container's fixed after_deidentification.dcm
+# basename, the app package's own output-filename convention is not yet
+# confirmed with its owner, so this allow-lists by extension instead — same
+# `ext` set the pipeline_config.json contract already exposes to the UI, not
+# a filename. Ambiguity (0 or >1 image files) is a hard error rather than a
+# guess, same rationale as _find_deidentified_outputs above.
+_IMAGE_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+_IMAGE_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+}
+
+
+def _find_image_outputs(output_dir):
+    """Collect image files directly under output_dir (non-recursive — the
+    app package processes a single image per job per the current contract)."""
+    found = []
+    for name in sorted(os.listdir(output_dir)):
+        path = os.path.join(output_dir, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in _IMAGE_OUTPUT_EXTENSIONS:
+            found.append(path)
+    return found
+
+
+def _read_image_manifest(output_dir):
+    """Optional detection/redaction summary the container may drop alongside
+    its output, following the same manifest.json convention the tabular
+    SKALD techniques use (see _read_stripped_manifest). Not yet confirmed
+    with the skald-image app owner — returns {} if absent or unreadable, so
+    callers degrade to reporting only the fields they already know."""
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return {}
+    try:
+        with open(manifest_path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_image_status(output_blob_url, filename, byte_count, run_config, manifest):
+    """Write the skald-image status.json contract that /enclave/status returns
+    verbatim to the UI. Written ONCE with outputs.image fully populated — see
+    the direct-upload race this avoids: publishing status:"success" before
+    outputs is filled in is what left the UI permanently stuck reporting "no
+    output location" there, and it applies here identically."""
+    image_output = {
+        "outputBlobUrl": output_blob_url,
+        "filename": filename,
+        "bytes": byte_count,
+    }
+    # mask_mode/conf are user-settable and known from the validated request
+    # config regardless of what (if anything) the container reports back.
+    if run_config.get("mask_mode") is not None:
+        image_output["mask_mode"] = run_config["mask_mode"]
+    if run_config.get("conf") is not None:
+        image_output["conf"] = run_config["conf"]
+    # redacted_regions/detections are the container's own claims about what
+    # it found — only include them if it actually reported something.
+    if isinstance(manifest.get("redacted_regions"), int):
+        image_output["redacted_regions"] = manifest["redacted_regions"]
+    if isinstance(manifest.get("detections"), dict):
+        image_output["detections"] = manifest["detections"]
+
+    status_payload = {
+        "status": "success",
+        "application": "skald-image",
+        "outputs": {"image": image_output},
+    }
+    status_path = config.get_path('status')
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    # Same remove-then-create dance as _write_dicom_status: the container may
+    # have already written a root-owned status.json into this directory.
+    try:
+        if os.path.exists(status_path):
+            os.remove(status_path)
+    except OSError:
+        pass
+    with open(status_path, "w") as f:
+        json.dump(status_payload, f, indent=2)
+    try:
+        os.chmod(status_path, 0o644)
+    except OSError:
+        pass
+    print(f"Image status written to {status_path}: {output_blob_url}")
+
+
+def _upload_image_output(fetch_data, output_dir, container_base_url, urls):
+    """Encrypt the redacted image and store it back to the output container,
+    then write the status contract. Only the redacted image is uploaded — a
+    temp_dir misconfiguration writing the unredacted source into output_dir is
+    rejected earlier, in fetch_data._validate_and_normalize_image_config(),
+    not tolerated here by picking "the other file".
+
+    When the bundle carried a per-run output key (see decrypt_bundle_tee /
+    _get_output_crypto), the image is encrypted into the SPIDROU1 container
+    with write_output_container() so the browser can decrypt and render it
+    directly. Older UIs that don't send that key fall back to the previous
+    behaviour: Fernet with the same dataset key used for input decryption.
+    """
+    if not os.path.exists(output_dir):
+        raise FileNotFoundError(f"Output directory not found: {output_dir}")
+
+    image_files = _find_image_outputs(output_dir)
+    if len(image_files) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one redacted image in {output_dir}, found "
+            f"{len(image_files)}: {[os.path.basename(p) for p in image_files]}."
+        )
+    src_path = image_files[0]
+    plaintext_bytes = os.path.getsize(src_path)
+
+    output_crypto = _get_output_crypto()
+    upload_name = os.path.basename(src_path) + ".enc"
+    upload_src = f"/tmp/{upload_name}"
+
+    if output_crypto is not None:
+        ext = os.path.splitext(src_path)[1].lower()
+        content_type = _IMAGE_CONTENT_TYPES.get(ext, "application/octet-stream")
+        with open(upload_src, "wb") as f:
+            write_output_container(
+                src_path, f,
+                run_id=output_crypto["run_id"],
+                output_key=output_crypto["key"],
+                output_base_iv=output_crypto["base_iv"],
+                filename=os.path.basename(src_path),
+                content_type=content_type,
+            )
+    else:
+        print("Fetching encryption key from Key Vault...")
+        fernet_key = fetch_data.fetch_fernet_key_from_kv(urls["keyVaultUrl"])
+        cipher = create_fernet_cipher(fernet_key)
+
+        with open(src_path, "rb") as f:
+            encrypted_data = cipher.encrypt(f.read())
+        with open(upload_src, "wb") as f:
+            f.write(encrypted_data)
+
+    blob_url = f"{container_base_url}/{upload_name}"
+    print(f"Uploading {upload_name} to {blob_url}...")
+    fetch_data.upload_blob(blob_url, upload_src)
+    os.remove(upload_src)
+
+    run_config = {}
+    try:
+        with open(os.path.join(config.paths.tee_input_config, "pipeline_config.json")) as f:
+            run_config = json.load(f)
+    except (OSError, ValueError):
+        pass
+
+    manifest = _read_image_manifest(output_dir)
+    _write_image_status(blob_url, os.path.basename(src_path), plaintext_bytes, run_config, manifest)
+    print("Image output stored to blob; status written")
+
+
 def encrypt_and_upload_output(config_path="DPconfig.json"):
     """Encrypt all files in output folder and upload to Azure Blob Storage."""
     fetch_data = _get_fetch_data()
@@ -585,20 +2031,43 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
             f"decrypted_urls.json not found at {urls_path}. "
             "Cannot determine upload location without decrypted URLs."
         )
-    
+
     with open(urls_path, "r") as f:
         urls = json.load(f)
-    
+
     if "keyVaultUrl" not in urls:
         raise ValueError("keyVaultUrl not found in decrypted_urls.json")
-    
+
     keyvault_url = urls["keyVaultUrl"]
-    
+
     if "outputContainerUrl" not in urls:
         raise ValueError("outputContainerUrl not found in decrypted_urls.json")
-    
+
     container_base_url = urls["outputContainerUrl"].rstrip("/")
-    
+
+    # Direct-upload mode short-circuits ALL format-based branching below: the
+    # output must go through the browser-held output key regardless of
+    # whether the underlying dataset was csv/json/excel/dicom, so this check
+    # must come BEFORE the dicom-format check — a direct-mode DICOM run would
+    # otherwise be wrongly routed into the SAS/plaintext DICOM path instead.
+    if urls.get("outputContainerUrl", "") == "enclave://download":
+        _upload_direct_output(output_dir, urls)
+        return
+
+    # DICOM (SKALD-DICOM) output takes a separate path: unencrypted upload +
+    # SAS + status contract. The tabular flow below is unchanged.
+    output_format = fetch_data.read_output_format()
+    if output_format == "dicom":
+        _upload_dicom_output(fetch_data, output_dir, container_base_url, urls)
+        return
+
+    # skald-image output: single redacted image, Fernet-encrypted with the
+    # same dataset key used for input, uploaded to the output container with
+    # its own status contract (outputs.image).
+    if output_format == "image":
+        _upload_image_output(fetch_data, output_dir, container_base_url, urls)
+        return
+
     print("Fetching encryption key from Key Vault...")
     fernet_key = fetch_data.fetch_fernet_key_from_kv(keyvault_url)
     cipher = create_fernet_cipher(fernet_key)
@@ -606,12 +2075,18 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     if not os.path.exists(output_dir):
         raise FileNotFoundError(f"Output directory not found: {output_dir}")
     
+    # skald-fta's staged CSV and detection audit share this directory with
+    # SKALD's result because that mount IS the handoff between the two stages.
+    # They are intermediates: the staged CSV has had free text masked but never
+    # went through k-anonymisation, so uploading it would ship every
+    # quasi-identifier the run exists to treat. See free_text_artifact_names().
+    excluded = _KNOWN_KEY_MATERIAL | free_text_artifact_names()
     output_files = [
         os.path.join(output_dir, f)
         for f in os.listdir(output_dir)
-        if os.path.isfile(os.path.join(output_dir, f))
+        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
     ]
-    
+
     if not output_files:
         raise FileNotFoundError(f"No files found in output directory: {output_dir}")
     
@@ -686,16 +2161,22 @@ def get_app_status():
 
 
 def restart_enclave_manager():
-    """Restart the enclave manager systemd service."""
-    print("Restarting enclavemanager service...", flush=True)
+    """Gracefully reload the enclave manager systemd service.
+
+    Uses `systemctl reload` (gunicorn SIGHUP) instead of `restart` so the
+    listening socket stays bound while the worker respawns with fresh state -
+    a plain restart briefly drops the socket and nginx returns 502 to any
+    client polling status during that window.
+    """
+    print("Reloading enclavemanager service...", flush=True)
     result = subprocess.run(
-        ["sudo", "systemctl", "restart", config.service.name],
+        ["sudo", "systemctl", "reload", config.service.name],
         capture_output=True,
         text=True
     )
     if result.returncode == 0:
-        print("enclavemanager service restarted successfully", flush=True)
-        # Give service a moment to fully restart
+        print("enclavemanager service reloaded successfully", flush=True)
+        # Give the new worker a moment to finish booting
         time.sleep(2)
     else:
-        print(f"Warning: Failed to restart enclavemanager service: {result.stderr}", flush=True)
+        print(f"Warning: Failed to reload enclavemanager service: {result.stderr}", flush=True)

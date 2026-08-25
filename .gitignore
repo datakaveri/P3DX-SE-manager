@@ -11,6 +11,7 @@ docker-compose.yml
 .env
 
 #Directories
+/tee/            # symlinks to the /tmp TEE mounts (plaintext data - never commit)
 /token_verification/
 /vm_pcr_verification/
 /attestation-and-verification.py/

@@ -11,6 +11,8 @@ import threading
 import P3DX_SDK
 from lib.config import config
 from lib import immudb_client
+from lib import direct_upload
+from enclave.enclave_direct_upload import UploadError, MAX_CHUNK_BYTES
 
 
 app = Flask(__name__)
@@ -328,7 +330,36 @@ def upload_encrypted_bundle():
                 "description": "No data received"
             }
             return jsonify(response), 400
-        
+
+        # Direct-upload ownership check. This is the ONLY point in the whole
+        # deploy flow where the bundle-uploader's X-User-Sub (available on
+        # this request) and the UploadManager singleton (which holds the
+        # /init session's user_sub, in this process's memory only) are both
+        # available at once. deploy_enclave.py, which later decrypts and
+        # actually uses this bundle, runs as a separate subprocess with no
+        # access to that in-memory state — if the check does not happen here,
+        # it can never happen at all, and a forged dataset_ref would go
+        # unchecked all the way to step 9.
+        try:
+            dataset_ref = _peek_bundle_blob_url(content)
+        except Exception as e:
+            return jsonify({
+                "title": "Error",
+                "description": f"Could not read bundle payload: {e}"
+            }), 400
+
+        if dataset_ref and dataset_ref.startswith("enclave://upload/"):
+            sub = _caller_user_sub()
+            if not sub:
+                return jsonify({
+                    "title": "Error",
+                    "description": "Missing authenticated caller identity"
+                }), 401
+            try:
+                direct_upload.stage_for_pipeline(sub, dataset_ref)
+            except UploadError as e:
+                return jsonify({"title": "Error", "description": e.description}), e.status
+
         bundle_dir = config.paths.bundle_dir
         os.makedirs(bundle_dir, exist_ok=True)
         
@@ -490,6 +521,299 @@ def get_app_status_endpoint():
 
 
 # ---------------------------------------------------------------------------
+# Direct dataset upload (chunked, browser-encrypted; see
+# backend-changes-direct-upload.md and enclave/enclave_direct_upload.py)
+# ---------------------------------------------------------------------------
+
+def _caller_user_sub():
+    """The caller's JWT `sub`, decoded by the middleware and forwarded as
+    X-User-Sub. Trusted as-is, with no independent verification here — that is
+    a deliberate, narrow trust boundary, not an oversight:
+
+    - The middleware ALWAYS overwrites any client-supplied X-User-Sub with the
+      value it decoded from the caller's verified Bearer JWT; a client cannot
+      set or spoof it.
+    - This host is network-restricted to only accept traffic from the
+      middleware, so an arbitrary caller cannot reach this endpoint directly
+      to forge the header in the first place.
+    - Missing/unauthenticated requests get a 401 at the middleware, before
+      anything is forwarded — so a genuinely missing header here indicates the
+      network restriction has failed or is being tested around, not a normal
+      client error. Treat it as unauthenticated rather than falling back to a
+      shared "anonymous" identity, which would silently break the per-user
+      session isolation (MAX_CONCURRENT_SESSIONS_PER_USER) this whole feature
+      depends on.
+
+    If the network-restriction assumption ever changes, the fix is mTLS with
+    identity derived from the client certificate, not a header — see
+    backend-changes-direct-upload.md.
+    """
+    return request.headers.get("X-User-Sub", "")
+
+
+def _upload_error_response(exc):
+    return jsonify({"title": "Error", "description": exc.description}), exc.status
+
+
+def _require_user_sub():
+    sub = _caller_user_sub()
+    if not sub:
+        raise UploadError(401, "Missing authenticated caller identity")
+    return sub
+
+
+@app.route("/enclave/upload/init", methods=["POST"])
+def upload_init():
+    try:
+        sub = _require_user_sub()
+        manager = direct_upload.get_manager()
+        body = request.get_json(silent=True)
+        if body is None:
+            raise UploadError(400, "Request body must be JSON")
+        result = manager.init(sub, body)
+        return jsonify(result), 201
+    except UploadError as e:
+        return _upload_error_response(e)
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"title": "Error", "description": f"Malformed request: {e}"}), 400
+
+
+def _expected_chunk_ciphertext_bytes(manager, sub, upload_id, index):
+    """
+    Look up how many ciphertext bytes this chunk SHOULD be, from the session
+    the caller already established at /init — chunk_size for every chunk
+    but the last, (total_bytes - index*chunk_size) for the last, plus the
+    16-byte GCM tag. Knowing this lets the streaming read path preallocate
+    exactly, like the Content-Length path does, instead of growing a
+    bytearray to EOF.
+
+    Returns None if the session is unknown, owned by someone else, already
+    completed, or the index is out of range — in every one of those cases
+    _read_chunk_body() falls back to its bounded-growth path, and
+    manager.put_chunk() below still performs the real ownership/validity
+    check and raises the correct (identical, non-oracle) error. This lookup
+    must never become a way to learn something about a session before that
+    real check runs.
+    """
+    session = manager._sessions.get(upload_id)  # noqa: SLF001 -- see stage_for_pipeline() for why
+    if session is None or session.user_sub != sub or session.completed:
+        return None
+    if not 0 <= index < session.total_chunks:
+        return None
+    plaintext_len = (
+        session.chunk_size if index < session.total_chunks - 1
+        else session.total_bytes - index * session.chunk_size
+    )
+    return plaintext_len + 16  # AES-GCM tag
+
+
+def _read_chunk_body(expected_bytes=None):
+    """
+    Read the chunk PUT body, handling both wire encodings a real client can
+    use — and real chunked-uploader traffic here is ALWAYS the second one:
+
+    - Content-Length present (e.g. a client that buffers and computes the
+      length up front): preallocate a single exact-size buffer and read
+      into it directly.
+    - Content-Length absent, Transfer-Encoding: chunked: the length is
+      genuinely unknown from the HTTP layer alone — that is what chunked
+      encoding means, not a missing header to reject. But the session
+      already knows how big this specific chunk should be (see
+      _expected_chunk_ciphertext_bytes), so we preallocate against THAT
+      instead of growing a bytearray to EOF. This matters because
+      AESGCM.decrypt already holds ciphertext + plaintext simultaneously —
+      ~128 MiB at a 64 MiB chunk, the documented AEAD floor. A doubling
+      bytearray on top of that would add a further transient 1.5-2x of the
+      ciphertext: the one place this handler could exceed the design doc's
+      memory budget without it being obvious.
+    - Only when the expected size genuinely can't be determined (unknown or
+      foreign upload_id) does this fall back to growing a bounded buffer to
+      EOF — manager.put_chunk() still performs the real ownership check
+      immediately afterward and raises the correct error either way.
+
+    In every case the total is bounded by MAX_CHUNK_BYTES.
+    """
+    stream = request.stream
+    content_length = request.content_length
+
+    if content_length:
+        if content_length > MAX_CHUNK_BYTES:
+            raise UploadError(413, "Chunk exceeds the negotiated chunk size")
+        buf = bytearray(content_length)
+        view = memoryview(buf)
+        read_total = 0
+        while read_total < content_length:
+            piece = stream.read(min(65536, content_length - read_total))
+            if not piece:
+                break
+            n = len(piece)
+            view[read_total:read_total + n] = piece
+            read_total += n
+        if read_total != content_length:
+            raise UploadError(400, "Chunk body shorter than declared Content-Length")
+        return bytes(buf)
+
+    if expected_bytes is not None and 0 < expected_bytes <= MAX_CHUNK_BYTES:
+        buf = bytearray(expected_bytes)
+        view = memoryview(buf)
+        read_total = 0
+        while read_total < expected_bytes:
+            piece = stream.read(min(65536, expected_bytes - read_total))
+            if not piece:
+                break
+            n = len(piece)
+            view[read_total:read_total + n] = piece
+            read_total += n
+        if read_total != expected_bytes:
+            raise UploadError(400, "Chunk body shorter than expected for this session")
+        # Confirm nothing more is still arriving — a single extra byte read
+        # means the sender is putting more than this chunk should contain.
+        if stream.read(1):
+            raise UploadError(413, "Chunk exceeds the negotiated chunk size")
+        return bytes(buf)
+
+    buf = bytearray()
+    while True:
+        piece = stream.read(65536)
+        if not piece:
+            break
+        buf.extend(piece)
+        if len(buf) > MAX_CHUNK_BYTES:
+            raise UploadError(413, "Chunk exceeds the negotiated chunk size")
+    if not buf:
+        raise UploadError(400, "Empty chunk body")
+    return bytes(buf)
+
+
+@app.route("/enclave/upload/<upload_id>/chunk/<int:index>", methods=["PUT"])
+def upload_chunk(upload_id, index):
+    try:
+        sub = _require_user_sub()
+        manager = direct_upload.get_manager()
+
+        expected_bytes = _expected_chunk_ciphertext_bytes(manager, sub, upload_id, index)
+        body = _read_chunk_body(expected_bytes)
+        digest = request.headers.get("X-Chunk-SHA256", "")
+        result = manager.put_chunk(sub, upload_id, index, body, digest)
+        return jsonify(result), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"title": "Error", "description": f"Malformed request: {e}"}), 400
+
+
+@app.route("/enclave/upload/<upload_id>/status", methods=["GET"])
+def upload_status(upload_id):
+    try:
+        sub = _require_user_sub()
+        manager = direct_upload.get_manager()
+        return jsonify(manager.status(sub, upload_id)), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+
+
+@app.route("/enclave/upload/<upload_id>/complete", methods=["POST"])
+def upload_complete(upload_id):
+    try:
+        sub = _require_user_sub()
+        manager = direct_upload.get_manager()
+        body = request.get_json(silent=True)
+        if body is None:
+            raise UploadError(400, "Request body must be JSON")
+        result = manager.complete(sub, upload_id, str(body.get("plaintext_sha256", "")))
+        return jsonify(result), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"title": "Error", "description": f"Malformed request: {e}"}), 400
+
+
+@app.route("/enclave/upload/<upload_id>", methods=["DELETE"])
+def upload_delete(upload_id):
+    try:
+        sub = _require_user_sub()
+        manager = direct_upload.get_manager()
+        manager.delete(sub, upload_id)
+        return jsonify({"title": "ok", "description": "deleted"}), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+
+
+def _peek_bundle_blob_url(content):
+    """
+    Decrypt just the blobUrl field of an uploaded bundle, without touching
+    encryptedFiles/config and without writing anything to disk. Used only to
+    detect the enclave://upload/ sentinel early enough to run the ownership
+    check in upload_encrypted_bundle() before the bundle is even saved.
+
+    Reuses the same decrypt_rsa_wrapped_key / decrypt_fernet_token functions
+    Bundle/decryption.py already uses for the full bundle decrypt later — in
+    particular the same (deliberately spec-swapped) Fernet key-half ordering,
+    so this agrees with the real decrypt rather than risking a second,
+    subtly-different implementation of the same non-standard scheme.
+
+    Returns None if the bundle has no encryptedUrls.blobUrl to peek at.
+    """
+    bundle = content.get('bundle', content) if isinstance(content, dict) else {}
+    payload = bundle.get('payload', {}) if isinstance(bundle, dict) else {}
+    wrapped_key = payload.get('wrappedKey')
+    blob_token = payload.get('encryptedUrls', {}).get('blobUrl')
+    if not wrapped_key or not blob_token:
+        return None
+    from decryption import decrypt_rsa_wrapped_key, decrypt_fernet_token
+    private_key_path = config.get_path('private_key')
+    fernet_key = decrypt_rsa_wrapped_key(wrapped_key, private_key_path)
+    return decrypt_fernet_token(blob_token, fernet_key).decode('utf-8')
+
+
+def _require_loopback():
+    """
+    Restrict a route to callers on this same host. Used only for the
+    finalize-output handoff from the deploy_enclave.py subprocess below — it
+    is not part of the public API surface middleware proxies, and the caller
+    has no X-User-Sub to check (the subprocess has no per-request user
+    identity, same as the existing /enclave/setstate and /enclave/bundle GET
+    routes it calls today).
+
+    This assumes requests to this port either originate on this host or
+    arrive through a local reverse proxy that preserves the real client
+    address — if that assumption doesn't hold on the actual deployment
+    topology, this check alone is not sufficient. The path-containment check
+    in direct_upload.finalize_output() is the load-bearing defense regardless
+    of how this route is reached.
+    """
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        raise UploadError(403, "This endpoint is host-internal only")
+
+
+@app.route("/internal/upload/<upload_id>/finalize-output", methods=["POST"])
+def upload_finalize_output(upload_id):
+    """
+    Called by deploy_enclave.py (or the /run/*_pipeline background thread)
+    once the pipeline has produced its result, so THIS process — the only one
+    holding the browser's output_key in memory — can encrypt it into the
+    SPIDROU1 container and upload it. The caller never receives the key
+    itself, only this completion signal; see backend-changes-direct-upload.md
+    §2.6 on why the key must never cross the process boundary.
+    """
+    try:
+        _require_loopback()
+        body = request.get_json(silent=True) or {}
+        result = direct_upload.finalize_output(
+            upload_id,
+            output_path=str(body.get("output_path", "")),
+            filename=str(body.get("filename", "output")),
+            content_type=str(body.get("content_type", "application/octet-stream")),
+            manifest=body.get("manifest"),
+        )
+        return jsonify(result), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+    except (KeyError, ValueError, TypeError, OSError) as e:
+        return jsonify({"title": "Error", "description": f"finalize-output failed: {e}"}), 400
+
+
+# ---------------------------------------------------------------------------
 # Pipeline helpers
 # ---------------------------------------------------------------------------
 
@@ -515,6 +839,11 @@ def _run_pipeline_background(job_id: str, username: str, blob_url: str,
         # picks up technique-specific parameters (k, epsilon, chunk_size, …)
         dp_config.update(run_config or {})
         dp_config["technique"] = technique
+        # DICOM re-runs ignore SKALD technique fields; mark the format/operation
+        # so the fetch/upload path uses the .dcm + SAS flow.
+        if technique == "dicom_deidentify":
+            dp_config["format"] = "dicom"
+            dp_config.setdefault("operations", ["dicom_deidentify"])
         with open(config_file_path, 'w') as f:
             json.dump(dp_config, f, indent=2)
 
@@ -624,6 +953,11 @@ def run_chunkanon_pipeline():
     return _start_pipeline("chunk_anonymisation")
 
 
+@app.route("/run/dicom_pipeline", methods=["POST"])
+def run_dicom_pipeline():
+    return _start_pipeline("dicom_deidentify")
+
+
 # ---------------------------------------------------------------------------
 # Run status endpoint (called by LLM VM to build chat context)
 # ---------------------------------------------------------------------------
@@ -716,9 +1050,16 @@ if __name__ == "__main__":
     print("  - POST /enclave/setstate")
     print("  - GET  /enclave/inference")
     print("  - GET  /enclave/status")
+    print("  - POST /enclave/upload/init")
+    print("  - PUT  /enclave/upload/<id>/chunk/<index>")
+    print("  - GET  /enclave/upload/<id>/status")
+    print("  - POST /enclave/upload/<id>/complete")
+    print("  - DELETE /enclave/upload/<id>")
+    print("  - POST /internal/upload/<id>/finalize-output (host-internal only)")
     print("  - POST /run/k_anon_pipeline")
     print("  - POST /run/dp_pipeline")
     print("  - POST /run/chunkanon_pipeline")
+    print("  - POST /run/dicom_pipeline")
     print("  - GET  /run/status")
     print("=" * 60)
     app.run(host=config.service.host, port=config.service.port, debug=True)

@@ -144,7 +144,29 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     password_bytes = key_password.encode('utf-8') if key_password else None
     fernet_key = decrypt_rsa_wrapped_key(wrapped_key, private_key_path, password_bytes)
     print(f"Fernet key decrypted ({len(fernet_key)} bytes)")
-    
+
+    # Per-run output key (browser-held, NOT the shared Fernet key above): lets
+    # the DICOM/image pipeline output be encrypted so only the browser that
+    # started this run can read it, instead of the shared dataset key. Older
+    # UIs don't send these fields yet, so absence just means "no per-run
+    # output encryption" - callers fall back to the existing Fernet behaviour.
+    output_crypto = None
+    output_wrapped_key = payload.get('outputWrappedKey')
+    output_base_iv_b64 = payload.get('outputBaseIv')
+    run_id = payload.get('runId')
+    if output_wrapped_key and output_base_iv_b64 and run_id:
+        print("\nStep 1b: Decrypting per-run output key...")
+        output_key = decrypt_rsa_wrapped_key(output_wrapped_key, private_key_path, password_bytes)
+        output_base_iv = base64.b64decode(output_base_iv_b64)
+        if len(output_base_iv) != 12:
+            raise ValueError(f"outputBaseIv must be 12 bytes, got {len(output_base_iv)}")
+        output_crypto = {
+            'key': output_key,
+            'base_iv': output_base_iv,
+            'run_id': str(run_id),
+        }
+        print(f"Output key decrypted ({len(output_key)} bytes); run_id={run_id}")
+
     file_names = metadata.get('fileNames', {})
     original_sizes = metadata.get('originalSizes', {})
     decrypted_files = {}
@@ -219,5 +241,6 @@ def decrypt_bundle(bundle_path: str, private_key_path: str, output_dir: str = No
     
     return {
         'files': decrypted_files,
-        'urls': decrypted_urls
+        'urls': decrypted_urls,
+        'output': output_crypto,
     }

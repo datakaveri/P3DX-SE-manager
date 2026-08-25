@@ -111,7 +111,25 @@ class Config:
         self.azure = PathNamespace()
         for key, value in azure_config.items():
             setattr(self.azure, key, value)
-        
+
+        # DICOM (SKALD-DICOM) configuration
+        dicom_config = self._config.get('dicom', {})
+        self.dicom = PathNamespace()
+        for key, value in dicom_config.items():
+            setattr(self.dicom, key, value)
+
+        # Free-text anonymisation (skald-fta pre-stage) configuration
+        fta_config = self._config.get('free_text_anonymization', {})
+        self.free_text_anonymization = PathNamespace()
+        for key, value in fta_config.items():
+            setattr(self.free_text_anonymization, key, value)
+
+        # Direct dataset upload configuration
+        direct_upload_config = self._config.get('direct_upload', {})
+        self.direct_upload = PathNamespace()
+        for key, value in direct_upload_config.items():
+            setattr(self.direct_upload, key, value)
+
         # Commands
         commands_config = self._config.get('commands', {})
         self.commands = PathNamespace()
@@ -192,7 +210,8 @@ class Config:
             file_name = getattr(self.files, path_name)
             # Most files go in keys directory
             if path_name in ['jwt_response', 'deployment_nonce', 'pcr_values', 
-                           'public_key', 'private_key', 'code_hash', 'image_hash']:
+                           'public_key', 'private_key', 'code_hash', 'image_hash',
+                           'fta_image_hash', 'fta_artifacts']:
                 base = self.paths.keys_dir
             elif path_name == 'encrypted_bundle':
                 base = self.paths.bundle_dir
