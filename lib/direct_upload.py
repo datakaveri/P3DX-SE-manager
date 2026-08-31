@@ -95,12 +95,14 @@ def get_manager():
     global _manager, _manager_key_fingerprint, _sweeper_started
 
     # Keyed on the public key's fingerprint rather than the private key file's
-    # mtime. The private key is normally a sealed blob whose mtime says nothing
-    # useful, and a fingerprint answers the actual question — "is this still the
-    # same keypair?" — instead of a proxy for it.
+    # mtime, which answers the actual question — "is this still the same
+    # keypair?" — instead of a proxy for it. That matters more now, not less:
+    # keys are per-run again, so the fingerprint changes on every deploy and this
+    # cache must follow it.
     import P3DX_SDK  # deferred: P3DX_SDK imports this module at load time
 
-    if not P3DX_SDK.keypair_exists():
+    if not (os.path.exists(config.get_path('public_key'))
+            and os.path.exists(config.get_path('private_key'))):
         raise UploadError(503, "TEE keys not yet generated — attest before uploading")
 
     fingerprint = P3DX_SDK.public_key_fingerprint()

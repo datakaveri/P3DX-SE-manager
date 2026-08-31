@@ -52,11 +52,10 @@ def cleanup_and_prepare_folders():
         os.remove(docker_compose_file)
         print(f"Removed: {docker_compose_file}", flush=True)
     
-    # keys/ is deliberately NOT removed. The enclave keypair is long-lived now:
-    # under the job queue the browser wraps its data key for this enclave's
-    # public key while the job waits, so deleting the key between jobs would
-    # silently invalidate every wrapped key in flight. Rotation is explicit —
-    # P3DX_SDK.rotate_key_pair() — not a side effect of deploying.
+    # keys/ is deliberately NOT removed even though the keypair is per-run again:
+    # generate_and_save_key_pair overwrites every file it owns, and blanket
+    # deletion would also take the TLS certificate out from under a listener
+    # that is still serving it. The key material is replaced, not accumulated.
     #
     # The stale JWT does go, so a caller polling /enclave/jwt cannot be handed
     # the previous deployment's attestation.
@@ -110,6 +109,12 @@ def main():
     P3DX_SDK.setState("TEE Attestation & Authorisation", "Step 2", 2, 11, address, job_id)
     P3DX_SDK.generate_and_save_key_pair()
     print("Key pair generated", flush=True)
+
+    # The certificate changed with the key, so the listener has to be rebound to
+    # it. Until this happens the enclave is still presenting the previous run's
+    # key and the middleware would refuse the channel — correctly, but the node
+    # would look mysteriously unreachable.
+    P3DX_SDK.reload_ratls_listener(address)
     
     # Step 3 - Docker image pulling
     print("\n" + "="*60, flush=True)

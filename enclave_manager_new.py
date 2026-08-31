@@ -14,7 +14,6 @@ import P3DX_SDK
 from lib.config import config
 from lib import immudb_client
 from lib import direct_upload
-from lib import sealed_key
 from enclave.enclave_direct_upload import UploadError, MAX_CHUNK_BYTES
 
 
@@ -39,26 +38,43 @@ CORS(app,
 def _bootstrap_measurement():
     """Extend PCR15 with the enclave-manager code hash at startup.
 
-    A reboot resets every PCR to zero, but the KEK protecting the private key is
-    sealed against PCR15 holding the code hash. So the measurement has to happen
-    before anything needs the key — and the first thing to need it may well be an
-    inbound upload, not an attestation call.
+    A reboot resets every PCR to zero, and PCR15 is what the middleware checks
+    to decide this node is running the code it expects. So it has to be measured
+    before anything asks this enclave to attest — which, under RA-TLS, is the
+    moment a dispatch arrives rather than something the operator schedules.
 
-    This used to run only inside /enclave/jwt/fresh, which meant a freshly booted
-    node with a valid sealed key could not open it until something happened to
-    ask for a new attestation. Idempotent: a no-op once PCR15 is non-zero.
+    The key no longer depends on this. Keys are per-run and unsealed now, so a
+    failure here costs attestation, not access to data. Idempotent: a no-op once
+    PCR15 is non-zero.
     """
     try:
         P3DX_SDK.measure_enclave_manager_code_vtpm()
     except Exception as e:
         # Not fatal — the node still serves /enclave/state and reports itself
-        # unhealthy — but every unseal will fail until this succeeds, so say so
-        # loudly rather than failing mysteriously later.
+        # unhealthy — but the middleware will refuse to dispatch to it, because
+        # its PCR15 will not match the published reference values.
         print(f"CRITICAL: PCR15 measurement failed at startup: {e}. "
-              f"The sealed private key cannot be unsealed until this is fixed.")
+              f"The middleware will refuse to dispatch work to this node.")
 
 
 _bootstrap_measurement()
+
+
+def _bootstrap_ratls():
+    """Bring the RA-TLS listener up at startup if a certificate survived.
+
+    Deferred to a timer rather than run inline: `start_ratls_listener` is defined
+    further down this module. Restarting the *service* (as opposed to running a
+    fresh deploy) should still get the listener back, or the node would sit there
+    healthy-looking and unable to receive a key until someone deployed to it.
+    """
+    try:
+        start_ratls_listener()
+    except Exception as e:
+        print(f"RA-TLS listener could not start at boot: {e}", flush=True)
+
+
+threading.Timer(0.5, _bootstrap_ratls).start()
 
 
 state = {
@@ -231,43 +247,131 @@ def get_identity():
             "tee_id": os.getenv("TEE_ID", ""),
             "public_key_pem": public_key,
             "key_fingerprint": P3DX_SDK.public_key_fingerprint(),
-            "key_generation": P3DX_SDK.load_key_generation(),
             "maa_jwt": jwt_token,
             "jwt_exp": jwt_exp,
             "image_digest": image_digest,
             "job_id": state.get("job_id", ""),
             "step": state.get("step", 0),
-            "sealed": sealed_key.enabled(),
+            # The middleware no longer routes by key fingerprint — it attests at
+            # dispatch and takes the key from the token — but this still tells an
+            # operator whether the node is ready to receive one.
+            "ratls_port": ratls_server_port(),
         }), 200
     except Exception as e:
         print(f"Identity lookup failed: {e}")
         return jsonify({"title": "Error", "description": str(e)}), 500
 
 
-@app.route("/enclave/key/rotate", methods=["POST"])
-def rotate_key():
-    """Mint a new keypair and reseal it.
+# ── RA-TLS key delivery ───────────────────────────────────────────────────────
+#
+# /enclave/key/rotate used to live here. It is gone along with the rest of the
+# long-lived-key machinery: a key that exists for exactly one run has nothing to
+# rotate. What replaces it is the pair of handlers below, which are served *not*
+# by this Flask app but by the TLS listener in enclave/ratls_server.py, on a
+# certificate carrying this run's key.
+#
+# They are defined here because they need the job state this module owns.
 
-    Refused while a job is running: any data key already wrapped for the old
-    public key becomes undecryptable the moment this returns, and an in-flight
-    job would fail at its next decrypt with no useful error. The scheduler only
-    calls this on an idle enclave.
+#: Data keys deposited for jobs, in memory only. Never written to disk: the
+#: whole reason the middleware will hand these over in the clear is that they
+#: live inside an attested enclave for the length of one run.
+_job_keys = {}
+_job_keys_lock = threading.Lock()
+
+
+def _ratls_attest(nonce):
+    """Mint an attestation for a nonce derived from the caller's TLS channel."""
+    return P3DX_SDK.mint_attestation(nonce)
+
+
+def _ratls_receive_key(job_id, data_key, output_key):
+    """Accept a job's data key from the attested middleware."""
+    with _job_keys_lock:
+        _job_keys[job_id] = {"data_key": data_key, "output_key": output_key}
+    # Deliberately logs the job id and nothing else. There is exactly one thing
+    # in this function worth not printing.
+    print(f"RA-TLS: accepted data key for job {job_id}", flush=True)
+
+
+def get_job_key(job_id):
+    """The data key for a job, or None. For the pipeline to pick up."""
+    with _job_keys_lock:
+        return _job_keys.get(job_id)
+
+
+def drop_job_key(job_id):
+    """Forget a job's key once the run is done."""
+    with _job_keys_lock:
+        _job_keys.pop(job_id, None)
+
+
+#: The running listener, so a new deploy can replace it. A per-run key means a
+#: per-run certificate, and a listener still holding the previous run's
+#: certificate would present a key the current attestation does not name — the
+#: middleware would refuse it, correctly, and the node would look broken.
+_ratls_server = None
+_ratls_lock = threading.Lock()
+
+
+def ratls_server_port():
+    return ratls_server_module_port() if _ratls_server else 0
+
+
+def ratls_server_module_port():
+    from enclave import ratls_server
+    return ratls_server.PORT
+
+
+def start_ratls_listener():
+    """(Re)serve the RA-TLS endpoints on this run's certificate.
+
+    Called at startup and again after every deploy, because the certificate
+    changes with the keypair. Shutting the old one down first is not optional:
+    the port would otherwise stay bound by a listener serving a stale key.
     """
-    if is_app_running or 0 < state.get("step", 0) < 11:
-        return jsonify({
-            "title": "Busy",
-            "description": "Refusing to rotate keys while a job is running.",
-        }), 409
-    try:
-        fingerprint = P3DX_SDK.rotate_key_pair()
-    except Exception as e:
-        return jsonify({"title": "Rotation failed", "description": str(e)}), 500
-    # The old attestation quotes the old public key, so it is now misleading.
-    # Drop it; the scheduler re-attests on its next poll.
-    jwt_file_path = config.get_path('jwt_response')
-    if os.path.exists(jwt_file_path):
-        subprocess.run(["sudo", "rm", "-f", jwt_file_path], check=False, capture_output=True)
-    return jsonify({"status": "rotated", "key_fingerprint": fingerprint}), 200
+    global _ratls_server
+    from enclave import ratls_server
+
+    cert = os.path.join(config.paths.keys_dir, "tls_cert.pem")
+    key = config.get_path('private_key')
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        print("RA-TLS listener not started: no per-run certificate yet", flush=True)
+        return None
+
+    with _ratls_lock:
+        if _ratls_server is not None:
+            try:
+                _ratls_server.shutdown()
+                _ratls_server.server_close()
+            except Exception as e:
+                print(f"RA-TLS: could not stop the previous listener: {e}", flush=True)
+            _ratls_server = None
+        try:
+            _ratls_server = ratls_server.serve(
+                cert, key, _ratls_attest, _ratls_receive_key
+            )
+        except OSError as e:
+            # Worth being loud: without this listener the node cannot receive a
+            # key and every dispatch to it will fail with a connection error
+            # that looks like a network problem.
+            print(f"CRITICAL: RA-TLS listener failed to start: {e}", flush=True)
+        return _ratls_server
+
+
+@app.route("/enclave/ratls/reload", methods=["POST"])
+def reload_ratls():
+    """Restart the listener on the certificate just generated by a deploy.
+
+    Called by deploy_enclave.py, which runs as a separate process and so cannot
+    touch this one's listener directly. Refused from anywhere but this machine:
+    it is a control operation, and it would let a remote caller drop the node's
+    ability to receive keys.
+    """
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"title": "Forbidden",
+                        "description": "Host-internal endpoint."}), 403
+    server = start_ratls_listener()
+    return jsonify({"status": "listening" if server else "unavailable"}), 200
 
 
 @app.route("/enclave/jwt", methods=["GET"])

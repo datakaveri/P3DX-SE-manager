@@ -9,17 +9,17 @@ import shutil
 import re
 import hashlib
 import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
 import requests
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
 
 from lib.config import config
-from lib import sealed_key
 
 # Ensure Bundle directory is in path for decryption import
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -161,52 +161,6 @@ def _read_pcr15():
     return match.group(1).lower() if match else None
 
 
-def assert_pcr15_matches_code():
-    """Refuse to seal a key against a PCR15 that does not describe this code.
-
-    The trap this closes: `measure_enclave_manager_code_vtpm` skips extending
-    when PCR15 is already non-zero, because a PCR can only be extended, never
-    set. So after deploying new code and restarting only the *service*, PCR15
-    still holds the hash of the code that was running at the last boot. Sealing
-    then produces a key that works right up until the next reboot re-measures the
-    new code — at which point it is unrecoverable, with nothing to link the
-    failure back to the deploy that caused it.
-
-    Reboot after changing enclave code, before generating a key.
-    """
-    if not sealed_key.enabled():
-        return
-    actual = _read_pcr15()
-    if actual is None:
-        raise RuntimeError("could not read PCR15; refusing to seal a key blindly")
-    expected = _expected_pcr15(hash_enclave_manager_code(config.base_dir))
-    if actual != expected:
-        raise RuntimeError(
-            "PCR15 does not match this code's hash, so a key sealed now would "
-            "stop unsealing at the next reboot.\n"
-            f"  PCR15 reads : {actual}\n"
-            f"  code implies: {expected}\n"
-            "  Cause: enclave-manager code changed since this machine booted, and "
-            "a PCR cannot be re-set without a reboot.\n"
-            "  Fix: reboot this node, then generate the keypair."
-        )
-
-
-def keypair_exists():
-    """True if this enclave already has a usable keypair.
-
-    Sealed mode needs the encrypted private key and both TPM blobs; unsealed
-    (development) mode needs the PEM. In either case the public key must be
-    there too, since that is what the attestation payload carries.
-    """
-    if not os.path.exists(config.get_path('public_key')):
-        return False
-    if sealed_key.enabled():
-        return all(os.path.exists(config.get_path(name))
-                   for name in ('private_key_enc', 'kek_pub', 'kek_priv'))
-    return os.path.exists(config.get_path('private_key'))
-
-
 def public_key_fingerprint():
     """SHA-256 over the DER SubjectPublicKeyInfo, hex.
 
@@ -220,57 +174,33 @@ def public_key_fingerprint():
     return hashlib.sha256(base64.b64decode(body)).hexdigest()
 
 
-def load_key_generation():
-    """Metadata about the current keypair: when it was made, how many rotations
-    in. Used to decide whether a rotation is due."""
-    path = config.get_path('key_generation')
-    if not os.path.exists(path):
-        return {"generation": 0, "created_at": 0}
-    try:
-        with open(path) as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return {"generation": 0, "created_at": 0}
-
-
-def _save_key_generation(generation):
-    path = config.get_path('key_generation')
-    with open(path, "w") as fh:
-        json.dump({"generation": generation, "created_at": int(time.time())}, fh)
-    os.chmod(path, 0o600)
-
-
 def generate_and_save_key_pair(force=False):
-    """Create the enclave keypair, once.
+    """Mint a fresh keypair for this run, and a TLS certificate for it.
 
-    Previously this ran unconditionally on every deploy, and the deploy script
-    deleted keys/ first — so a key lived exactly one job. That cannot work with a
-    job queue: the browser wraps its data key for a named enclave public key
-    while the job sits waiting, and a deploy in between would silently invalidate
-    it. So the keypair now persists, and this is a no-op unless it is missing or
-    a rotation is explicitly requested.
+    **Ephemeral again, deliberately.** For one phase these keys were long-lived
+    and vTPM-sealed, because the browser had to wrap its data key for a specific
+    enclave before the scheduler had chosen one. Now the browser wraps for the
+    *middleware*, which re-delivers the key over RA-TLS to whichever enclave it
+    attests — so nothing outside this machine ever needs to name this key in
+    advance, and it can go back to living exactly one job.
 
-    The private key does not stay in the clear. It is written encrypted under a
-    KEK sealed to the vTPM against PCR15, so a copied disk is useless without
-    this machine's TPM. See lib/sealed_key.py for what that does and does not
-    protect against.
+    That is the stronger position. A key that exists only for one run cannot leak
+    a previous user's data if it is later compromised, needs no sealing, no
+    rotation endpoint, and no PCR15 policy that breaks on every code change. The
+    sealing machinery moved to the middleware, where there is one machine to
+    reason about instead of five.
+
+    `force` is retained for call-site compatibility and no longer means anything:
+    every call generates. The parameter is accepted rather than removed so an
+    older caller does not fail with a TypeError while the fleet is mid-rollout.
+
+    The certificate is self-signed over this same keypair, and that is the point:
+    the middleware checks the TLS certificate's SPKI against the public key
+    inside this enclave's attestation, so the certificate needs no CA and could
+    not usefully have one.
     """
     os.makedirs(config.paths.keys_dir, exist_ok=True)
     os.chmod(config.paths.keys_dir, 0o700)
-
-    if keypair_exists() and not force:
-        print(f"Reusing existing keypair (fingerprint {public_key_fingerprint()[:16]}...)")
-        return
-
-    if sealed_key.enabled() and not sealed_key.tpm_available():
-        raise RuntimeError(
-            "KEY_SEALING is on but the vTPM is unreachable — refusing to write a "
-            "long-lived private key in the clear. Set KEY_SEALING=off only for "
-            "development."
-        )
-
-    # Fail here, loudly, rather than at the next reboot when the key is gone.
-    assert_pcr15_matches_code()
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -300,56 +230,121 @@ def generate_and_save_key_pair(force=False):
         public_key_out.write(public_key)
     os.chmod(public_key_path, 0o644)
 
-    if sealed_key.enabled():
-        sealed_key.seal_private_key(
-            private_key_bytes,
-            config.get_path('kek_pub'),
-            config.get_path('kek_priv'),
-            config.get_path('private_key_enc'),
-        )
-        # Remove any plaintext PEM left by an older build or a previous
-        # development run — otherwise sealing is theatre.
-        legacy = config.get_path('private_key')
-        if os.path.exists(legacy):
-            os.unlink(legacy)
-            print("Removed legacy plaintext private_key.pem")
-        print("Private key sealed to the vTPM (PCR%s policy)" % sealed_key.POLICY_PCR)
-    else:
-        private_key_path = config.get_path('private_key')
-        fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "wb") as private_key_out:
-            private_key_out.write(private_key_bytes)
-        print("WARNING: KEY_SEALING=off — long-lived private key written IN THE "
-              "CLEAR. Development only.")
+    private_key_path = config.get_path('private_key')
+    fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "wb") as private_key_out:
+        private_key_out.write(private_key_bytes)
 
-    generation = load_key_generation().get("generation", 0) + (1 if force else 0)
-    _save_key_generation(generation)
-    print(f"Keypair ready (fingerprint {public_key_fingerprint()[:16]}...)")
+    # Clear out sealed artefacts from the long-lived-key phase. Left behind they
+    # are not merely clutter: `load_enclave_private_key_pem` would still prefer
+    # the sealed blob if sealing were ever re-enabled, and it holds a *different*
+    # key than the certificate now being served.
+    for stale in ('private_key_enc', 'kek_pub', 'kek_priv', 'key_generation'):
+        try:
+            path = config.get_path(stale)
+        except (KeyError, AttributeError):
+            continue
+        if os.path.exists(path):
+            os.unlink(path)
+
+    generate_tls_certificate(private_key)
+    print(f"Per-run keypair and TLS certificate ready "
+          f"(fingerprint {public_key_fingerprint()[:16]}...)")
+
+
+def generate_tls_certificate(private_key, days_valid=2):
+    """Self-signed certificate over the per-run key, for the RA-TLS listener.
+
+    Not a trust anchor and not trying to be. The middleware ignores the issuer,
+    the subject and the chain entirely, and checks only that the certificate's
+    SubjectPublicKeyInfo equals the public key inside this enclave's MAA token.
+    A CA could not help here even in principle: this key is minted inside the
+    enclave minutes before use and no CA has ever seen it.
+
+    Short-dated anyway, because a certificate outliving the key it describes is
+    a confusing artefact to find on a disk, and this one has no reason to live
+    past the run.
+    """
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, os.getenv("TEE_ID", "p3dx-enclave")),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SPIDEr processing enclave"),
+    ])
+
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        # Backdated a little: the middleware and the enclave are different
+        # machines, and a certificate that is not yet valid by a few seconds of
+        # clock skew fails a handshake for no real reason.
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=days_valid))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(private_key, hashes.SHA256())
+    )
+
+    cert_path = os.path.join(config.paths.keys_dir, "tls_cert.pem")
+    with open(cert_path, "wb") as fh:
+        fh.write(certificate.public_bytes(serialization.Encoding.PEM))
+    os.chmod(cert_path, 0o644)
+    return cert_path
 
 
 def load_enclave_private_key_pem():
-    """Return the private key PEM in memory. Never writes it to disk.
+    """Return the per-run private key PEM in memory.
 
-    Single entry point for everything that needs the private key — bundle
-    decryption and the direct-upload manager both go through here, so there is
-    one place that knows whether the key is sealed.
+    Single entry point for everything that needs the private key. No longer has
+    a sealed branch: the key lives one run, so there is nothing on this disk
+    worth sealing against a future boot — the middleware holds the long-lived
+    identity now.
     """
-    if sealed_key.enabled():
-        return sealed_key.load_private_key(
-            config.get_path('kek_pub'),
-            config.get_path('kek_priv'),
-            config.get_path('private_key_enc'),
-        )
     with open(config.get_path('private_key'), "rb") as fh:
         return fh.read()
 
 
-def rotate_key_pair():
-    """Mint a new keypair and reseal. Callers must ensure no job is running:
-    any data key already wrapped for the old public key becomes undecryptable,
-    and the middleware only learns that at its next registry poll."""
-    generate_and_save_key_pair(force=True)
-    return public_key_fingerprint()
+def reload_ratls_listener(address):
+    """Ask the enclave manager to rebind its TLS listener to the new certificate.
+
+    The deploy runs as its own process and cannot reach the manager's listener
+    object, so it asks over the loopback interface — the same way it already
+    reports state.
+
+    A failure here is reported and not raised: the deploy has genuinely produced
+    a valid keypair and can continue, and the manager also rebinds at startup.
+    Aborting a deploy over it would turn a recoverable condition into a failed
+    job.
+    """
+    url = urllib.parse.urljoin(address, "/enclave/ratls/reload")
+    try:
+        response = requests.post(url, timeout=30)
+        print(f"RA-TLS listener reload: {response.status_code} {response.text.strip()}",
+              flush=True)
+    except requests.RequestException as e:
+        print(f"WARNING: could not reload the RA-TLS listener: {e}. "
+              f"This node may not be able to receive a data key.", flush=True)
+
+
+def mint_attestation(nonce):
+    """Mint a fresh MAA token for a nonce the middleware chose.
+
+    This is the enclave side of the RA-TLS handshake. The nonce is
+    `sha256(channel binding)` of the TLS session the middleware is asking over,
+    so the resulting token is usable on that connection and no other.
+
+    Not cached, and it must never be. A cached token is by construction bound to
+    a channel that has already closed, so serving one would silently convert a
+    relay-resistant exchange into a replayable one — the exact property this
+    whole mechanism exists to provide.
+    """
+    save_nonce(nonce)
+    execute_guest_attestation()
+    return get_jwt_from_file()
 
 
 def pull_docker_image(app_name):
