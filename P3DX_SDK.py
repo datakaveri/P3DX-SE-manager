@@ -684,6 +684,23 @@ def report_job_complete(job_id, output_url=None, error=None):
         return
 
     payload = {"error": error} if error else {"output_url": output_url}
+
+    # Attach this run's status.json.
+    #
+    # It is the only structured description of what the pipeline produced —
+    # application, phase, outputs.dicom/image/direct, the k-anon parameter grid —
+    # and it lives ONLY on this machine, which the scheduler deallocates minutes
+    # after the job finishes. Callers used to fetch it from /enclave/status, which
+    # meant the result became unreachable the moment the enclave powered down and,
+    # worse, answered about whichever enclave happened to reply.
+    #
+    # Best effort: a run that produced no readable status still has a valid
+    # completion to report, and failing the callback over this would turn a
+    # finished job into a stalled one.
+    try:
+        payload["result"] = get_app_status()
+    except Exception as e:
+        print(f"Could not attach status to the completion callback: {e}", flush=True)
     try:
         resp = requests.post(
             f"{callback_url}/internal/jobs/{job_id}/callback",
@@ -1698,6 +1715,11 @@ def _read_stripped_manifest(output_dir):
     return manifest
 
 
+#: Suffix under which the container's own status.json is preserved when a
+#: direct-upload failure overwrites it.
+PIPELINE_STATUS_SUFFIX = ".pipeline"
+
+
 def _write_direct_error_status(description):
     """Surface a direct-upload failure through /enclave/status instead of
     leaving whatever the container last wrote there. The UI renders
@@ -1710,13 +1732,20 @@ def _write_direct_error_status(description):
     }
     status_path = config.get_path('status')
     os.makedirs(os.path.dirname(status_path), exist_ok=True)
-    # Same remove-then-create dance as _write_dicom_status: the container may
-    # have written a root-owned status.json into this directory already.
+
+    # Keep whatever the container wrote. Overwriting it in place destroys the
+    # only record of what the pipeline actually produced — which is exactly the
+    # evidence needed to explain a selection failure, and precisely when it is
+    # gone. Diagnosing the first workbook upload meant reconstructing the run
+    # from pipeline.log because this had already replaced the real status.
     try:
         if os.path.exists(status_path):
-            os.remove(status_path)
+            os.replace(status_path, status_path + PIPELINE_STATUS_SUFFIX)
     except OSError:
-        pass
+        try:
+            os.remove(status_path)
+        except OSError:
+            pass
     with open(status_path, "w") as f:
         json.dump(status_payload, f, indent=2)
     try:
@@ -1761,18 +1790,137 @@ def _select_tabular_output(output_dir, status_path):
     if not isinstance(status, dict):
         return None
 
+    # SKALD nests these under "outputs" alongside the run statistics; they are
+    # not top-level fields. Reading only the top level meant this function
+    # returned None for *every* run ever made, so the whole v3.2 selection was
+    # dead and the caller always fell through to "there must be exactly one
+    # file". CSV input survived that by writing exactly one file; the first
+    # workbook submitted produced generalized.csv AND generalized.xlsx and
+    # failed as ambiguous, having actually anonymised the data correctly.
+    #
+    # The top level is still searched, so a container that promotes these to
+    # the root — or an older one that already did — keeps working.
+    sections = []
+    outputs = status.get("outputs")
+    if isinstance(outputs, dict):
+        sections.append(outputs)
+    sections.append(status)
+
+    output_dir_real = os.path.realpath(output_dir)
     for key in ("restored_workbook_path", "format_matched_output_path", "final_output_path"):
-        raw = status.get(key)
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        candidate = os.path.join(output_dir, os.path.basename(raw.strip()))
-        resolved = os.path.realpath(candidate)
-        output_dir_real = os.path.realpath(output_dir)
-        if not resolved.startswith(output_dir_real + os.sep):
-            continue
-        if os.path.isfile(resolved):
-            return resolved
+        for section in sections:
+            raw = section.get(key)
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            candidate = os.path.join(output_dir, os.path.basename(raw.strip()))
+            resolved = os.path.realpath(candidate)
+            if not resolved.startswith(output_dir_real + os.sep):
+                continue
+            if os.path.isfile(resolved):
+                return resolved
     return None
+
+
+#: SKALD's tabular result, before the extension. It always writes the .csv and,
+#: for json/xlsx input, a format-matched sibling next to it.
+_TABULAR_OUTPUT_STEM = "generalized"
+
+#: The submitted format -> the extension SKALD writes for it. Keyed by what the
+#: upload sidecar records in `format`.
+_FORMAT_EXTENSIONS = {
+    "excel": ".xlsx", "xlsx": ".xlsx", "xls": ".xlsx",
+    "json": ".json", "csv": ".csv",
+}
+
+
+def resolve_tabular_output_path(output_dir, status_path, fmt):
+    """The one file a tabular direct-upload run should return.
+
+    Three sources, in order of how much they are trusted:
+
+      1. status.json, which names the result explicitly — SKALD >= v3.2 writes
+         generalized.csv AND a format-matched sibling for json/xlsx input, so
+         "the only file present" stopped being a usable answer.
+      2. the single remaining candidate, for pre-v3.2 output where status.json
+         names no path at all.
+      3. the submitted format, when several of SKALD's own siblings remain.
+
+    Raises RuntimeError, after recording the failure in status.json, when none
+    of the three can pick a file. Refusing is right: the wrong choice here means
+    uploading a file that was never anonymised.
+
+    Public and separate from `_upload_direct_output` because the wiring is the
+    part that broke. `_select_tabular_output` was correct in isolation and
+    simply never returned anything, and no test could see that while the
+    decision lived inline in a function that also encrypts and uploads.
+    """
+    output_path = _select_tabular_output(output_dir, status_path)
+    if output_path is not None:
+        return output_path
+
+    status_name = os.path.basename(status_path)
+    # free_text_artifact_names() matters twice over here: without it a free-text
+    # run leaves the staged CSV and audit JSON behind, so this count is 3 rather
+    # than 1 and every such run dies on the ambiguity check instead of returning
+    # its result.
+    #
+    # status_name + PIPELINE_STATUS_SUFFIX is the container's own status
+    # preserved by a previous failed attempt. The scheduler requeues onto
+    # another TEE and may land back here, so without this the retry would see
+    # one more "result file" than the first attempt did.
+    excluded = ({status_name, status_name + PIPELINE_STATUS_SUFFIX,
+                 "pipeline.log"} | _KNOWN_KEY_MATERIAL
+                | _KNOWN_DIAGNOSTIC_ARTIFACTS | free_text_artifact_names())
+    candidates = [
+        f for f in os.listdir(output_dir)
+        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
+    ]
+
+    if len(candidates) == 1:
+        return os.path.join(output_dir, candidates[0])
+
+    output_path = _select_by_submitted_format(output_dir, candidates, fmt)
+    if output_path is not None:
+        return output_path
+
+    message = (
+        f"Direct-upload output expects exactly one result file in "
+        f"{output_dir} (excluding {sorted(excluded)}), found "
+        f"{len(candidates)}: {candidates}. Narrow the pipeline's output "
+        "before uploading."
+    )
+    _write_direct_error_status(message)
+    raise RuntimeError(message)
+
+
+def _select_by_submitted_format(output_dir, candidates, fmt):
+    """Choose between SKALD's sibling outputs using the format that was sent.
+
+    A last resort for when status.json names no path at all. The rule is the
+    one the requester would expect and the one SKALD's own log states — "Input
+    was Excel, wrote matching output" — so someone who submits a workbook gets
+    a workbook back rather than a CSV.
+
+    Returns None unless the candidates are exactly SKALD's `generalized.*`
+    family, because outside that family there is no principled choice to make
+    and guessing would be worse than the explicit ambiguity error.
+    """
+    wanted = _FORMAT_EXTENSIONS.get((fmt or "").strip().lower())
+    if not wanted:
+        return None
+
+    siblings = {}
+    for name in candidates:
+        stem, ext = os.path.splitext(name)
+        if stem != _TABULAR_OUTPUT_STEM:
+            return None  # something unexpected is present; do not guess
+        siblings[ext.lower()] = name
+
+    chosen = siblings.get(wanted) or siblings.get(".csv")
+    if not chosen:
+        return None
+    path = os.path.join(output_dir, chosen)
+    return path if os.path.isfile(path) else None
 
 
 def _upload_direct_output(output_dir, urls):
@@ -1853,33 +2001,7 @@ def _upload_direct_output(output_dir, urls):
         output_path = deid_files[0]
         manifest = _read_stripped_manifest(output_dir)
     else:
-        # SKALD >= v3.2 writes generalized.csv AND a format-matched sibling for
-        # json/xlsx input, so status.json — not "the only file present" — is
-        # what identifies the result. The count check below still applies to
-        # pre-v3.2 output, where status.json names no path at all.
-        output_path = _select_tabular_output(output_dir, status_path)
-        if output_path is None:
-            status_name = os.path.basename(status_path)
-            # free_text_artifact_names() matters twice over here: without it a
-            # free-text run leaves the staged CSV and audit JSON behind, so
-            # this count is 3 rather than 1 and every such run dies on the
-            # ambiguity check below instead of returning its result.
-            excluded = ({status_name, "pipeline.log"} | _KNOWN_KEY_MATERIAL
-                        | _KNOWN_DIAGNOSTIC_ARTIFACTS | free_text_artifact_names())
-            candidates = [
-                f for f in os.listdir(output_dir)
-                if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
-            ]
-            if len(candidates) != 1:
-                message = (
-                    f"Direct-upload output expects exactly one result file in "
-                    f"{output_dir} (excluding {sorted(excluded)}), found "
-                    f"{len(candidates)}: {candidates}. Narrow the pipeline's output "
-                    "before uploading."
-                )
-                _write_direct_error_status(message)
-                raise RuntimeError(message)
-            output_path = os.path.join(output_dir, candidates[0])
+        output_path = resolve_tabular_output_path(output_dir, status_path, fmt)
         print(f"Direct-upload result selected: {os.path.basename(output_path)}")
 
     stem, _ = os.path.splitext(original_name)
