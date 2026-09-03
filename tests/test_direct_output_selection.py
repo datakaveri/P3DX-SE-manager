@@ -252,5 +252,111 @@ class TestTheContainerStatusIsPreserved(SelectionTestCase):
             self.assertEqual(json.load(fh)["outputs"]["total_records"], 7)
 
 
+class TestTwoPassKAnonPassOne(SelectionTestCase):
+    """Pass 1 of two-pass k-anon produces no result file on purpose.
+
+    It writes a parameter grid for the user to choose k from and stops. The
+    direct-upload finaliser used to demand exactly one result file, fail with
+    'found 0', and — via _write_direct_error_status — overwrite the grid with a
+    generic error before the completion callback could carry it to the UI. A
+    successful analysis was reported as a failure and the grid destroyed.
+    """
+
+    # A real pass-1 status.json, shape confirmed against a live enclave run.
+    PASS1_STATUS = {
+        "status": "success",
+        "phase": "awaiting_pass2",
+        "outputs": {
+            "pass": "pass1",
+            "k_optimal": 10,
+            "suppression_limit": 0.01,
+            "total_records": 10,
+            "parameter_grid": [
+                {"k": 5, "suppression_limit": 0.0, "best_node": [48, 374020],
+                 "dm_star": 100, "num_equivalence_classes": 1,
+                 "suppression_count": 0, "feasible": True},
+            ],
+        },
+    }
+
+    def _patch_status_path(self):
+        real_get_path = P3DX_SDK.config.get_path
+        P3DX_SDK.config.get_path = lambda key: (
+            self.status_path if key == "status" else real_get_path(key))
+        self.addCleanup(setattr, P3DX_SDK.config, "get_path", real_get_path)
+
+    def test_pass1_returns_none_without_uploading(self):
+        self.write_status(self.PASS1_STATUS)
+        self._patch_status_path()
+        # urls with an enclave upload blobUrl so we know the early return, not
+        # the blobUrl guard, is what stops it. If the pass-1 branch were absent
+        # this would proceed to meta parsing / finalize_output (a network call)
+        # rather than returning None.
+        result = P3DX_SDK._upload_direct_output(
+            self.dir, {"blobUrl": "enclave://upload/job-123"})
+        self.assertIsNone(result)
+
+    def test_pass1_leaves_the_grid_intact(self):
+        self.write_status(self.PASS1_STATUS)
+        self._patch_status_path()
+        P3DX_SDK._upload_direct_output(
+            self.dir, {"blobUrl": "enclave://upload/job-123"})
+
+        # status.json must NOT be overwritten to an error, and no .pipeline
+        # backup created — the grid is what the completion callback forwards.
+        with open(self.status_path) as fh:
+            after = json.load(fh)
+        self.assertEqual(after["phase"], "awaiting_pass2")
+        self.assertEqual(after["outputs"]["k_optimal"], 10)
+        self.assertFalse(
+            os.path.isfile(self.status_path + P3DX_SDK.PIPELINE_STATUS_SUFFIX),
+            "pass 1 must not trigger the error-status rewrite")
+
+    def test_a_real_error_status_still_refuses(self):
+        # The pass-1 branch must not swallow a genuine failure: an error status
+        # still raises rather than being mistaken for a no-file success.
+        self.write_status({"status": "error", "error": "boom"})
+        self._patch_status_path()
+        with self.assertRaises(RuntimeError):
+            P3DX_SDK._upload_direct_output(
+                self.dir, {"blobUrl": "enclave://upload/job-123"})
+
+
+class TestPipelineStatusInErrorMessage(SelectionTestCase):
+    """The 'found N' failure should name what the pipeline actually did, not
+    just the finaliser's file count."""
+
+    def test_error_status_is_surfaced(self):
+        self.write_status({"status": "error", "error": "SKALD crashed on column X"})
+        note = P3DX_SDK._describe_pipeline_status(self.status_path)
+        self.assertIn("SKALD crashed on column X", note)
+
+    def test_success_but_no_file_is_named(self):
+        self.write_status({"status": "success", "phase": "some_phase"})
+        note = P3DX_SDK._describe_pipeline_status(self.status_path)
+        self.assertIn("success", note)
+        self.assertIn("some_phase", note)
+        self.assertIn("no", note.lower())
+
+    def test_absent_status_falls_back_to_guidance(self):
+        note = P3DX_SDK._describe_pipeline_status(
+            os.path.join(self.dir, "does-not-exist.json"))
+        self.assertIn("Narrow the pipeline's output", note)
+
+    def test_the_full_message_embeds_the_pipeline_note(self):
+        # resolve_tabular_output_path with two ambiguous files and an error
+        # status must carry the pipeline's reason into the RuntimeError.
+        self.write("generalized.csv")
+        self.write("extra.csv")
+        self.write_status({"status": "error", "error": "downstream boom"})
+        real_get_path = P3DX_SDK.config.get_path
+        P3DX_SDK.config.get_path = lambda key: (
+            self.status_path if key == "status" else real_get_path(key))
+        self.addCleanup(setattr, P3DX_SDK.config, "get_path", real_get_path)
+        with self.assertRaises(RuntimeError) as ctx:
+            P3DX_SDK.resolve_tabular_output_path(self.dir, self.status_path, "csv")
+        self.assertIn("downstream boom", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

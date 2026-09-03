@@ -1886,11 +1886,41 @@ def resolve_tabular_output_path(output_dir, status_path, fmt):
     message = (
         f"Direct-upload output expects exactly one result file in "
         f"{output_dir} (excluding {sorted(excluded)}), found "
-        f"{len(candidates)}: {candidates}. Narrow the pipeline's output "
-        "before uploading."
+        f"{len(candidates)}: {candidates}. {_describe_pipeline_status(status_path)}"
     )
     _write_direct_error_status(message)
     raise RuntimeError(message)
+
+
+def _describe_pipeline_status(status_path):
+    """A one-line account of what the pipeline itself reported, for the
+    file-selection failure message.
+
+    The bare "found N result files" is the finaliser's symptom, not the cause —
+    diagnosing a real failure meant SSHing to a live enclave to read
+    status.json, because the message named the file count and nothing about what
+    the pipeline actually did. Folding the container's own status in makes the
+    error self-explanatory. Best-effort: never raises, and falls back to the
+    original guidance when status.json says nothing useful.
+    """
+    try:
+        with open(status_path) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        return "Narrow the pipeline's output before uploading."
+    if not isinstance(status, dict):
+        return "Narrow the pipeline's output before uploading."
+
+    if status.get("status") == "error":
+        reason = status.get("error") or status.get("description") or "no reason given"
+        return f"The pipeline reported an error: {reason}"
+    if status.get("status") == "success":
+        phase = status.get("phase")
+        phase_note = f" phase='{phase}'" if phase else ""
+        return (f"The pipeline reported status='success'{phase_note} but wrote no "
+                "result file — this is not a shape the direct-upload finaliser "
+                "knows how to return.")
+    return "Narrow the pipeline's output before uploading."
 
 
 def _select_by_submitted_format(output_dir, candidates, fmt):
@@ -1962,6 +1992,19 @@ def _upload_direct_output(output_dir, urls):
                 "Pipeline reported an error; refusing to treat remaining output "
                 f"files as a successful result: {existing_status.get('error')}"
             )
+
+        # Two-pass k-anon, pass 1: the pipeline deliberately produced no result
+        # file, only a parameter grid for the user to pick k from. That grid is
+        # already in status.json and reaches the UI through the completion
+        # callback's `result` (report_job_complete attaches get_app_status()).
+        # There is nothing to encrypt or upload; forcing this through the
+        # one-result-file check below turns a successful analysis into a failure
+        # and, via _write_direct_error_status, destroys the grid. Keying on the
+        # phase is precise — pass 2 writes generalized.csv and succeeds normally.
+        if isinstance(existing_status, dict) and existing_status.get("phase") == "awaiting_pass2":
+            print("Direct-upload: two-pass k-anon pass 1 — parameter grid only, "
+                  "nothing to upload", flush=True)
+            return None
 
     dataset_url = urls.get("blobUrl", "")
     prefix = "enclave://upload/"
