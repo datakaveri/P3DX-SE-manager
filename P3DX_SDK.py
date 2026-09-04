@@ -2043,6 +2043,22 @@ def _upload_direct_output(output_dir, urls):
             raise RuntimeError(message)
         output_path = deid_files[0]
         manifest = _read_stripped_manifest(output_dir)
+    elif fmt == "image":
+        # A direct image run used to fall into the tabular branch below, which
+        # looks for a `generalized.*` file and fails — the image pipeline writes
+        # a single redacted image, not a table. Select it the same way the blob
+        # image path does, so a direct skald_image run lands its result instead
+        # of erroring on a shape it was never going to produce.
+        image_files = _find_image_outputs(output_dir)
+        if len(image_files) != 1:
+            message = (
+                f"Direct-upload image output expects exactly one redacted image "
+                f"in {output_dir}, found {len(image_files)}: "
+                f"{[os.path.basename(p) for p in image_files]}."
+            )
+            _write_direct_error_status(message)
+            raise RuntimeError(message)
+        output_path = image_files[0]
     else:
         output_path = resolve_tabular_output_path(output_dir, status_path, fmt)
         print(f"Direct-upload result selected: {os.path.basename(output_path)}")
@@ -2052,6 +2068,11 @@ def _upload_direct_output(output_dir, urls):
     # uploaded, not the input's format: SKALD may fall back to generalized.csv
     # for a workbook submission (no format-matched file written), and labelling
     # those CSV bytes .xlsx would break the reader that opens them.
+    #
+    # Image types are folded in from the same _IMAGE_CONTENT_TYPES the blob path
+    # uses, and an image result keeps its own extension (.png stays .png) rather
+    # than taking the `_anonymised` tabular suffix — the redacted image is the
+    # result, and a viewer opens it by extension.
     ext = os.path.splitext(output_path)[1]
     content_type = {
         ".csv": "text/csv",
@@ -2059,8 +2080,12 @@ def _upload_direct_output(output_dir, urls):
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".xls": "application/vnd.ms-excel",
         ".dcm": "application/dicom",
+        **_IMAGE_CONTENT_TYPES,
     }.get(ext.lower(), "application/octet-stream")
-    filename = f"{stem or 'dataset'}_anonymised{ext}"
+    if fmt == "image":
+        filename = f"{stem or 'image'}_redacted{ext}"
+    else:
+        filename = f"{stem or 'dataset'}_anonymised{ext}"
 
     dp_config = load_config_file(config.get_path('config_file'))
     address = dp_config["enclaveManagerAddress"]

@@ -126,6 +126,52 @@ def _meta_path(scratch_dir, upload_id):
     return os.path.join(scratch_dir, f"{upload_id}.meta.json")
 
 
+def _content_matches_format(path, fmt):
+    """Does the reassembled file's magic actually match the declared format?
+
+    Checks the cheap, high-value signatures — the binary formats, where feeding
+    format X to parser Y is a real attack surface — and does a lenient text
+    check for csv/json. Returns True for an unrecognised format (already rejected
+    upstream) so this never becomes a second, stricter allow-list. Best-effort:
+    a read error is treated as a mismatch, not swallowed.
+    """
+    f = (fmt or "").lower()
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+            if f == "dicom":
+                fh.seek(128)
+                return fh.read(4) == b"DICM"
+    except OSError:
+        return False
+
+    if f == "excel":
+        # xlsx is a zip (PK\x03\x04); legacy xls is an OLE2 compound file.
+        return head[:4] == b"PK\x03\x04" or head[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+    if f == "image":
+        return (
+            head[:8] == b"\x89PNG\r\n\x1a\n"                 # PNG
+            or head[:3] == b"\xff\xd8\xff"                    # JPEG
+            or head[:2] == b"BM"                              # BMP
+            or head[:4] in (b"II*\x00", b"MM\x00*")           # TIFF (LE / BE)
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")  # WEBP
+        )
+    if f == "json":
+        return head.lstrip()[:1] in (b"{", b"[")
+    if f == "csv":
+        # Text, not binary. A zip or image carries NUL bytes a CSV never does.
+        if b"\x00" in head:
+            return False
+        for codec in ("utf-8", "latin-1"):
+            try:
+                head.decode(codec)
+                return True
+            except UnicodeDecodeError:
+                continue
+        return False
+    return True
+
+
 def stage_for_pipeline(user_sub, dataset_ref):
     """
     Verify the caller owns the referenced upload, then write a small metadata
@@ -156,9 +202,21 @@ def stage_for_pipeline(user_sub, dataset_ref):
     # avoids modifying enclave_direct_upload.py, which must stay byte-for-byte
     # identical to the checksummed reference copy.
     session = manager._sessions.get(upload_id)  # noqa: SLF001
+    fmt = session.fmt if session else "csv"
+
+    # Content must match the declared format before any parser sees the file.
+    #
+    # `format` is derived from a browser-supplied extension and now selects which
+    # pipeline parses the bytes — a `.csv` that is really a zip reaching a
+    # spreadsheet parser is the classic version of the attack this closes. Cheap:
+    # one read of the first 512 bytes, here at the single staging point, before
+    # the deploy subprocess starts. A mismatch rejects the bundle upload outright.
+    if not _content_matches_format(scratch_path, fmt):
+        raise UploadError(422, f"uploaded file does not match the declared format '{fmt}'")
+
     meta = {
         "filename": session.filename if session else "dataset",
-        "format": session.fmt if session else "csv",
+        "format": fmt,
     }
     meta_path = _meta_path(os.path.dirname(scratch_path), upload_id)
     with open(meta_path, "w") as f:

@@ -45,11 +45,18 @@ MB = 1024 * 1024
 CHUNK_SIZE = 64 * MB
 MAX_CHUNKS = 16
 MAX_CHUNK_BYTES = CHUNK_SIZE + 64          # ciphertext + GCM tag + slack
+# Per-format caps, enforced independently of the middleware — this is the side
+# that cannot be bypassed. csv/json/dicom carry the raised 300 MB cap; the
+# reassembled dataset and the output container both live in the /enclave/scratch
+# tmpfs, grown to 2 GiB in the same deploy to hold them. excel and image stay at
+# 25 MB, bounded by browser preview memory, not the transport. Keep this table
+# in step with the middleware's MAX_TOTAL_BYTES.
 MAX_TOTAL_BYTES_BY_FORMAT = {
-    "csv": 100 * MB,
-    "json": 100 * MB,
+    "csv": 300 * MB,
+    "json": 300 * MB,
     "excel": 25 * MB,
-    "dicom": 100 * MB,
+    "dicom": 300 * MB,
+    "image": 25 * MB,
 }
 MAX_CONCURRENT_SESSIONS_PER_USER = 1
 SESSION_TTL_SECONDS = 30 * 60
