@@ -2279,6 +2279,136 @@ def _upload_dicom_output(fetch_data, output_dir, container_base_url, urls):
     return primary_blob_url
 
 
+# DP k-means: two diagnostic plots the application drops alongside the main
+# tabular result, in output_dir, when the run's DP config included a k-means
+# query. Fixed basenames per the application's own contract, not user-chosen —
+# same "allow-list a known name" rationale as _DEID_OUTPUT_NAME above. Maps
+# each basename to the status.json field its uploaded URL is reported under.
+_KMEANS_PLOT_FILES = {
+    "item_level_kmeans_convergence.png": "plot_convergence",
+    "item_level_kmeans_wcss.png": "plot_wcss",
+}
+
+
+def _upload_kmeans_plots(fetch_data, output_dir, container_base_url):
+    """Encrypt and upload the k-means convergence/WCSS plots, if the DP
+    application wrote them, then report their bare blob URLs by merging them
+    into the `"query": "kmeans"` result object the application already wrote
+    into status.json.
+
+    Same key, same container format (write_output_container / SPIDROU1), same
+    upload target as the main tabular result — see _upload_dicom_output above.
+    The only differences: there are two extra files here, additional to (not
+    replacing) the main result, and each gets its OWN fresh random base_iv.
+
+    AES-GCM's keystream depends only on (key, nonce). Reusing the job's shared
+    output_base_iv across these containers would encrypt different plaintext
+    (chunk 0 of the convergence plot vs. chunk 0 of the WCSS plot vs. chunk 0
+    of the main result) under an identical (key, nonce) pair, leaking their
+    XOR and endangering the authentication key — so a fresh 12-byte base_iv is
+    generated per container and written into that container's own header; the
+    browser's reader already takes base_iv from the header rather than a
+    value fixed at job creation. The per-container run_id suffix
+    (":convergence" / ":wcss") is kept only as domain separation against one
+    container's chunks being spliced into another's — it is NOT what makes
+    reusing output_base_iv safe, and does not substitute for the fresh IV.
+
+    Best-effort in one specific way: a job with no k-means query has neither
+    file, and this is a silent no-op. A job that has the files but no
+    output_crypto (no per-run browser key on this run) can't satisfy "same
+    key as the main result", so it logs and skips rather than failing an
+    otherwise-successful pipeline run.
+    """
+    output_crypto = _get_output_crypto()
+    if output_crypto is None:
+        if any(os.path.isfile(os.path.join(output_dir, name)) for name in _KMEANS_PLOT_FILES):
+            print("k-means plot(s) present but no per-run output key on this "
+                  "job; skipping plot upload", flush=True)
+        return {}
+
+    plot_urls = {}
+    for basename, field in _KMEANS_PLOT_FILES.items():
+        src_path = os.path.join(output_dir, basename)
+        if not os.path.isfile(src_path):
+            continue
+
+        suffix = field[len("plot_"):]  # "plot_convergence" -> "convergence"
+        upload_name = basename + ".enc"
+        upload_src = f"/tmp/{upload_name}"
+        container_base_iv = os.urandom(12)  # fresh per container — see docstring
+        with open(upload_src, "wb") as f:
+            write_output_container(
+                src_path, f,
+                run_id=f"{output_crypto['run_id']}:{suffix}",
+                output_key=output_crypto["key"],
+                output_base_iv=container_base_iv,
+                filename=basename,
+                content_type="image/png",
+            )
+        blob_url = f"{container_base_url}/{upload_name}"
+        print(f"Uploading {upload_name} to {blob_url}...")
+        fetch_data.upload_blob(blob_url, upload_src)
+        os.remove(upload_src)
+        plot_urls[field] = blob_url
+
+    if plot_urls:
+        _patch_kmeans_status(plot_urls)
+    return plot_urls
+
+
+def _find_kmeans_query_result(node):
+    """Depth-first search for a dict with `"query": "kmeans"` anywhere in a
+    parsed status.json tree (arbitrarily nested dicts/lists) — the DP
+    application owns that shape, not this module, so this doesn't assume a
+    fixed path to it."""
+    if isinstance(node, dict):
+        if node.get("query") == "kmeans":
+            return node
+        for value in node.values():
+            found = _find_kmeans_query_result(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_kmeans_query_result(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _patch_kmeans_status(plot_urls):
+    """Merge plot_convergence/plot_wcss into the k-means result object already
+    in status.json, without disturbing anything else the DP application wrote
+    there (centroids, labels, etc. — that content is the application's, not
+    ours; see _upload_kmeans_plots)."""
+    status_path = config.get_path('status')
+    try:
+        with open(status_path) as f:
+            status = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Could not read status.json to attach k-means plot URLs: {e}", flush=True)
+        return
+
+    target = _find_kmeans_query_result(status)
+    if target is None:
+        print('No "query": "kmeans" object found in status.json; plot URLs '
+              "were uploaded but not attached", flush=True)
+        return
+    target.update(plot_urls)
+
+    try:
+        if os.path.exists(status_path):
+            os.remove(status_path)
+    except OSError:
+        pass
+    with open(status_path, "w") as f:
+        json.dump(status, f, indent=2)
+    try:
+        os.chmod(status_path, 0o644)
+    except OSError:
+        pass
+
+
 # skald-image writes exactly one redacted image into /app/output (mirrors
 # tee_output). Unlike the DICOM container's fixed after_deidentification.dcm
 # basename, the app package's own output-filename convention is not yet
@@ -2505,7 +2635,10 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     # They are intermediates: the staged CSV has had free text masked but never
     # went through k-anonymisation, so uploading it would ship every
     # quasi-identifier the run exists to treat. See free_text_artifact_names().
-    excluded = _KNOWN_KEY_MATERIAL | free_text_artifact_names()
+    # The k-means plots are uploaded separately below, each in its own
+    # SPIDROU1 container under a fresh IV (see _upload_kmeans_plots) — they
+    # must not also go through this loop's shared-Fernet-key path.
+    excluded = _KNOWN_KEY_MATERIAL | free_text_artifact_names() | set(_KMEANS_PLOT_FILES)
     output_files = [
         os.path.join(output_dir, f)
         for f in os.listdir(output_dir)
@@ -2549,6 +2682,8 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
             primary_blob_url = upload_blob_url
 
         os.remove(temp_encrypted)
+
+    _upload_kmeans_plots(fetch_data, output_dir, container_base_url)
 
     print("Output encryption and upload complete")
     return primary_blob_url
