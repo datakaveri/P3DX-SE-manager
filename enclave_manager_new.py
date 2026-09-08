@@ -1057,12 +1057,18 @@ def upload_finalize_output(upload_id):
     try:
         _require_loopback()
         body = request.get_json(silent=True) or {}
+        # output_key_check stays None when absent rather than becoming "":
+        # finalize_output treats None as "the caller couldn't tell us" and any
+        # string as a claim that must match, so coercing would turn a missing
+        # field into a guaranteed mismatch.
+        key_check = body.get("output_key_check")
         result = direct_upload.finalize_output(
             upload_id,
             output_path=str(body.get("output_path", "")),
             filename=str(body.get("filename", "output")),
             content_type=str(body.get("content_type", "application/octet-stream")),
             manifest=body.get("manifest"),
+            output_key_check=str(key_check) if key_check is not None else None,
         )
         return jsonify(result), 200
     except UploadError as e:

@@ -358,5 +358,161 @@ class TestPipelineStatusInErrorMessage(SelectionTestCase):
         self.assertIn("downstream boom", str(ctx.exception))
 
 
+class TestKmeansPlotsAreNotResultCandidates(SelectionTestCase):
+    """The two k-means plots are uploaded separately, each in its own
+    container, so they must never compete to be "the result file".
+
+    Left in the candidate list they broke a k-means run two ways over:
+    _select_by_submitted_format refuses to guess once a non-generalized.* name
+    is present, so even a run that wrote generalized.csv failed as ambiguous.
+    """
+
+    def test_the_plots_are_excluded(self):
+        for name in P3DX_SDK._KMEANS_PLOT_FILES:
+            self.write(name)
+        self.write("generalized.csv")
+        self.write("pipeline.log")
+        self.write_status({"status": "success"})
+        candidates, excluded = P3DX_SDK.tabular_output_candidates(
+            self.dir, self.status_path)
+        self.assertEqual(candidates, ["generalized.csv"])
+        self.assertTrue(set(P3DX_SDK._KMEANS_PLOT_FILES) <= excluded)
+
+    def test_a_kmeans_run_still_resolves_its_result(self):
+        for name in P3DX_SDK._KMEANS_PLOT_FILES:
+            self.write(name)
+        self.write("generalized.csv")
+        self.write_status({"status": "success"})
+        self.assertEqual(
+            P3DX_SDK.resolve_tabular_output_path(self.dir, self.status_path, "csv"),
+            os.path.join(self.dir, "generalized.csv"))
+
+
+class TestOutputKeyCheckValue(unittest.TestCase):
+    """The browser has ONE output key per job and no fallback, but the enclave
+    receives it twice by unrelated routes (the bundle, and upload/init). The
+    check value is what lets the two processes compare without either sending
+    the key."""
+
+    def test_the_same_key_gives_the_same_value(self):
+        key = b"k" * 32
+        self.assertEqual(P3DX_SDK.output_key_check_value(key),
+                         P3DX_SDK.output_key_check_value(key))
+
+    def test_a_different_key_gives_a_different_value(self):
+        self.assertNotEqual(P3DX_SDK.output_key_check_value(b"k" * 32),
+                            P3DX_SDK.output_key_check_value(b"j" * 32))
+
+    def test_it_is_not_the_key(self):
+        key = b"k" * 32
+        value = P3DX_SDK.output_key_check_value(key)
+        self.assertNotIn(key.hex(), value)
+        self.assertEqual(len(value), 32)
+
+
+class TestDpQueryRunWithNoResultFile(SelectionTestCase):
+    """A DP query's answer is the result object in status.json; there is no
+    anonymised file to hand back. Selection must not treat that as a failure —
+    doing so would destroy the answer, the same way pass-1 k-anon used to
+    fail — but the run must still reach finalize-output, because the k-means
+    plots need encrypting under a key only the manager process holds.
+    """
+
+    def setUp(self):
+        super().setUp()
+        real_get_path = P3DX_SDK.config.get_path
+        P3DX_SDK.config.get_path = lambda key: (
+            self.status_path if key == "status" else real_get_path(key))
+        self.addCleanup(setattr, P3DX_SDK.config, "get_path", real_get_path)
+
+        self.addCleanup(setattr, P3DX_SDK, "_output_crypto", P3DX_SDK._output_crypto)
+        P3DX_SDK._output_crypto = {
+            "key": b"o" * 32, "base_iv": b"i" * 12, "run_id": "job-1"}
+
+        self.addCleanup(setattr, P3DX_SDK, "load_config_file", P3DX_SDK.load_config_file)
+        P3DX_SDK.load_config_file = lambda *a, **k: {
+            "enclaveManagerAddress": "http://127.0.0.1:5000"}
+
+        self.posted = []
+        real_post = P3DX_SDK.requests.post
+
+        def fake_post(url, json=None, timeout=None):
+            self.posted.append((url, json))
+            return types.SimpleNamespace(
+                status_code=200, json=lambda: {"output_url": None},
+                text="")
+
+        P3DX_SDK.requests.post = fake_post
+        self.addCleanup(setattr, P3DX_SDK.requests, "post", real_post)
+
+    def run_it(self):
+        return P3DX_SDK._upload_direct_output(
+            self.dir, {"blobUrl": "enclave://upload/job-1"})
+
+    def test_it_finalises_without_a_result_file(self):
+        for name in P3DX_SDK._KMEANS_PLOT_FILES:
+            self.write(name)
+        self.write_status({"status": "success", "result": {"query": "kmeans", "k": 3}})
+
+        self.run_it()
+
+        self.assertEqual(len(self.posted), 1, "should still hand off to finalize-output")
+        _, payload = self.posted[0]
+        self.assertNotIn("output_path", payload, "there is no result file to name")
+
+    def test_the_result_survives(self):
+        for name in P3DX_SDK._KMEANS_PLOT_FILES:
+            self.write(name)
+        self.write_status({"status": "success", "result": {"query": "kmeans", "k": 3}})
+
+        self.run_it()
+
+        with open(self.status_path) as fh:
+            after = json.load(fh)
+        self.assertEqual(after["result"]["k"], 3)
+        self.assertFalse(
+            os.path.isfile(self.status_path + P3DX_SDK.PIPELINE_STATUS_SUFFIX),
+            "a DP query run must not trigger the error-status rewrite")
+
+    def test_the_key_check_is_sent(self):
+        self.write("generalized.csv")
+        self.write_status({"status": "success"})
+
+        self.run_it()
+
+        _, payload = self.posted[0]
+        self.assertEqual(payload["output_key_check"],
+                         P3DX_SDK.output_key_check_value(b"o" * 32))
+        self.assertNotIn("o" * 32, json.dumps(payload), "the key itself must not be sent")
+
+    def test_no_key_check_when_the_bundle_carried_no_key(self):
+        P3DX_SDK._output_crypto = None
+        self.write("generalized.csv")
+        self.write_status({"status": "success"})
+
+        self.run_it()
+
+        _, payload = self.posted[0]
+        self.assertNotIn("output_key_check", payload)
+
+    def test_a_missing_result_file_with_no_result_still_fails(self):
+        # The no-file branch must not swallow a genuine "produced nothing" run:
+        # without a result object there is nothing to report and this is a
+        # real failure.
+        self.write_status({"status": "success"})
+        with self.assertRaises(RuntimeError):
+            self.run_it()
+
+    def test_a_named_but_missing_result_file_still_fails(self):
+        # A container that names its result and doesn't write it is
+        # contradicting itself. Having a result object too must not turn that
+        # into a quiet query-only success.
+        self.write_status({"status": "success",
+                           "result": {"query": "kmeans"},
+                           "outputs": {"final_output_path": "./output/generalized.csv"}})
+        with self.assertRaises(RuntimeError):
+            self.run_it()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

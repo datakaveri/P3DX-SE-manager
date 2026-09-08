@@ -10,6 +10,7 @@ or expired upload session".
 """
 
 import glob
+import hmac
 import json
 import os
 import sys
@@ -257,8 +258,39 @@ def _output_blob_base_url():
     return f"https://{account}.blob.core.windows.net/{container}"
 
 
-def _write_direct_status(outputs_direct, manifest=None):
-    outputs = {"direct": outputs_direct}
+def _read_app_status(status_path):
+    """Whatever the pipeline application left in status.json, or {}."""
+    try:
+        with open(status_path) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return status if isinstance(status, dict) else {}
+
+
+def _write_direct_status(outputs_direct, manifest=None, plot_urls=None):
+    """Write the direct-upload status contract, KEEPING the application's own
+    query result.
+
+    This used to replace status.json wholesale, which discarded that result —
+    so a DP run over direct upload returned no result at all. The result
+    object is the entire answer to a DP query and lives nowhere else: the
+    encrypted output container holds an anonymised file, not the query's
+    numbers, and status.json is what report_job_complete forwards to the
+    scheduler. outputs.direct is kept alongside it; the DP view reads
+    result/results and ignores it.
+
+    Only the application's result keys are carried across, not its whole
+    status: `status`/`application`/`outputs` here describe THIS write, and
+    letting the container's values for those survive would leave the UI
+    reading a direct-upload run's shape off the application's own contract.
+    """
+    import P3DX_SDK  # deferred: same import cycle as get_manager() avoids
+
+    status_path = config.get_path('status')
+    outputs = {}
+    if outputs_direct is not None:
+        outputs["direct"] = outputs_direct
     if manifest is not None:
         outputs["manifest"] = manifest
     status_payload = {
@@ -266,7 +298,20 @@ def _write_direct_status(outputs_direct, manifest=None):
         "application": "direct-upload",
         "outputs": outputs,
     }
-    status_path = config.get_path('status')
+
+    app_status = _read_app_status(status_path)
+    for key in P3DX_SDK.APP_RESULT_KEYS:
+        if key in app_status:
+            status_payload[key] = app_status[key]
+
+    if plot_urls:
+        target = P3DX_SDK._find_kmeans_query_result(status_payload)  # noqa: SLF001
+        if target is None:
+            print('No "query": "kmeans" object found in the application\'s '
+                  "result; plot URLs were uploaded but not attached", flush=True)
+        else:
+            target.update(plot_urls)
+
     os.makedirs(os.path.dirname(status_path), exist_ok=True)
     # The SKALD container runs as root inside Docker and may have already
     # written a status.json of its own into this bind-mounted directory (e.g.
@@ -287,7 +332,8 @@ def _write_direct_status(outputs_direct, manifest=None):
         pass
 
 
-def finalize_output(upload_id, output_path, filename, content_type, manifest=None):
+def finalize_output(upload_id, output_path, filename, content_type, manifest=None,
+                    output_key_check=None):
     """
     Encrypt the pipeline's result under the browser-held output key and
     upload it — the one operation that MUST happen in this process, since
@@ -295,6 +341,18 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     backend-changes-direct-upload.md §2.6). The deploy_enclave.py subprocess
     that produced `output_path` calls this over loopback and receives only a
     completion result, never the key.
+
+    `output_path` is optional: a DP query run's answer is the result object in
+    status.json and it has no result file to hand back. Such a run still comes
+    through here, because its k-means plots do need encrypting under this
+    session's key, and to have the result object preserved by the status write.
+
+    `output_key_check` is the check value for the output key the CALLER
+    unwrapped from the bundle. The browser has exactly one output key per job
+    and no fallback, but the enclave receives it by two independent routes
+    (bundle vs. upload/init) — so if the caller supplies this, it must match
+    this session's key or nothing is encrypted at all. See
+    P3DX_SDK.output_key_check_value for why that can't just be assumed.
 
     `manifest` is the already-stripped DICOM manifest (tags_touched /
     redacted_regions summary) when the underlying dataset is DICOM, passed
@@ -310,35 +368,75 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     primitive (encrypt-then-upload-anything, decryptable by whoever holds
     this upload_id's output_key).
     """
+    import P3DX_SDK  # deferred: same import cycle as get_manager() avoids
+
     output_dir_real = os.path.realpath(config.paths.tee_output)
     resolved = os.path.realpath(output_path) if output_path else ""
-    if not resolved or not (resolved == output_dir_real or resolved.startswith(output_dir_real + os.sep)):
-        raise UploadError(400, "output_path must be inside the pipeline's output directory")
-    if not os.path.isfile(resolved):
-        raise UploadError(400, f"output_path does not exist: {output_path}")
+    if resolved:
+        if not (resolved == output_dir_real or resolved.startswith(output_dir_real + os.sep)):
+            raise UploadError(400, "output_path must be inside the pipeline's output directory")
+        if not os.path.isfile(resolved):
+            raise UploadError(400, f"output_path does not exist: {output_path}")
 
     manager = get_manager()
     output_key, output_base_iv = manager.output_key_for(upload_id)  # raises UploadError(404) if unknown
 
-    scratch_dir = _scratch_dir()
-    container_path = os.path.join(scratch_dir, f"{upload_id}.out.enc")
-    with open(container_path, "wb") as fh:
-        header = write_output_container(
-            resolved, fh,
-            run_id=upload_id, output_key=output_key, output_base_iv=output_base_iv,
-            filename=filename, content_type=content_type,
-        )
-    os.chmod(container_path, 0o600)
+    # Before anything is encrypted: if the caller told us which key it saw,
+    # it has to be this one. A mismatch means the browser's single stored key
+    # can decrypt at most one of the two, and it has no way to tell which —
+    # failing the run is strictly better than shipping output nobody can open.
+    if output_key_check is not None:
+        expected = P3DX_SDK.output_key_check_value(output_key)
+        # Compared as bytes: compare_digest rejects a str with non-ASCII in it,
+        # and this value arrives over HTTP.
+        if not hmac.compare_digest(str(output_key_check).encode("utf-8"),
+                                   expected.encode("ascii")):
+            raise UploadError(
+                409,
+                "The output key in this upload session does not match the one "
+                "the pipeline unwrapped from the bundle. Refusing to encrypt "
+                "output the browser could not decrypt.",
+            )
+    else:
+        print("finalize-output: no output key check supplied; using this "
+              "session's key unverified", flush=True)
 
+    scratch_dir = _scratch_dir()
     fetch_data = _get_fetch_data()
-    blob_url = f"{_output_blob_base_url()}/{upload_id}.enc"
-    try:
-        fetch_data.upload_blob(blob_url, container_path)
-    finally:
+    blob_base_url = _output_blob_base_url()
+
+    blob_url = None
+    header = None
+    if resolved:
+        container_path = os.path.join(scratch_dir, f"{upload_id}.out.enc")
+        with open(container_path, "wb") as fh:
+            header = write_output_container(
+                resolved, fh,
+                run_id=upload_id, output_key=output_key, output_base_iv=output_base_iv,
+                filename=filename, content_type=content_type,
+            )
+        os.chmod(container_path, 0o600)
+
+        blob_url = f"{blob_base_url}/{upload_id}.enc"
         try:
-            os.unlink(container_path)
-        except OSError:
-            pass
+            fetch_data.upload_blob(blob_url, container_path)
+        finally:
+            try:
+                os.unlink(container_path)
+            except OSError:
+                pass
+
+    # The k-means plots, under this same session key — the blob-input path does
+    # this in the deploy subprocess (P3DX_SDK._upload_kmeans_plots), which
+    # cannot work here because the key is only ever in this process's memory.
+    # Namespaced under the upload_id: the main container gets uniqueness from
+    # being named for it, whereas these keep their own fixed basenames and
+    # would otherwise collide across jobs in the shared output container.
+    # Staged in scratch (tmpfs) rather than /tmp, like the container above.
+    plot_urls = P3DX_SDK.write_kmeans_plot_containers(
+        fetch_data, config.paths.tee_output, f"{blob_base_url}/{upload_id}",
+        run_id=upload_id, output_key=output_key, staging_dir=scratch_dir,
+    )
 
     # The input scratch file is normally already gone (the subprocess deletes
     # it right after staging into tee_input_data — see Fetch_data/fetch_data.py).
@@ -347,11 +445,17 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     manager.release(upload_id)
 
     ttl_seconds = int(getattr(config.direct_upload, "output_ttl_seconds", 7200))
-    result = {
-        "outputBlobUrl": blob_url,
-        "filename": filename,
-        "bytes": header["total_bytes"],
-        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl_seconds)),
-    }
-    _write_direct_status(result, manifest=manifest)
-    return result
+    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl_seconds))
+    result = None
+    if blob_url is not None:
+        result = {
+            "outputBlobUrl": blob_url,
+            "filename": filename,
+            "bytes": header["total_bytes"],
+            "expires_at": expires_at,
+        }
+    _write_direct_status(result, manifest=manifest, plot_urls=plot_urls)
+
+    response = dict(result) if result else {"expires_at": expires_at}
+    response.update(plot_urls)
+    return response

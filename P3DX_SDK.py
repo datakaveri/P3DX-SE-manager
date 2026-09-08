@@ -8,6 +8,7 @@ import time
 import shutil
 import re
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1754,6 +1755,27 @@ def _write_direct_error_status(description):
         pass
 
 
+#: The keys by which the container names its own result file, most faithful to
+#: the submission first. See _select_tabular_output for the ordering rationale.
+_RESULT_PATH_KEYS = ("restored_workbook_path", "format_matched_output_path",
+                     "final_output_path")
+
+
+def _status_names_a_result_path(status):
+    """Does the container CLAIM to have written a result file? Independent of
+    whether that file exists — the gap between the two is a container bug, and
+    telling them apart is what keeps it from being read as a query-only run."""
+    if not isinstance(status, dict):
+        return False
+    sections = []
+    outputs = status.get("outputs")
+    if isinstance(outputs, dict):
+        sections.append(outputs)
+    sections.append(status)
+    return any(isinstance(section.get(key), str) and section[key].strip()
+               for key in _RESULT_PATH_KEYS for section in sections)
+
+
 def _select_tabular_output(output_dir, status_path):
     """Pick the anonymised artifact SKALD wants returned, per status.json.
 
@@ -1807,7 +1829,7 @@ def _select_tabular_output(output_dir, status_path):
     sections.append(status)
 
     output_dir_real = os.path.realpath(output_dir)
-    for key in ("restored_workbook_path", "format_matched_output_path", "final_output_path"):
+    for key in _RESULT_PATH_KEYS:
         for section in sections:
             raw = section.get(key)
             if not isinstance(raw, str) or not raw.strip():
@@ -1831,6 +1853,43 @@ _FORMAT_EXTENSIONS = {
     "excel": ".xlsx", "xlsx": ".xlsx", "xls": ".xlsx",
     "json": ".json", "csv": ".csv",
 }
+
+
+def tabular_output_candidates(output_dir, status_path):
+    """The files in output_dir that could be a tabular run's single result,
+    and the set that was excluded to get there.
+
+    Split out from resolve_tabular_output_path because _upload_direct_output
+    needs to know whether there are ZERO candidates *without* triggering that
+    function's failure path — which writes an error status over whatever the
+    pipeline reported. A DP query run legitimately has none.
+    """
+    status_name = os.path.basename(status_path)
+    # free_text_artifact_names() matters twice over here: without it a free-text
+    # run leaves the staged CSV and audit JSON behind, so this count is 3 rather
+    # than 1 and every such run dies on the ambiguity check instead of returning
+    # its result.
+    #
+    # status_name + PIPELINE_STATUS_SUFFIX is the container's own status
+    # preserved by a previous failed attempt. The scheduler requeues onto
+    # another TEE and may land back here, so without this the retry would see
+    # one more "result file" than the first attempt did.
+    #
+    # The k-means plots are excluded because they are uploaded separately, each
+    # in its own container (see write_kmeans_plot_containers) — and because
+    # leaving them in makes a k-means run unreturnable either way:
+    # _select_by_submitted_format refuses to guess once a non-generalized.*
+    # name is present, so their mere existence turned "one result file" into an
+    # ambiguity error.
+    excluded = ({status_name, status_name + PIPELINE_STATUS_SUFFIX,
+                 "pipeline.log"} | _KNOWN_KEY_MATERIAL
+                | _KNOWN_DIAGNOSTIC_ARTIFACTS | set(_KMEANS_PLOT_FILES)
+                | free_text_artifact_names())
+    candidates = [
+        f for f in os.listdir(output_dir)
+        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
+    ]
+    return candidates, excluded
 
 
 def resolve_tabular_output_path(output_dir, status_path, fmt):
@@ -1858,23 +1917,7 @@ def resolve_tabular_output_path(output_dir, status_path, fmt):
     if output_path is not None:
         return output_path
 
-    status_name = os.path.basename(status_path)
-    # free_text_artifact_names() matters twice over here: without it a free-text
-    # run leaves the staged CSV and audit JSON behind, so this count is 3 rather
-    # than 1 and every such run dies on the ambiguity check instead of returning
-    # its result.
-    #
-    # status_name + PIPELINE_STATUS_SUFFIX is the container's own status
-    # preserved by a previous failed attempt. The scheduler requeues onto
-    # another TEE and may land back here, so without this the retry would see
-    # one more "result file" than the first attempt did.
-    excluded = ({status_name, status_name + PIPELINE_STATUS_SUFFIX,
-                 "pipeline.log"} | _KNOWN_KEY_MATERIAL
-                | _KNOWN_DIAGNOSTIC_ARTIFACTS | free_text_artifact_names())
-    candidates = [
-        f for f in os.listdir(output_dir)
-        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
-    ]
+    candidates, excluded = tabular_output_candidates(output_dir, status_path)
 
     if len(candidates) == 1:
         return os.path.join(output_dir, candidates[0])
@@ -1953,6 +1996,22 @@ def _select_by_submitted_format(output_dir, candidates, fmt):
     return path if os.path.isfile(path) else None
 
 
+def _is_query_only_run(output_dir, status_path, status):
+    """True when the pipeline reported a query result and wrote no result
+    file — a DP query run, whose answer is the result object itself.
+
+    Deliberately narrow. A container that NAMES a result file in status.json
+    is not this shape even when the file is missing: that is the container
+    contradicting itself, and it stays the hard error it already was rather
+    than being quietly reported as a query-only success.
+    """
+    if _app_query_result(status) is None:
+        return False
+    if _status_names_a_result_path(status):
+        return False
+    return not tabular_output_candidates(output_dir, status_path)[0]
+
+
 def _upload_direct_output(output_dir, urls):
     """
     Direct-upload mode: hand the pipeline's single result file to the enclave
@@ -1979,8 +2038,16 @@ def _upload_direct_output(output_dir, urls):
     (pipeline.log, partial output, ...) as a valid result and overwriting
     that error with a fabricated "success" would be worse than the crash
     this replaces: it would silently misreport a failed run as succeeded.
+
+    A DP query run is the one shape with no result file at all: its answer IS
+    the JSON result object in status.json, and there is nothing anonymised to
+    hand back. That still goes through finalize-output rather than returning
+    early the way two-pass k-anon pass 1 does, because the k-means plots do
+    need encrypting and uploading and only the enclave manager process holds
+    the key for it.
     """
     status_path = config.get_path('status')
+    existing_status = None
     if os.path.isfile(status_path):
         try:
             with open(status_path) as f:
@@ -2059,6 +2126,13 @@ def _upload_direct_output(output_dir, urls):
             _write_direct_error_status(message)
             raise RuntimeError(message)
         output_path = image_files[0]
+    elif _is_query_only_run(output_dir, status_path, existing_status):
+        # The result object in status.json is the whole answer.
+        # resolve_tabular_output_path would fail this with "found 0" and, via
+        # _write_direct_error_status, destroy that answer — the same way pass-1
+        # k-anon used to fail. The plots below still need uploading.
+        output_path = None
+        print("Direct-upload: DP query result, no result file to upload", flush=True)
     else:
         output_path = resolve_tabular_output_path(output_dir, status_path, fmt)
         print(f"Direct-upload result selected: {os.path.basename(output_path)}")
@@ -2073,31 +2147,44 @@ def _upload_direct_output(output_dir, urls):
     # uses, and an image result keeps its own extension (.png stays .png) rather
     # than taking the `_anonymised` tabular suffix — the redacted image is the
     # result, and a viewer opens it by extension.
-    ext = os.path.splitext(output_path)[1]
-    content_type = {
-        ".csv": "text/csv",
-        ".json": "application/json",
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xls": "application/vnd.ms-excel",
-        ".dcm": "application/dicom",
-        **_IMAGE_CONTENT_TYPES,
-    }.get(ext.lower(), "application/octet-stream")
-    if fmt == "image":
-        filename = f"{stem or 'image'}_redacted{ext}"
-    else:
-        filename = f"{stem or 'dataset'}_anonymised{ext}"
+    if output_path is not None:
+        ext = os.path.splitext(output_path)[1]
+        content_type = {
+            ".csv": "text/csv",
+            ".json": "application/json",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xls": "application/vnd.ms-excel",
+            ".dcm": "application/dicom",
+            **_IMAGE_CONTENT_TYPES,
+        }.get(ext.lower(), "application/octet-stream")
+        if fmt == "image":
+            filename = f"{stem or 'image'}_redacted{ext}"
+        else:
+            filename = f"{stem or 'dataset'}_anonymised{ext}"
 
     dp_config = load_config_file(config.get_path('config_file'))
     address = dp_config["enclaveManagerAddress"]
     endpoint = urllib.parse.urljoin(address, f"/internal/upload/{upload_id}/finalize-output")
 
-    payload = {
-        "output_path": output_path,
-        "filename": filename,
-        "content_type": content_type,
-    }
+    payload = {}
+    if output_path is not None:
+        payload.update({
+            "output_path": output_path,
+            "filename": filename,
+            "content_type": content_type,
+        })
     if manifest is not None:
         payload["manifest"] = manifest
+
+    # Let the manager check its session's output key against the one this
+    # process unwrapped from the bundle, before it encrypts anything under
+    # either. The check value is not the key — see output_key_check_value, and
+    # §2.6 on why the key itself never crosses this boundary. Absent when the
+    # bundle carried no per-run key (older UI), in which case there is nothing
+    # to compare and the session's key stands alone.
+    output_crypto = _get_output_crypto()
+    if output_crypto is not None:
+        payload["output_key_check"] = output_key_check_value(output_crypto["key"])
 
     print(f"Handing off output to enclave manager for encryption: {endpoint}")
     response = requests.post(endpoint, json=payload, timeout=60)
@@ -2289,17 +2376,67 @@ _KMEANS_PLOT_FILES = {
     "item_level_kmeans_wcss.png": "plot_wcss",
 }
 
+#: Where the pipeline application reports a query result (a DP k-means/mean/
+#: histogram answer, as opposed to an anonymised file). The UI reads a DP
+#: result from these keys, so they are what has to survive a status write.
+APP_RESULT_KEYS = ("result", "results")
 
-def _upload_kmeans_plots(fetch_data, output_dir, container_base_url):
-    """Encrypt and upload the k-means convergence/WCSS plots, if the DP
-    application wrote them, then report their bare blob URLs by merging them
-    into the `"query": "kmeans"` result object the application already wrote
-    into status.json.
 
-    Same key, same container format (write_output_container / SPIDROU1), same
-    upload target as the main tabular result — see _upload_dicom_output above.
-    The only differences: there are two extra files here, additional to (not
-    replacing) the main result, and each gets its OWN fresh random base_iv.
+def _app_query_result(status):
+    """The query result object the application reported, or None. Takes an
+    already-parsed status dict so callers that read status.json for other
+    reasons don't read it twice."""
+    if not isinstance(status, dict):
+        return None
+    for key in APP_RESULT_KEYS:
+        value = status.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+#: Domain-separation label for output_key_check_value(). Fixed forever: it is
+#: part of the value's definition, and both processes must derive the same one.
+_OUTPUT_KEY_CHECK_LABEL = b"P3DX output key check v1"
+
+
+def output_key_check_value(output_key):
+    """A value that proves two processes hold the same output key, without
+    either of them sending the key.
+
+    There is exactly ONE output key per job on the browser side: it is
+    generated once, filed in IndexedDB under the job id, and the decrypt hook
+    has no second key to fall back on. But the enclave receives it twice, by
+    two routes that nothing here ties together — the bundle's
+    outputWrappedKey, unwrapped in the deploy subprocess (see
+    decrypt_bundle_tee), and POST /enclave/upload/init's output_wrapped_key,
+    unwrapped into the UploadManager session in the enclave manager process.
+    Whether those carry the same bytes depends on the middleware forwarding
+    one key to both surfaces, which cannot be verified from inside the
+    enclave. If they ever diverge the run still "succeeds" and the user gets
+    output they can never decrypt, with no recourse — so the two are compared
+    at finalize time instead of assumed equal.
+
+    HMAC over a fixed label rather than a bare digest of the key: a key check
+    value is a standard construction for exactly this, and it means the thing
+    crossing the process boundary is not a hash of a secret. Truncated to 32
+    hex chars — this only ever has to detect a mismatch, not resist collision
+    search by someone who could already choose keys.
+    """
+    return hmac.new(output_key, _OUTPUT_KEY_CHECK_LABEL, hashlib.sha256).hexdigest()[:32]
+
+
+def write_kmeans_plot_containers(fetch_data, output_dir, container_base_url, *,
+                                 run_id, output_key, staging_dir="/tmp"):
+    """Encrypt each k-means plot the DP application wrote into its OWN
+    SPIDROU1 container and upload it. Returns {status.json field: bare blob
+    URL} for whichever plots were present — a job with no k-means query has
+    neither file, and this is a silent no-op.
+
+    Same key, same container format (write_output_container), same upload
+    target as the run's main result — see _upload_dicom_output above. The only
+    differences: there are two extra files here, additional to (not replacing)
+    the main result, and each gets its own fresh random base_iv.
 
     AES-GCM's keystream depends only on (key, nonce). Reusing the job's shared
     output_base_iv across these containers would encrypt different plaintext
@@ -2313,19 +2450,14 @@ def _upload_kmeans_plots(fetch_data, output_dir, container_base_url):
     container's chunks being spliced into another's — it is NOT what makes
     reusing output_base_iv safe, and does not substitute for the fresh IV.
 
-    Best-effort in one specific way: a job with no k-means query has neither
-    file, and this is a silent no-op. A job that has the files but no
-    output_crypto (no per-run browser key on this run) can't satisfy "same
-    key as the main result", so it logs and skips rather than failing an
-    otherwise-successful pipeline run.
+    Takes `run_id`/`output_key` explicitly rather than reading _output_crypto,
+    because the two ingest paths hold the job's output key in different
+    processes: the blob-input path in this subprocess (see _upload_kmeans_plots
+    below), the direct-upload path only inside the enclave manager's
+    UploadManager session (see lib/direct_upload.finalize_output, which checks
+    the two agree before using either). Both call this, so one browser reader
+    decrypts byte-identical containers either way.
     """
-    output_crypto = _get_output_crypto()
-    if output_crypto is None:
-        if any(os.path.isfile(os.path.join(output_dir, name)) for name in _KMEANS_PLOT_FILES):
-            print("k-means plot(s) present but no per-run output key on this "
-                  "job; skipping plot upload", flush=True)
-        return {}
-
     plot_urls = {}
     for basename, field in _KMEANS_PLOT_FILES.items():
         src_path = os.path.join(output_dir, basename)
@@ -2334,23 +2466,57 @@ def _upload_kmeans_plots(fetch_data, output_dir, container_base_url):
 
         suffix = field[len("plot_"):]  # "plot_convergence" -> "convergence"
         upload_name = basename + ".enc"
-        upload_src = f"/tmp/{upload_name}"
+        staged = os.path.join(staging_dir, upload_name)
         container_base_iv = os.urandom(12)  # fresh per container — see docstring
-        with open(upload_src, "wb") as f:
+        with open(staged, "wb") as f:
             write_output_container(
                 src_path, f,
-                run_id=f"{output_crypto['run_id']}:{suffix}",
-                output_key=output_crypto["key"],
+                run_id=f"{run_id}:{suffix}",
+                output_key=output_key,
                 output_base_iv=container_base_iv,
                 filename=basename,
                 content_type="image/png",
             )
+        try:
+            os.chmod(staged, 0o600)
+        except OSError:
+            pass
+
         blob_url = f"{container_base_url}/{upload_name}"
-        print(f"Uploading {upload_name} to {blob_url}...")
-        fetch_data.upload_blob(blob_url, upload_src)
-        os.remove(upload_src)
+        print(f"Uploading {upload_name} to {blob_url}...", flush=True)
+        try:
+            fetch_data.upload_blob(blob_url, staged)
+        finally:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
         plot_urls[field] = blob_url
 
+    return plot_urls
+
+
+def _upload_kmeans_plots(fetch_data, output_dir, container_base_url):
+    """The blob-input path's k-means plot upload: encrypt and upload the plots
+    under this run's browser-held output key, then report their bare blob URLs
+    by merging them into the `"query": "kmeans"` result object the DP
+    application already wrote into status.json.
+
+    A job whose plots exist but which has no output_crypto (no per-run browser
+    key on this run) can't satisfy "same key as the main result", so it logs
+    and skips rather than failing an otherwise-successful pipeline run.
+    """
+    output_crypto = _get_output_crypto()
+    if output_crypto is None:
+        if any(os.path.isfile(os.path.join(output_dir, name)) for name in _KMEANS_PLOT_FILES):
+            print("k-means plot(s) present but no per-run output key on this "
+                  "job; skipping plot upload", flush=True)
+        return {}
+
+    plot_urls = write_kmeans_plot_containers(
+        fetch_data, output_dir, container_base_url,
+        run_id=output_crypto["run_id"], output_key=output_crypto["key"],
+    )
     if plot_urls:
         _patch_kmeans_status(plot_urls)
     return plot_urls
