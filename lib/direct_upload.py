@@ -25,6 +25,7 @@ from enclave.enclave_direct_upload import (
     UploadError,
     write_output_container,
 )
+from lib import folder_bundle
 
 _lock = threading.Lock()
 _manager = None
@@ -59,7 +60,7 @@ def _sweep_stray_scratch_files(scratch_dir):
     it has no way to discover files left behind by a process that no longer
     exists.
     """
-    for pattern in ("*.bin", "*.meta.json", "*.out.enc"):
+    for pattern in ("*.bin", "*.meta.json", "*.out.enc", "*.out.tar"):
         for stray in glob.glob(os.path.join(scratch_dir, pattern)):
             try:
                 os.unlink(stray)
@@ -127,6 +128,10 @@ def _meta_path(scratch_dir, upload_id):
     return os.path.join(scratch_dir, f"{upload_id}.meta.json")
 
 
+#: How much of a file the content sniff looks at. DICOM's `DICM` sits at 128.
+SNIFF_BYTES = 512
+
+
 def _content_matches_format(path, fmt):
     """Does the reassembled file's magic actually match the declared format?
 
@@ -136,16 +141,21 @@ def _content_matches_format(path, fmt):
     upstream) so this never becomes a second, stricter allow-list. Best-effort:
     a read error is treated as a mismatch, not swallowed.
     """
-    f = (fmt or "").lower()
     try:
         with open(path, "rb") as fh:
-            head = fh.read(512)
-            if f == "dicom":
-                fh.seek(128)
-                return fh.read(4) == b"DICM"
+            head = fh.read(SNIFF_BYTES)
     except OSError:
         return False
+    return head_matches_format(head, fmt)
 
+
+def head_matches_format(head, fmt):
+    """The sniff behind _content_matches_format, on the first SNIFF_BYTES of a
+    file. Split out so a folder bundle can run it on every member without
+    extracting any of them to disk."""
+    f = (fmt or "").lower()
+    if f == "dicom":
+        return head[128:132] == b"DICM"
     if f == "excel":
         # xlsx is a zip (PK\x03\x04); legacy xls is an OLE2 compound file.
         return head[:4] == b"PK\x03\x04" or head[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
@@ -173,7 +183,7 @@ def _content_matches_format(path, fmt):
     return True
 
 
-def stage_for_pipeline(user_sub, dataset_ref):
+def stage_for_pipeline(user_sub, dataset_ref, application=None):
     """
     Verify the caller owns the referenced upload, then write a small metadata
     sidecar (original filename, format) next to the scratch file.
@@ -192,6 +202,13 @@ def stage_for_pipeline(user_sub, dataset_ref):
 
     Raises UploadError if the caller does not own the session or it has not
     finished uploading — the bundle upload should be rejected outright.
+
+    A folder upload (`<folder>.tar` with the ustar magic) is detected and its
+    whole archive validated here too — every member's path, type, size and
+    content — so a bad archive fails the job before the subprocess starts and
+    before any parser sees a byte of it. `application` is the job's
+    application as far as this process knows it (see
+    P3DX_SDK.application_from_compose_url); a DP job may not carry a folder.
     """
     manager = get_manager()
     scratch_path = manager.resolve_dataset_ref(user_sub, dataset_ref)  # ownership + completed check
@@ -212,13 +229,25 @@ def stage_for_pipeline(user_sub, dataset_ref):
     # spreadsheet parser is the classic version of the attack this closes. Cheap:
     # one read of the first 512 bytes, here at the single staging point, before
     # the deploy subprocess starts. A mismatch rejects the bundle upload outright.
-    if not _content_matches_format(scratch_path, fmt):
+    filename = session.filename if session else "dataset"
+    try:
+        is_folder = folder_bundle.detect(filename, scratch_path, fmt)
+        if is_folder:
+            if application == "dp":
+                raise folder_bundle.FolderError(folder_bundle.DP_REJECTION)
+            archive = folder_bundle.validate_archive(scratch_path, fmt, head_matches_format)
+    except folder_bundle.FolderError as e:
+        raise UploadError(422, str(e)) from None
+
+    if not is_folder and not _content_matches_format(scratch_path, fmt):
         raise UploadError(422, f"uploaded file does not match the declared format '{fmt}'")
 
     meta = {
-        "filename": session.filename if session else "dataset",
+        "filename": filename,
         "format": fmt,
     }
+    if is_folder:
+        meta["folder"] = {"mode": archive.mode, "files_total": archive.files_total}
     meta_path = _meta_path(os.path.dirname(scratch_path), upload_id)
     with open(meta_path, "w") as f:
         json.dump(meta, f)
@@ -268,7 +297,7 @@ def _read_app_status(status_path):
     return status if isinstance(status, dict) else {}
 
 
-def _write_direct_status(outputs_direct, manifest=None, plot_urls=None):
+def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=None):
     """Write the direct-upload status contract, KEEPING the application's own
     query result.
 
@@ -293,6 +322,10 @@ def _write_direct_status(outputs_direct, manifest=None, plot_urls=None):
         outputs["direct"] = outputs_direct
     if manifest is not None:
         outputs["manifest"] = manifest
+    if folder is not None:
+        # A folder run: how many files went in and, per file, how many came
+        # out. Sits beside outputs.direct, which stays exactly as for one file.
+        outputs["folder"] = folder
     status_payload = {
         "status": "success",
         "application": "direct-upload",
@@ -332,8 +365,22 @@ def _write_direct_status(outputs_direct, manifest=None, plot_urls=None):
         pass
 
 
+def _sanitise_folder_status(folder):
+    """Keep only the counts outputs.folder is specified to carry. It arrives
+    over the loopback handoff, so nothing else in it is passed on to status."""
+    if not isinstance(folder, dict) or folder.get("mode") not in ("joint", "per_file"):
+        return None
+    keys = ("files_total", "records_in") if folder["mode"] == "joint" else (
+        "files_total", "files_succeeded", "files_failed")
+    out = {"mode": folder["mode"]}
+    for key in keys:
+        value = folder.get(key)
+        out[key] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return out
+
+
 def finalize_output(upload_id, output_path, filename, content_type, manifest=None,
-                    output_key_check=None):
+                    output_key_check=None, folder=None):
     """
     Encrypt the pipeline's result under the browser-held output key and
     upload it — the one operation that MUST happen in this process, since
@@ -356,7 +403,9 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
 
     `manifest` is the already-stripped DICOM manifest (tags_touched /
     redacted_regions summary) when the underlying dataset is DICOM, passed
-    straight through from P3DX_SDK._upload_direct_output. It carries no PHI
+    straight through from P3DX_SDK._upload_direct_output. `folder` is the
+    outputs.folder block for a folder upload (lib/folder_bundle.folder_status),
+    counts only. The manifest carries no PHI
     of its own (see _read_stripped_manifest), so it's safe to fold into the
     status payload verbatim; without it the DICOM output UI panel that reads
     that summary would have nothing to show for a direct-mode run.
@@ -454,7 +503,8 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
             "bytes": header["total_bytes"],
             "expires_at": expires_at,
         }
-    _write_direct_status(result, manifest=manifest, plot_urls=plot_urls)
+    _write_direct_status(result, manifest=manifest, plot_urls=plot_urls,
+                         folder=_sanitise_folder_status(folder))
 
     response = dict(result) if result else {"expires_at": expires_at}
     response.update(plot_urls)

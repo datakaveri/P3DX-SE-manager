@@ -16,3 +16,4 @@ PyYAML>=6.0
 requests>=2.31.0
 Flask-CORS>=4.0.0
 immudb-py>=1.4.0
+openpyxl>=3.1  # Excel folder uploads only (lib/folder_bundle.py)

@@ -130,6 +130,12 @@ def deploy_enclave():
     compose_url = content.get("compose_url")
     job_id = str(content.get("job_id", "") or "")
 
+    # Remembered for the bundle upload that follows: the compose URL is the
+    # only thing this process is told about the job's application, and a DP
+    # job must not be allowed a folder upload (see stage_for_pipeline).
+    global current_compose_url
+    current_compose_url = compose_url
+
     if not compose_url:
         return jsonify({
             "title": "Error",
@@ -179,6 +185,9 @@ def deploy_enclave():
 
 
 stored_bundle = None
+
+# compose_url of the most recent /enclave/deploy; see deploy_enclave().
+current_compose_url = None
 
 @app.route("/enclave/jwt", methods=["POST"])
 def receive_jwt():
@@ -610,7 +619,10 @@ def upload_encrypted_bundle():
                     "description": "Missing authenticated caller identity"
                 }), 401
             try:
-                direct_upload.stage_for_pipeline(sub, dataset_ref)
+                direct_upload.stage_for_pipeline(
+                    sub, dataset_ref,
+                    application=P3DX_SDK.application_from_compose_url(current_compose_url),
+                )
             except UploadError as e:
                 return jsonify({"title": "Error", "description": e.description}), e.status
 
@@ -1069,6 +1081,7 @@ def upload_finalize_output(upload_id):
             content_type=str(body.get("content_type", "application/octet-stream")),
             manifest=body.get("manifest"),
             output_key_check=str(key_check) if key_check is not None else None,
+            folder=body.get("folder"),
         )
         return jsonify(result), 200
     except UploadError as e:

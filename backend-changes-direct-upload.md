@@ -292,6 +292,22 @@ At D = 100 MB that is ~3.4 GiB — comfortable. **Memory is not the constraint; 
 
 Read the chunk body into a single preallocated buffer rather than `request.get_data()` to keep the in-flight cost at 2× rather than 3×.
 
+### 2.9 Folder uploads
+
+A folder arrives as one uncompressed POSIX tar named `<folder>.tar`, through the transport above with nothing changed. `format` is the **member** format (never `tar`). Code: `lib/folder_bundle.py`.
+
+| Step | Where | What |
+|---|---|---|
+| Cap | `/upload/init` | A `.tar` name is checked against `MAX_FOLDER_BYTES` (300 MB) whatever the format, not the per-format cap. `MAX_FOLDER_BYTES` / `MAX_FOLDER_FILES` live in `enclave_direct_upload.py` and must match the UI's `maxFolderBytes` / `maxFolderFiles` and the middleware. |
+| Detect + validate | bundle upload (`stage_for_pipeline`) | Folder = `.tar` name **and** `ustar` at offset 257. Every member is walked once: regular files only (pax `x` headers allowed, GNU long names not), safe unique paths, ≤ 10,000 members, per-member cap, ≤ 300 MB total, and the single-file content sniff on every member. Any failure rejects the bundle (422) before a parser runs. A DP job with a folder is rejected here too. |
+| csv / json / excel | step 9 (`fetch_data`) | **Joint.** Members are combined into one input file of the member format, rows shuffled with `secrets.SystemRandom`, and SKALD runs once. JSON: a top-level object is one record. Excel: each workbook is merged as SKALD merges one workbook, then stacked into a single sheet. Fails the job on an unreadable member, a column the config never names, a record missing a quasi-identifier, or a non-numeric value in a numerical QI. |
+| dicom / image | step 10 (`run_docker_containers`) | **Per file.** One member at a time is staged, the application runs, its output is appended to `<folder>_anonymised.tar` in scratch, and data/ and output/ are cleared. A failed member is left out and listed in `_manifest.json`. |
+| Status | finalize-output | `outputs.direct` is unchanged; `outputs.folder` adds `mode`, `files_total`, and `records_in` (joint) or `files_succeeded` / `files_failed` (per file). |
+
+Peak scratch measured at ~300 MB: 290 MB joint (the bundle only), 576 MB per file (bundle + output tar).
+
+Known gap: per-file runs share nothing between members. With SKALD-DICOM's default policy the same `PatientID` in two files comes out with **different** hashes, because each run starts with a fresh keystore (recorded by `tests/test_folder_upload.py::DicomConsistency`). Fixing that needs changes in the DICOM and image applications.
+
 ---
 
 ## 3. What the frontend already does

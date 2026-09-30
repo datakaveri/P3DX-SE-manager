@@ -183,6 +183,10 @@ def _stage_direct_upload_input(dataset_url, output_dir, output_format):
     meta = _du.read_staged_meta(scratch_dir, upload_id)
     original_name = meta.get("filename") or "dataset"
     fmt = meta.get("format") or output_format
+
+    if isinstance(meta.get("folder"), dict):
+        _stage_folder_input(scratch_path, scratch_dir, upload_id, meta, fmt, output_dir)
+        return
     stem, orig_ext = os.path.splitext(original_name)
     ext = _FORMAT_EXTENSIONS.get(fmt, orig_ext or ".dat")
     filename = (stem or "dataset") + ext
@@ -199,6 +203,57 @@ def _stage_direct_upload_input(dataset_url, output_dir, output_format):
     os.remove(scratch_path)
 
     print(f"Direct-upload dataset staged: {scratch_path} -> {dest_path}")
+
+
+def _stage_folder_input(scratch_path, scratch_dir, upload_id, meta, fmt, output_dir):
+    """A folder upload (lib/folder_bundle.py), already validated member by
+    member when its bundle was uploaded.
+
+    csv/json/excel: every member is loaded and combined into ONE input file in
+    data/, shuffled, and the bundle is released from scratch. SKALD then runs
+    once over it. dicom/image: nothing is staged — the bundle stays in scratch
+    and P3DX_SDK.run_docker_containers takes it one member at a time.
+    """
+    import P3DX_SDK
+    from lib import folder_bundle
+
+    if P3DX_SDK.current_application() == "dp":
+        raise ValueError(folder_bundle.DP_REJECTION)
+
+    folder = meta["folder"]
+    if folder.get("mode") != folder_bundle.MODE_JOINT:
+        print(f"Folder upload ({fmt}): {folder.get('files_total')} file(s) will be "
+              "de-identified one at a time")
+        return
+
+    data_type, section = folder_bundle.load_section(config.paths.tee_input_config)
+    stem = os.path.splitext(meta.get("filename") or "folder")[0] or "folder"
+    ext = {"csv": ".csv", "json": ".json", "excel": ".xlsx"}[fmt]
+    os.makedirs(output_dir, exist_ok=True)
+    dest_path = os.path.join(output_dir, stem.replace(os.sep, "_") + ext)
+
+    try:
+        result = folder_bundle.combine_tabular(scratch_path, fmt, section, dest_path,
+                                               spool_dir=output_dir)
+    except folder_bundle.FolderError as e:
+        raise ValueError(f"Folder upload rejected: {e}") from None
+
+    # Every member is loaded; the bundle's RAM goes back now, not at finalize.
+    os.remove(scratch_path)
+
+    folder.update(records_in=result.records_in, files_total=result.files_total)
+    # In place, not replaced: the sidecar belongs to the enclave manager
+    # process, which reads it back when the output is finalised.
+    with open(_du_meta_path(scratch_dir, upload_id), "w") as f:
+        json.dump(meta, f)
+
+    print(f"Folder upload staged: {result.files_total} file(s), {result.records_in} "
+          f"record(s) combined under '{data_type}' -> {dest_path}")
+
+
+def _du_meta_path(scratch_dir, upload_id):
+    from lib import direct_upload as _du
+    return _du._meta_path(scratch_dir, upload_id)
 
 
 _IMAGE_INPUT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")

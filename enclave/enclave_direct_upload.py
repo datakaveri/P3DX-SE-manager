@@ -58,6 +58,15 @@ MAX_TOTAL_BYTES_BY_FORMAT = {
     "dicom": 300 * MB,
     "image": 25 * MB,
 }
+# A folder arrives as one uncompressed tar (`<folder>.tar`) whose members are
+# all of `format`. Its total is checked against this cap INSTEAD of the
+# per-format one — an image folder is legitimately far over the 25 MB
+# per-image cap — and each member is still held to its per-format cap once the
+# archive is walked (lib/folder_bundle.py). The UI (`maxFolderBytes`,
+# `maxFolderFiles`) and the middleware carry the same two numbers; all three
+# move together.
+MAX_FOLDER_BYTES = 300 * MB
+MAX_FOLDER_FILES = 10_000
 MAX_CONCURRENT_SESSIONS_PER_USER = 1
 SESSION_TTL_SECONDS = 30 * 60
 OUTPUT_TTL_SECONDS = 2 * 60 * 60
@@ -85,6 +94,13 @@ class UploadError(Exception):
         super().__init__(description)
         self.status = status
         self.description = description
+
+
+def is_folder_filename(filename) -> bool:
+    """A folder upload is named `<folder>.tar`. The name alone only selects the
+    folder cap here; lib/folder_bundle.py confirms the `ustar` magic once the
+    bytes are reassembled, and fails the job if a `.tar` name lacks it."""
+    return str(filename or "").lower().endswith(".tar")
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +267,12 @@ class UploadManager:
 
         if total_bytes <= 0:
             raise UploadError(400, "total_bytes must be positive")
-        if total_bytes > MAX_TOTAL_BYTES_BY_FORMAT[fmt]:
+        if is_folder_filename(body.get("filename")):
+            if total_bytes > MAX_FOLDER_BYTES:
+                raise UploadError(
+                    413, f"Folder uploads are limited to {MAX_FOLDER_BYTES // MB} MB"
+                )
+        elif total_bytes > MAX_TOTAL_BYTES_BY_FORMAT[fmt]:
             raise UploadError(
                 413,
                 f"{fmt.upper()} uploads are limited to "

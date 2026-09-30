@@ -68,6 +68,49 @@ def load_config_file(config_path="DPconfig.json"):
         raise ValueError(f"Failed to load config from {config_path}: {e}")
 
 
+# The job's application ("dp", "skald", "skald_dicom", "skald_image"). The
+# enclave is never told it directly: the scheduler resolves it to a compose URL
+# (DPconfig.json compose_urls) and sends only that. deploy_enclave.py records
+# the URL here so later steps can ask.
+_compose_url = None
+
+#: compose-URL path segment -> application, per the Docker-Compose repo layout.
+_APPLICATION_BY_COMPOSE_DIR = {
+    "differential-privacy": "dp",
+    "skald-dicom": "skald_dicom",
+    "skald-image": "skald_image",
+    "skald": "skald",
+}
+
+
+def application_from_compose_url(url):
+    """The application a compose URL deploys, or None if it is not one of ours."""
+    path = urllib.parse.urlparse(str(url or "")).path.lower()
+    for part in reversed([p for p in path.split("/") if p]):
+        if part in _APPLICATION_BY_COMPOSE_DIR:
+            return _APPLICATION_BY_COMPOSE_DIR[part]
+    return None
+
+
+def set_compose_url(url):
+    global _compose_url
+    _compose_url = url
+
+
+def current_application():
+    """This run's application: from the deploy's compose URL, else — for a
+    /run/*_pipeline re-run, which has no compose URL — from the technique it
+    stamped into DPconfig.json."""
+    app = application_from_compose_url(_compose_url)
+    if app:
+        return app
+    try:
+        technique = load_config_file(config.get_path('config_file')).get("technique")
+    except Exception:
+        technique = None
+    return "dp" if technique == "differential_privacy" else None
+
+
 def create_fernet_cipher(key_data):
     """Create Fernet cipher from key data, handling various key formats."""
     try:
@@ -1632,7 +1675,22 @@ def run_docker_containers():
     to only one of them would silently skip free-text masking on the other.
     Runs that don't enable free_text_anonymization are byte-for-byte unchanged:
     the gate short-circuits and compose comes up exactly as before.
+
+    A DICOM or image FOLDER upload runs the application once per member
+    instead (_run_folder_per_file). Everything else, including a tabular
+    folder — already combined into one input by then — runs once.
     """
+    folder = _pending_per_file_folder()
+    if folder is not None:
+        _run_folder_per_file(*folder)
+        return
+    _run_application_once()
+
+
+def _run_application_once():
+    """One pass of the application over whatever is in data/ — the body of
+    run_docker_containers, and the single-file path a per-file folder runs
+    for each member."""
     # Before the gate, not inside it: a ledger left by an earlier run must not
     # survive into a run that doesn't enable the stage (see
     # clear_free_text_artifacts).
@@ -1686,6 +1744,151 @@ def run_docker_containers():
     
     print("\n" + "="*60, flush=True)
     print(f"Application execution complete. Output saved to {config.paths.tee_output}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Folder upload, DICOM / image: one member at a time (lib/folder_bundle.py)
+# ---------------------------------------------------------------------------
+
+#: Where a per-file folder's output tar is handed to finalize-output, which
+#: only accepts a path inside tee_output.
+FOLDER_OUTPUT_NAME = "folder_output.tar"
+
+
+def _direct_upload_id():
+    try:
+        with open(config.get_path('decrypted_urls')) as f:
+            ref = json.load(f).get("blobUrl", "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    prefix = "enclave://upload/"
+    return ref[len(prefix):] if isinstance(ref, str) and ref.startswith(prefix) else None
+
+
+def _pending_per_file_folder():
+    """(upload_id, scratch_dir, meta) when this run is a DICOM/image folder
+    whose bundle is still waiting in scratch, else None."""
+    upload_id = _direct_upload_id()
+    if not upload_id:
+        return None
+    from lib import direct_upload as _du
+    scratch_dir = _du._scratch_dir()
+    meta = _du.read_staged_meta(scratch_dir, upload_id)
+    folder = meta.get("folder")
+    if not isinstance(folder, dict) or folder.get("mode") != "per_file":
+        return None
+    return upload_id, scratch_dir, meta
+
+
+def _clear_directory(path):
+    for name in os.listdir(path):
+        target = os.path.join(path, name)
+        try:
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+            else:
+                os.unlink(target)
+        except OSError:
+            pass
+
+
+def _member_failure_reason(fmt, status):
+    """A fixed, content-free reason for a member the application rejected.
+    The container's own message is never copied: it leaves the enclave in the
+    manifest and could quote the file."""
+    text = json.dumps(status).lower()
+    if any(word in text for word in ("unparsable", "unparseable", "parse", "invalid dicom",
+                                     "cannot identify image", "not a valid")):
+        return "unparsable DICOM" if fmt == "dicom" else "unreadable image"
+    return "de-identification failed"
+
+
+def _folder_member_output(fmt, output_dir):
+    """The single de-identified output the application wrote for one member —
+    the same allow-list the single-file direct path uses."""
+    from lib.folder_bundle import MemberFailure
+    try:
+        with open(config.get_path('status')) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        status = None
+    if isinstance(status, dict) and status.get("status") == "error":
+        raise MemberFailure(_member_failure_reason(fmt, status))
+    found = (_find_deidentified_outputs(output_dir) if fmt == "dicom"
+             else _find_image_outputs(output_dir))
+    if not found:
+        raise MemberFailure("no de-identified output was produced")
+    if len(found) > 1:
+        raise MemberFailure("more than one output was produced")
+    return found[0]
+
+
+def _run_folder_per_file(upload_id, scratch_dir, meta):
+    """De-identify each member of a DICOM/image folder through the existing
+    single-file path, streaming results into `<upload_id>.out.tar` in scratch.
+
+    Scratch is tmpfs (RAM), so the bundle is never unpacked: one member at a
+    time is written to data/, the application runs, its one output is appended
+    to the output tar, and data/ and output/ are emptied before the next.
+    Peak scratch is the bundle plus the output tar.
+    """
+    from lib import folder_bundle
+    from lib.folder_bundle import MemberFailure
+
+    fmt = meta.get("format")
+    tar_path = os.path.join(scratch_dir, f"{upload_id}.bin")
+    if not os.path.exists(tar_path):
+        raise FileNotFoundError(
+            f"Folder bundle not found at {tar_path}. The upload session may have "
+            "expired or already been consumed."
+        )
+    out_tar = os.path.join(scratch_dir, f"{upload_id}.out.tar")
+    in_dir, out_dir = config.paths.tee_input_data, config.paths.tee_output
+    os.makedirs(in_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def process(name, fh):
+        _clear_directory(in_dir)
+        _clear_directory(out_dir)
+        if os.listdir(in_dir) or os.listdir(out_dir):
+            # Never run over a previous member's leftovers: its output could
+            # be picked up as this member's.
+            raise MemberFailure("could not prepare a clean workspace")
+        head = fh.read(512)
+        staged = os.path.join(in_dir, "input" + folder_bundle.input_extension(fmt, head))
+        with open(staged, "wb") as f:
+            f.write(head)
+            shutil.copyfileobj(fh, f, 1 << 20)
+        os.chmod(staged, 0o600)
+        _run_application_once()
+        return _folder_member_output(fmt, out_dir)
+
+    def cleanup():
+        _clear_directory(in_dir)
+        _clear_directory(out_dir)
+
+    total = (meta.get("folder") or {}).get("files_total", "?")
+    print(f"Folder upload: de-identifying {total} {fmt} file(s) one at a time", flush=True)
+    manifest = folder_bundle.run_per_file(tar_path, fmt, out_tar, process, cleanup)
+    print(f"Folder upload: {manifest['files_succeeded']} succeeded, "
+          f"{manifest['files_failed']} failed", flush=True)
+
+    # The bundle is not needed again; release its scratch (RAM) now rather
+    # than at finalize.
+    os.remove(tar_path)
+    final = os.path.join(out_dir, FOLDER_OUTPUT_NAME)
+    shutil.move(out_tar, final)
+    os.chmod(final, 0o644)
+
+    meta.setdefault("folder", {}).update(
+        files_total=manifest["files_total"],
+        files_succeeded=manifest["files_succeeded"],
+        files_failed=manifest["files_failed"],
+    )
+    # Rewritten in place, not replaced, so the sidecar keeps its owner — the
+    # enclave manager process, which reads it back at finalize.
+    with open(os.path.join(scratch_dir, f"{upload_id}.meta.json"), "w") as f:
+        json.dump(meta, f)
 
 
 def _read_stripped_manifest(output_dir):
@@ -2084,6 +2287,7 @@ def _upload_direct_output(output_dir, urls):
     scratch_dir = os.environ.get("ENCLAVE_SCRATCH_DIR", "/enclave/scratch")
     meta_path = os.path.join(scratch_dir, f"{upload_id}.meta.json")
     original_name, fmt = "dataset", "csv"
+    meta = {}
     try:
         with open(meta_path) as f:
             meta = json.load(f)
@@ -2097,8 +2301,20 @@ def _upload_direct_output(output_dir, urls):
         except FileNotFoundError:
             pass
 
+    folder = meta.get("folder") if isinstance(meta, dict) else None
+    folder = folder if isinstance(folder, dict) else None
+    per_file_folder = bool(folder) and folder.get("mode") == "per_file"
+
     manifest = None
-    if fmt == "dicom":
+    if per_file_folder:
+        # A DICOM/image folder: the one result is the output tar the per-file
+        # loop assembled, with its own _manifest.json inside.
+        output_path = os.path.join(output_dir, FOLDER_OUTPUT_NAME)
+        if not os.path.isfile(output_path):
+            message = f"Folder upload produced no output archive at {output_path}."
+            _write_direct_error_status(message)
+            raise RuntimeError(message)
+    elif fmt == "dicom":
         deid_files = _find_deidentified_outputs(output_dir)
         if len(deid_files) != 1:
             message = (
@@ -2155,9 +2371,12 @@ def _upload_direct_output(output_dir, urls):
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ".xls": "application/vnd.ms-excel",
             ".dcm": "application/dicom",
+            ".tar": "application/x-tar",
             **_IMAGE_CONTENT_TYPES,
         }.get(ext.lower(), "application/octet-stream")
-        if fmt == "image":
+        if per_file_folder:
+            filename = f"{stem or 'folder'}_anonymised.tar"
+        elif fmt == "image":
             filename = f"{stem or 'image'}_redacted{ext}"
         else:
             filename = f"{stem or 'dataset'}_anonymised{ext}"
@@ -2175,6 +2394,14 @@ def _upload_direct_output(output_dir, urls):
         })
     if manifest is not None:
         payload["manifest"] = manifest
+    if folder is not None:
+        from lib.folder_bundle import folder_status
+        payload["folder"] = folder_status(
+            folder.get("mode"), folder.get("files_total", 0),
+            records_in=folder.get("records_in", 0),
+            files_succeeded=folder.get("files_succeeded", 0),
+            files_failed=folder.get("files_failed", 0),
+        )
 
     # Let the manager check its session's output key against the one this
     # process unwrapped from the bundle, before it encrypts anything under

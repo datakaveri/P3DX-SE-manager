@@ -77,6 +77,7 @@ def main():
     """Main deployment workflow."""
     compose_url = get_compose_url()
     job_id = get_job_id()
+    P3DX_SDK.set_compose_url(compose_url)
 
     print("="*60, flush=True)
     print("TEE Enclave Deployment", flush=True)
