@@ -148,6 +148,10 @@ cors:
   origins:
     - http://localhost:5173
     - http://localhost:3000
+    # anamika.iudx.org.in is the new UI domain; spider.p3dx is the one it
+    # replaces and stays listed until that host is retired, so the two can be
+    # served in parallel during the cutover.
+    - https://anamika.iudx.org.in
     - https://spider.p3dx.iudx.org.in
   methods:
     - GET
