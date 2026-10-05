@@ -48,7 +48,7 @@ MAX_CHUNK_BYTES = CHUNK_SIZE + 64          # ciphertext + GCM tag + slack
 # Per-format caps, enforced independently of the middleware — this is the side
 # that cannot be bypassed. csv/json/dicom carry the raised 300 MB cap; the
 # reassembled dataset and the output container both live in the /enclave/scratch
-# tmpfs, grown to 2 GiB in the same deploy to hold them. excel and image stay at
+# tmpfs (3 GiB since folder uploads reached 1 GiB). excel and image stay at
 # 25 MB, bounded by browser preview memory, not the transport. Keep this table
 # in step with the middleware's MAX_TOTAL_BYTES.
 MAX_TOTAL_BYTES_BY_FORMAT = {
@@ -58,14 +58,24 @@ MAX_TOTAL_BYTES_BY_FORMAT = {
     "dicom": 300 * MB,
     "image": 25 * MB,
 }
-# A folder arrives as one uncompressed tar (`<folder>.tar`) whose members are
-# all of `format`. Its total is checked against this cap INSTEAD of the
-# per-format one — an image folder is legitimately far over the 25 MB
-# per-image cap — and each member is still held to its per-format cap once the
-# archive is walked (lib/folder_bundle.py). The UI (`maxFolderBytes`,
-# `maxFolderFiles`) and the middleware carry the same two numbers; all three
-# move together.
-MAX_FOLDER_BYTES = 300 * MB
+# A folder — an uploaded `<folder>.tar`, or a blob prefix in blob mode — is
+# held to these caps by MEMBER format INSTEAD of the per-format single-file cap
+# (an image folder is legitimately far over the 25 MB per-image cap); each
+# member is still held to its per-format cap (lib/folder_bundle.py,
+# lib/blob_folder.py). DICOM/image run per file and stream their output
+# (lib/output_stream.py), which is what lets them reach 1 GiB — also the upload
+# transport's ceiling, MAX_CHUNKS x CHUNK_SIZE. Tabular folders are combined
+# into one table, so their cap is about enclave memory. The UI
+# (`maxFolderBytesByFormat`, `maxFolderFiles`) and the middleware
+# (`MAX_FOLDER_BYTES`) carry the same numbers; all three move together.
+GiB = 1024 * MB
+MAX_FOLDER_BYTES_BY_FORMAT = {
+    "csv": 500 * MB,
+    "json": 500 * MB,
+    "excel": 500 * MB,
+    "dicom": 1 * GiB,
+    "image": 1 * GiB,
+}
 MAX_FOLDER_FILES = 10_000
 MAX_CONCURRENT_SESSIONS_PER_USER = 1
 SESSION_TTL_SECONDS = 30 * 60
@@ -81,7 +91,8 @@ SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
 # Scratch MUST be tmpfs. DC2as_v5 has no local temp disk, so RAM is the only
 # storage inside the SEV-SNP encrypted-memory boundary. Mount it size-capped so a
 # bug cannot exhaust enclave RAM:
-#     mount -t tmpfs -o size=1G,noexec,nosuid,nodev tmpfs /enclave/scratch
+#     mount -t tmpfs -o size=3G,noexec,nosuid,nodev tmpfs /enclave/scratch
+# (3 GiB: a 1 GiB uploaded folder tar plus headroom — see enclave-scratch.mount)
 SCRATCH_DIR = os.environ.get("ENCLAVE_SCRATCH_DIR", "/enclave/scratch")
 
 OUTPUT_MAGIC = b"SPIDROU1"
@@ -268,9 +279,11 @@ class UploadManager:
         if total_bytes <= 0:
             raise UploadError(400, "total_bytes must be positive")
         if is_folder_filename(body.get("filename")):
-            if total_bytes > MAX_FOLDER_BYTES:
+            if total_bytes > MAX_FOLDER_BYTES_BY_FORMAT[fmt]:
                 raise UploadError(
-                    413, f"Folder uploads are limited to {MAX_FOLDER_BYTES // MB} MB"
+                    413,
+                    f"{fmt.upper()} folder uploads are limited to "
+                    f"{MAX_FOLDER_BYTES_BY_FORMAT[fmt] // MB} MB",
                 )
         elif total_bytes > MAX_TOTAL_BYTES_BY_FORMAT[fmt]:
             raise UploadError(

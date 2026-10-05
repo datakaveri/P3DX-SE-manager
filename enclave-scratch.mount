@@ -1,0 +1,23 @@
+# /enclave/scratch: the direct-upload scratch (reassembled uploads, including a
+# folder upload's tar). tmpfs, i.e. RAM: DC2as_v5 has no local temp disk, and
+# RAM is the only storage inside the SEV-SNP encrypted-memory boundary.
+#
+# 3G: a 1 GiB uploaded DICOM/image folder tar is reassembled here, plus
+# headroom. The per-file output no longer passes through scratch (it streams to
+# blob storage, lib/output_stream.py), and a cloud folder puts nothing here.
+# size= is a cap, not a reservation: pages are allocated on write.
+#
+# @UID@/@GID@ are the enclave manager's user, filled in by
+# tools/provision_node.sh; tmpfs takes numeric ids only.
+[Unit]
+Description=Enclave direct-upload scratch (tmpfs)
+Before=enclavemanager.service
+
+[Mount]
+What=tmpfs
+Where=/enclave/scratch
+Type=tmpfs
+Options=size=3G,mode=0700,uid=@UID@,gid=@GID@,noexec,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

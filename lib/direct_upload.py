@@ -379,6 +379,29 @@ def _sanitise_folder_status(folder):
     return out
 
 
+def _verify_output_key_check(output_key, output_key_check, caller):
+    """The browser has one output key per job, which reaches the enclave by two
+    routes (bundle and upload/init). If the caller says which key it
+    unwrapped, it must be this session's — see P3DX_SDK.output_key_check_value."""
+    import P3DX_SDK  # deferred: same import cycle as get_manager() avoids
+
+    if output_key_check is None:
+        print(f"{caller}: no output key check supplied; using this session's key "
+              "unverified", flush=True)
+        return
+    expected = P3DX_SDK.output_key_check_value(output_key)
+    # Compared as bytes: compare_digest rejects a str with non-ASCII in it,
+    # and this value arrives over HTTP.
+    if not hmac.compare_digest(str(output_key_check).encode("utf-8"),
+                               expected.encode("ascii")):
+        raise UploadError(
+            409,
+            "The output key in this upload session does not match the one "
+            "the pipeline unwrapped from the bundle. Refusing to encrypt "
+            "output the browser could not decrypt.",
+        )
+
+
 def finalize_output(upload_id, output_path, filename, content_type, manifest=None,
                     output_key_check=None, folder=None):
     """
@@ -434,21 +457,7 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     # it has to be this one. A mismatch means the browser's single stored key
     # can decrypt at most one of the two, and it has no way to tell which —
     # failing the run is strictly better than shipping output nobody can open.
-    if output_key_check is not None:
-        expected = P3DX_SDK.output_key_check_value(output_key)
-        # Compared as bytes: compare_digest rejects a str with non-ASCII in it,
-        # and this value arrives over HTTP.
-        if not hmac.compare_digest(str(output_key_check).encode("utf-8"),
-                                   expected.encode("ascii")):
-            raise UploadError(
-                409,
-                "The output key in this upload session does not match the one "
-                "the pipeline unwrapped from the bundle. Refusing to encrypt "
-                "output the browser could not decrypt.",
-            )
-    else:
-        print("finalize-output: no output key check supplied; using this "
-              "session's key unverified", flush=True)
+    _verify_output_key_check(output_key, output_key_check, "finalize-output")
 
     scratch_dir = _scratch_dir()
     fetch_data = _get_fetch_data()
@@ -509,3 +518,121 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     response = dict(result) if result else {"expires_at": expires_at}
     response.update(plot_urls)
     return response
+
+
+# --------------------------------------------------------------------------- #
+# Per-file folder output, streamed (DICOM / image folder uploads)
+# --------------------------------------------------------------------------- #
+#
+# The output key lives only in this process, and a 1 GiB folder's output cannot
+# be staged whole (scratch is RAM). So the deploy subprocess drives a stream
+# held HERE, over loopback, one member at a time: begin, then one `member` call
+# per de-identified file (read from tee_output and appended to a tar that is
+# sealed chunk by chunk into staged blocks), then finish, which commits the
+# blob and writes status. lib/output_stream.py has the container mechanics.
+
+_folder_streams = {}
+_folder_streams_lock = threading.Lock()
+
+
+def _storage_http():
+    from lib.output_stream import BlobHttp  # noqa: PLC0415
+    fetch_data = _get_fetch_data()
+    return BlobHttp(token_provider=lambda: fetch_data.get_mi_token(config.azure.storage_resource))
+
+
+def folder_output_begin(upload_id, filename, fmt, output_key_check=None, http=None):
+    from lib.output_stream import BlockBlobUploader, ContainerStreamWriter, StreamingTarSink  # noqa: PLC0415
+    from enclave.enclave_direct_upload import MAX_FOLDER_BYTES_BY_FORMAT  # noqa: PLC0415
+
+    if fmt not in folder_bundle.PER_FILE_FORMATS:
+        raise UploadError(400, f"no streamed folder output for format '{fmt}'")
+    manager = get_manager()
+    output_key, _session_iv = manager.output_key_for(upload_id)
+    _verify_output_key_check(output_key, output_key_check, "folder-output")
+
+    url = f"{_output_blob_base_url()}/{upload_id}.enc"
+    name = os.path.basename(str(filename)) or "folder_anonymised.tar"
+    writer = ContainerStreamWriter(
+        BlockBlobUploader(http or _storage_http(), url),
+        run_id=upload_id, output_key=output_key,
+        # A fresh IV for this container, never the session's: the reader takes
+        # base_iv from the header, and a retried run must not reuse a nonce
+        # that an aborted attempt's staged blocks already used.
+        output_base_iv=os.urandom(12),
+        filename=name,
+        content_type="application/x-tar",
+        # Room for the output to outgrow the folder; past this the job fails
+        # rather than sealing a container whose header would be wrong.
+        max_bytes=2 * MAX_FOLDER_BYTES_BY_FORMAT[fmt],
+    )
+    with _folder_streams_lock:
+        if upload_id in _folder_streams:
+            raise UploadError(409, "a folder output is already being written for this upload")
+        _folder_streams[upload_id] = {"sink": StreamingTarSink(writer), "url": url,
+                                      "filename": name}
+    return {"total_chunks": writer.total_chunks, "chunk_size": writer.chunk_size}
+
+
+def _folder_stream(upload_id):
+    with _folder_streams_lock:
+        stream = _folder_streams.get(upload_id)
+    if stream is None:
+        raise UploadError(404, "no folder output in progress for this upload")
+    return stream
+
+
+def folder_output_member(upload_id, output_path, arcname):
+    """Append one de-identified file. `output_path` arrives over HTTP, so it is
+    held inside the pipeline's output directory exactly as finalize_output
+    holds its own; `arcname` is the member's relative path, checked the way an
+    uploaded tar's member paths are."""
+    stream = _folder_stream(upload_id)
+    output_dir_real = os.path.realpath(config.paths.tee_output)
+    resolved = os.path.realpath(str(output_path or ""))
+    if not resolved.startswith(output_dir_real + os.sep) or not os.path.isfile(resolved):
+        raise UploadError(400, "output_path must be a file inside the pipeline's output directory")
+    try:
+        folder_bundle._check_path(str(arcname or ""))  # noqa: SLF001
+    except folder_bundle.FolderError as e:
+        raise UploadError(400, str(e)) from None
+    stream["sink"].add_file(str(arcname), resolved)
+    return {"stored_bytes": stream["sink"].writer.stored_bytes}
+
+
+def folder_output_finish(upload_id, manifest):
+    """Close the tar (manifest last), seal the container's tail and header,
+    commit the blob, and write the status contract: outputs.direct exactly as
+    for one file, plus outputs.folder."""
+    stream = _folder_stream(upload_id)
+    if not isinstance(manifest, dict) or manifest.get("mode") != "per_file":
+        raise UploadError(400, "finish needs the per-file manifest")
+    header = stream["sink"].close(folder_bundle.MANIFEST_NAME,
+                                  json.dumps(manifest, indent=2).encode("utf-8"))
+    with _folder_streams_lock:
+        _folder_streams.pop(upload_id, None)
+
+    # The folder tar is normally already gone (the subprocess releases it
+    # after its last member); this is the backstop, as in finalize_output.
+    get_manager().release(upload_id)
+
+    ttl_seconds = int(getattr(config.direct_upload, "output_ttl_seconds", 7200))
+    result = {
+        "outputBlobUrl": stream["url"],
+        "filename": stream["filename"],
+        "bytes": header["total_bytes"],
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl_seconds)),
+    }
+    folder = folder_bundle.folder_status(
+        "per_file", manifest.get("files_total", 0),
+        files_succeeded=manifest.get("files_succeeded", 0),
+        files_failed=manifest.get("files_failed", 0))
+    _write_direct_status(result, folder=_sanitise_folder_status(folder))
+    return result
+
+
+def folder_output_abort(upload_id):
+    with _folder_streams_lock:
+        stream = _folder_streams.pop(upload_id, None)
+    if stream is not None:
+        stream["sink"].abort()

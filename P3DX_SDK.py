@@ -1676,10 +1676,13 @@ def run_docker_containers():
     Runs that don't enable free_text_anonymization are byte-for-byte unchanged:
     the gate short-circuits and compose comes up exactly as before.
 
-    A DICOM or image FOLDER upload runs the application once per member
-    instead (_run_folder_per_file). Everything else, including a tabular
-    folder — already combined into one input by then — runs once.
+    A DICOM or image FOLDER — uploaded or a blob prefix — runs the application
+    once per member instead. Everything else, including a tabular folder —
+    already combined into one input by then — runs once.
     """
+    if _cloud_folder is not None and _cloud_folder["plan"].mode == "per_file":
+        _run_cloud_folder_per_file(_cloud_folder)
+        return
     folder = _pending_per_file_folder()
     if folder is not None:
         _run_folder_per_file(*folder)
@@ -1750,11 +1753,6 @@ def _run_application_once():
 # Folder upload, DICOM / image: one member at a time (lib/folder_bundle.py)
 # ---------------------------------------------------------------------------
 
-#: Where a per-file folder's output tar is handed to finalize-output, which
-#: only accepts a path inside tee_output.
-FOLDER_OUTPUT_NAME = "folder_output.tar"
-
-
 def _direct_upload_id():
     try:
         with open(config.get_path('decrypted_urls')) as f:
@@ -1823,26 +1821,13 @@ def _folder_member_output(fmt, output_dir):
     return found[0]
 
 
-def _run_folder_per_file(upload_id, scratch_dir, meta):
-    """De-identify each member of a DICOM/image folder through the existing
-    single-file path, streaming results into `<upload_id>.out.tar` in scratch.
-
-    Scratch is tmpfs (RAM), so the bundle is never unpacked: one member at a
-    time is written to data/, the application runs, its one output is appended
-    to the output tar, and data/ and output/ are emptied before the next.
-    Peak scratch is the bundle plus the output tar.
-    """
+def _per_file_workspace(fmt):
+    """(process, cleanup) for run_per_file: stage one member in data/, run the
+    application over it exactly as for a single file, and hand back its one
+    output; then empty data/ and output/ whatever happened."""
     from lib import folder_bundle
     from lib.folder_bundle import MemberFailure
 
-    fmt = meta.get("format")
-    tar_path = os.path.join(scratch_dir, f"{upload_id}.bin")
-    if not os.path.exists(tar_path):
-        raise FileNotFoundError(
-            f"Folder bundle not found at {tar_path}. The upload session may have "
-            "expired or already been consumed."
-        )
-    out_tar = os.path.join(scratch_dir, f"{upload_id}.out.tar")
     in_dir, out_dir = config.paths.tee_input_data, config.paths.tee_output
     os.makedirs(in_dir, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
@@ -1867,28 +1852,195 @@ def _run_folder_per_file(upload_id, scratch_dir, meta):
         _clear_directory(in_dir)
         _clear_directory(out_dir)
 
+    return process, cleanup
+
+
+#: The outputs.direct block of a per-file folder run once its output is
+#: committed — what encrypt_and_upload_output reports for the run.
+_folder_output_result = None
+
+
+class _ManagerFolderSink:
+    """The run_per_file sink for a folder UPLOAD: the container is sealed in the
+    enclave manager (the only holder of the browser's output key), driven over
+    loopback. Only paths inside tee_output cross the boundary, never the key."""
+
+    def __init__(self, address, upload_id, filename, fmt, output_key_check):
+        self._base = urllib.parse.urljoin(address, f"/internal/upload/{upload_id}/folder-output/")
+        self._call("begin", {"filename": filename, "format": fmt,
+                             "output_key_check": output_key_check})
+
+    def _call(self, action, body, timeout=900):
+        from lib.folder_bundle import SinkFailure
+        try:
+            resp = requests.post(self._base + action, json=body, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            raise SinkFailure(f"folder-output {action}: {e}") from None
+        if resp.status_code != 200:
+            raise SinkFailure(f"folder-output {action} failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def add_file(self, arcname, path):
+        self._call("member", {"output_path": path, "arcname": arcname})
+
+    def close(self, manifest_name, manifest):
+        return self._call("finish", {"manifest": json.loads(manifest)})
+
+    def abort(self):
+        try:
+            requests.post(self._base + "abort", json={}, timeout=30)
+        except requests.exceptions.RequestException:
+            pass
+
+
+def _run_folder_per_file(upload_id, scratch_dir, meta):
+    """De-identify each member of an uploaded DICOM/image folder through the
+    existing single-file path, streaming each result into the encrypted output
+    container as soon as it exists.
+
+    Scratch is tmpfs (RAM), so the bundle is never unpacked and the output is
+    never staged: one member at a time is written to data/, the application
+    runs, its output is appended to the container stream held by the enclave
+    manager, and data/ and output/ are emptied before the next. Peak scratch
+    is the bundle itself.
+    """
+    global _folder_output_result
+    from lib import folder_bundle
+
+    fmt = meta.get("format")
+    tar_path = os.path.join(scratch_dir, f"{upload_id}.bin")
+    if not os.path.exists(tar_path):
+        raise FileNotFoundError(
+            f"Folder bundle not found at {tar_path}. The upload session may have "
+            "expired or already been consumed."
+        )
+    stem = os.path.splitext(meta.get("filename") or "folder")[0] or "folder"
+    address = load_config_file(config.get_path('config_file'))["enclaveManagerAddress"]
+    output_crypto = _get_output_crypto()
+    sink = _ManagerFolderSink(
+        address, upload_id, f"{stem}_anonymised.tar", fmt,
+        output_key_check_value(output_crypto["key"]) if output_crypto is not None else None,
+    )
+    process, cleanup = _per_file_workspace(fmt)
+
     total = (meta.get("folder") or {}).get("files_total", "?")
     print(f"Folder upload: de-identifying {total} {fmt} file(s) one at a time", flush=True)
-    manifest = folder_bundle.run_per_file(tar_path, fmt, out_tar, process, cleanup)
+    manifest, result = folder_bundle.run_per_file(
+        folder_bundle.tar_members(tar_path), fmt, sink, process, cleanup)
     print(f"Folder upload: {manifest['files_succeeded']} succeeded, "
-          f"{manifest['files_failed']} failed", flush=True)
+          f"{manifest['files_failed']} failed; output committed", flush=True)
 
-    # The bundle is not needed again; release its scratch (RAM) now rather
-    # than at finalize.
-    os.remove(tar_path)
-    final = os.path.join(out_dir, FOLDER_OUTPUT_NAME)
-    shutil.move(out_tar, final)
-    os.chmod(final, 0o644)
+    # The bundle is not needed again. The manager's finish has normally
+    # released it already; this covers the case where it could not.
+    try:
+        os.remove(tar_path)
+    except FileNotFoundError:
+        pass
+    _folder_output_result = result
 
-    meta.setdefault("folder", {}).update(
-        files_total=manifest["files_total"],
-        files_succeeded=manifest["files_succeeded"],
-        files_failed=manifest["files_failed"],
+
+# ---------------------------------------------------------------------------
+# Cloud folders (blob mode): a blob prefix instead of one blob
+# (lib/blob_folder.py). Fetch_data stages a joint folder itself; a per-file
+# folder is planned there and run here, one download at a time.
+# ---------------------------------------------------------------------------
+
+#: Set by Fetch_data when the run's input is a per-file cloud folder:
+#: {"plan": FolderPlan, "http": BlobHttp, "decrypt": callable}. In memory only —
+#: it carries the dataset key's decrypt function — and only for this process.
+_cloud_folder = None
+
+
+def set_cloud_folder(state):
+    global _cloud_folder
+    _cloud_folder = state
+
+
+def reset_folder_state():
+    """Forget any folder state from an earlier run in this process (the
+    /run/*_pipeline re-runs share it)."""
+    global _cloud_folder, _folder_output_result
+    _cloud_folder = None
+    _folder_output_result = None
+
+
+def _run_cloud_folder_per_file(state):
+    """Download -> decrypt -> de-identify -> stream into the output -> delete,
+    one member at a time. Nothing from the folder is held except the member in
+    flight, so the folder can be as large as its cap without any staging.
+
+    The output is the same container a DICOM/image folder upload produces,
+    sealed in this process under the bundle's per-run output key, written to
+    outputContainerUrl, and reported under outputs.direct + outputs.folder —
+    the UI fetches every folder run from outputs.direct.outputBlobUrl.
+    """
+    global _folder_output_result
+    from lib import blob_folder, folder_bundle
+    from lib.direct_upload import head_matches_format
+    from lib.output_stream import (BlockBlobUploader, ContainerStreamWriter,
+                                   StreamingTarSink, bare_url, blob_url)
+    from enclave.enclave_direct_upload import MAX_FOLDER_BYTES_BY_FORMAT
+
+    plan = state["plan"]
+    output_crypto = _get_output_crypto()
+    if output_crypto is None:
+        raise RuntimeError(
+            "A cloud folder's output is sealed under the per-run output key, and "
+            "this bundle carried none (payload.outputWrappedKey)."
+        )
+    with open(config.get_path('decrypted_urls')) as f:
+        container_url = json.load(f)["outputContainerUrl"]
+    filename = f"{plan.folder.name}_anonymised.tar"
+    url = blob_url(container_url, filename + ".enc")
+    writer = ContainerStreamWriter(
+        BlockBlobUploader(state["http"], url),
+        run_id=output_crypto["run_id"], output_key=output_crypto["key"],
+        output_base_iv=os.urandom(12),   # fresh per container; see output_stream
+        filename=filename, content_type="application/x-tar",
+        max_bytes=2 * MAX_FOLDER_BYTES_BY_FORMAT[plan.fmt],
     )
-    # Rewritten in place, not replaced, so the sidecar keeps its owner — the
-    # enclave manager process, which reads it back at finalize.
-    with open(os.path.join(scratch_dir, f"{upload_id}.meta.json"), "w") as f:
-        json.dump(meta, f)
+    process, cleanup = _per_file_workspace(plan.fmt)
+    print(f"Cloud folder: de-identifying {plan.files_total} {plan.fmt} file(s) one at a time",
+          flush=True)
+    manifest, header = folder_bundle.run_per_file(
+        blob_folder.members(plan, state["http"], state["decrypt"], head_matches_format),
+        plan.fmt, StreamingTarSink(writer), process, cleanup)
+    print(f"Cloud folder: {manifest['files_succeeded']} succeeded, "
+          f"{manifest['files_failed']} failed; output committed", flush=True)
+
+    ttl_seconds = int(getattr(config.direct_upload, "output_ttl_seconds", 7200))
+    _folder_output_result = {
+        "outputBlobUrl": bare_url(url),
+        "filename": filename,
+        "bytes": header["total_bytes"],
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl_seconds)),
+    }
+    _write_folder_status(plan.fmt, _folder_output_result, folder_bundle.folder_status(
+        "per_file", manifest["files_total"],
+        files_succeeded=manifest["files_succeeded"], files_failed=manifest["files_failed"]))
+
+
+def _write_folder_status(fmt, outputs_direct, folder):
+    """status.json for a blob-mode per-file folder: the same outputs.direct /
+    outputs.folder contract a folder upload reports."""
+    status_payload = {
+        "status": "success",
+        "application": "skald-dicom" if fmt == "dicom" else "skald-image",
+        "outputs": {"direct": outputs_direct, "folder": folder},
+    }
+    status_path = config.get_path('status')
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    try:
+        if os.path.exists(status_path):
+            os.remove(status_path)   # may be root-owned; see _write_dicom_status
+    except OSError:
+        pass
+    with open(status_path, "w") as f:
+        json.dump(status_payload, f, indent=2)
+    try:
+        os.chmod(status_path, 0o644)
+    except OSError:
+        pass
 
 
 def _read_stripped_manifest(output_dir):
@@ -2284,7 +2436,10 @@ def _upload_direct_output(output_dir, urls):
         raise RuntimeError(message)
     upload_id = dataset_url[len(prefix):]
 
-    scratch_dir = os.environ.get("ENCLAVE_SCRATCH_DIR", "/enclave/scratch")
+    # The same lookup staging used (config, then ENCLAVE_SCRATCH_DIR), so the
+    # sidecar is read from where it was written.
+    from lib import direct_upload as _du
+    scratch_dir = _du._scratch_dir()
     meta_path = os.path.join(scratch_dir, f"{upload_id}.meta.json")
     original_name, fmt = "dataset", "csv"
     meta = {}
@@ -2305,16 +2460,17 @@ def _upload_direct_output(output_dir, urls):
     folder = folder if isinstance(folder, dict) else None
     per_file_folder = bool(folder) and folder.get("mode") == "per_file"
 
-    manifest = None
     if per_file_folder:
-        # A DICOM/image folder: the one result is the output tar the per-file
-        # loop assembled, with its own _manifest.json inside.
-        output_path = os.path.join(output_dir, FOLDER_OUTPUT_NAME)
-        if not os.path.isfile(output_path):
-            message = f"Folder upload produced no output archive at {output_path}."
+        # A DICOM/image folder streamed its output while it ran and the enclave
+        # manager committed it, status included; there is nothing to finalise.
+        if _folder_output_result is None:
+            message = "Folder upload finished without committing its output."
             _write_direct_error_status(message)
             raise RuntimeError(message)
-    elif fmt == "dicom":
+        return _folder_output_result["outputBlobUrl"]
+
+    manifest = None
+    if fmt == "dicom":
         deid_files = _find_deidentified_outputs(output_dir)
         if len(deid_files) != 1:
             message = (
@@ -2371,12 +2527,9 @@ def _upload_direct_output(output_dir, urls):
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ".xls": "application/vnd.ms-excel",
             ".dcm": "application/dicom",
-            ".tar": "application/x-tar",
             **_IMAGE_CONTENT_TYPES,
         }.get(ext.lower(), "application/octet-stream")
-        if per_file_folder:
-            filename = f"{stem or 'folder'}_anonymised.tar"
-        elif fmt == "image":
+        if fmt == "image":
             filename = f"{stem or 'image'}_redacted{ext}"
         else:
             filename = f"{stem or 'dataset'}_anonymised{ext}"
@@ -3003,6 +3156,15 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     # otherwise be wrongly routed into the SAS/plaintext DICOM path instead.
     if urls.get("outputContainerUrl", "") == "enclave://download":
         return _upload_direct_output(output_dir, urls)
+
+    # A per-file cloud folder already streamed, committed and reported its
+    # output while it ran (_run_cloud_folder_per_file). A tabular cloud folder
+    # falls through: it ran as one input and its output is a single-file
+    # blob run's in every respect.
+    if _cloud_folder is not None and _cloud_folder["plan"].mode == "per_file":
+        if _folder_output_result is None:
+            raise RuntimeError("Cloud folder finished without committing its output.")
+        return _folder_output_result["outputBlobUrl"]
 
     # DICOM (SKALD-DICOM) output takes a separate path: unencrypted upload +
     # SAS + status contract. The tabular flow below is unchanged.

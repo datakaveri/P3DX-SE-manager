@@ -243,25 +243,25 @@ Then `/enclave/status` reports:
 
 Docker / podman:
 ```
---tmpfs /enclave/scratch:rw,size=1g,mode=0700,noexec,nosuid,nodev
+--tmpfs /enclave/scratch:rw,size=3g,mode=0700,noexec,nosuid,nodev
 ```
 
 docker-compose:
 ```yaml
 tmpfs:
-  - /enclave/scratch:rw,size=1g,mode=0700,noexec,nosuid,nodev
+  - /enclave/scratch:rw,size=3g,mode=0700,noexec,nosuid,nodev
 ```
 
 Kubernetes:
 ```yaml
 volumes:
   - name: enclave-scratch
-    emptyDir: { medium: Memory, sizeLimit: 1Gi }
+    emptyDir: { medium: Memory, sizeLimit: 3Gi }
 ```
 
-> **On Kubernetes, `medium: Memory` counts against the container's memory limit.** If the limit isn't raised by the same 1Gi, the container is OOMKilled the moment scratch fills — and it will present as the pipeline dying mid-run, not as a storage error. `emptyDir` also can't set `noexec,nosuid,nodev`; if those matter, use a CSI ephemeral volume or run under docker/podman where `--tmpfs` accepts them.
+> **On Kubernetes, `medium: Memory` counts against the container's memory limit.** If the limit isn't raised by the same 3Gi, the container is OOMKilled the moment scratch fills — and it will present as the pipeline dying mid-run, not as a storage error. `emptyDir` also can't set `noexec,nosuid,nodev`; if those matter, use a CSI ephemeral volume or run under docker/podman where `--tmpfs` accepts them.
 
-`size=1g` is a cap, not a reservation — tmpfs allocates pages on write, so it costs nothing until used. Sizing: ~100 MB reassembled dataset plus ~100 MB output container per concurrent run, so 1Gi is comfortable.
+`size=3g` is a cap, not a reservation — tmpfs allocates pages on write, so it costs nothing until used. Sizing: the largest thing reassembled here is a 1 GiB DICOM/image folder upload; a single file is at most 300 MB plus its ~300 MB output container. A per-file folder's output streams to blob storage and never touches scratch (§2.9). The fleet nodes run the manager on the host, so the mount is the systemd unit `enclave-scratch.mount`, installed by `tools/provision_node.sh`.
 
 Set `ENCLAVE_SCRATCH_DIR=/enclave/scratch` in the container environment, or the module falls back to its own default and you get a silent path mismatch.
 
@@ -292,19 +292,55 @@ At D = 100 MB that is ~3.4 GiB — comfortable. **Memory is not the constraint; 
 
 Read the chunk body into a single preallocated buffer rather than `request.get_data()` to keep the in-flight cost at 2× rather than 3×.
 
-### 2.9 Folder uploads
+### 2.9 Folders: uploaded tars and cloud prefixes
 
-A folder arrives as one uncompressed POSIX tar named `<folder>.tar`, through the transport above with nothing changed. `format` is the **member** format (never `tar`). Code: `lib/folder_bundle.py`.
+A folder reaches the enclave one of two ways, and both feed the same two pipelines.
 
-| Step | Where | What |
+- **Uploaded:** one uncompressed POSIX tar named `<folder>.tar`, through the transport above with nothing changed. `format` is the **member** format (never `tar`).
+- **Cloud (blob mode):** the decrypted `blobUrl`'s path ends in `/`, naming a blob prefix. Every encrypted blob under it is a member, encrypted like a single-blob input with the `keyVaultUrl` key. A blob-mode bundle carries no `filename` or `format`; the format is derived (below).
+
+Code: `lib/folder_bundle.py` (validation, both pipelines), `lib/blob_folder.py` (cloud listing and members), `lib/output_stream.py` (streamed output).
+
+**Caps**, by member format, in `MAX_FOLDER_BYTES_BY_FORMAT` (`enclave_direct_upload.py`). They match the UI's `maxFolderBytesByFormat` and the middleware's `MAX_FOLDER_BYTES`:
+
+| Member format | Folder cap | Per-file cap |
 |---|---|---|
-| Cap | `/upload/init` | A `.tar` name is checked against `MAX_FOLDER_BYTES` (300 MB) whatever the format, not the per-format cap. `MAX_FOLDER_BYTES` / `MAX_FOLDER_FILES` live in `enclave_direct_upload.py` and must match the UI's `maxFolderBytes` / `maxFolderFiles` and the middleware. |
-| Detect + validate | bundle upload (`stage_for_pipeline`) | Folder = `.tar` name **and** `ustar` at offset 257. Every member is walked once: regular files only (pax `x` headers allowed, GNU long names not), safe unique paths, ≤ 10,000 members, per-member cap, ≤ 300 MB total, and the single-file content sniff on every member. Any failure rejects the bundle (422) before a parser runs. A DP job with a folder is rejected here too. |
-| csv / json / excel | step 9 (`fetch_data`) | **Joint.** Members are combined into one input file of the member format, rows shuffled with `secrets.SystemRandom`, and SKALD runs once. JSON: a top-level object is one record. Excel: each workbook is merged as SKALD merges one workbook, then stacked into a single sheet. Fails the job on an unreadable member, a column the config never names, a record missing a quasi-identifier, or a non-numeric value in a numerical QI. |
-| dicom / image | step 10 (`run_docker_containers`) | **Per file.** One member at a time is staged, the application runs, its output is appended to `<folder>_anonymised.tar` in scratch, and data/ and output/ are cleared. A failed member is left out and listed in `_manifest.json`. |
-| Status | finalize-output | `outputs.direct` is unchanged; `outputs.folder` adds `mode`, `files_total`, and `records_in` (joint) or `files_succeeded` / `files_failed` (per file). |
+| dicom, image | 1 GiB (also the upload ceiling, 16 × 64 MiB) | 300 MB / 25 MB |
+| csv, json, excel | 500 MB | 300 MB / 300 MB / 25 MB |
 
-Peak scratch measured at ~300 MB: 290 MB joint (the bundle only), 576 MB per file (bundle + output tar).
+At most 10,000 members (`MAX_FOLDER_FILES`). An upload is checked at `/upload/init` (`.tar` name → folder cap). A cloud folder is checked from its listing.
+
+| Step | Uploaded tar | Cloud prefix |
+|---|---|---|
+| Detect | `.tar` name **and** `ustar` at offset 257, at bundle upload (`stage_for_pipeline`) | path ends in `/`, at step 9 (`fetch_data`) |
+| Validate | Every member walked once: regular files only (pax `x` allowed, GNU long names not), safe unique paths, count, per-member and folder caps, content sniff per member. Failure → 422 on the bundle. | URL (https, Azure Blob, a folder below the container) and SAS (`sp` with `l` and `r`; `sr=c`/`sr=d`, or `srt` with `c`+`o`) checked first. Then one flat listing, frozen (name, size, ETag). Directory markers, zero-size blobs and OS clutter are dropped. Member name = path below the prefix minus one `.enc`. Count, caps, one format, and the application's formats are all checked before any download. A refused listing is reported as refused, not as empty. |
+| Format | `format` field | From extensions: one format for the whole folder, else fail with counts ("12 csv, 3 json"); `skald` → csv/json/excel, `skald_dicom` → dicom, `skald_image` → image. No recognised extension → presumed DICOM in a DICOM folder (confirmed by `DICM` after decryption), refused elsewhere. |
+| Sizes | tar member sizes | Blob sizes are Fernet ciphertext, ~4/3 of the plaintext (base64), so caps use the plaintext bound the size implies. Real sizes are re-checked after decryption. |
+| csv / json / excel | **Joint.** Members combined into one input of the member format, rows shuffled (`secrets.SystemRandom`), SKALD once. JSON top-level object = one record. Excel: each workbook merged as SKALD merges one, then stacked. Fails on an unreadable member, a column the config never names, a record missing a QI, or a non-numeric numerical-QI value. | Same, members downloaded (`If-Match` the frozen ETag) and decrypted one at a time. Any member changed, removed or undecryptable fails the job. The output is then a single-file blob run's output in every respect: same naming, encryption and status. |
+| dicom / image | **Per file**, output streamed. The tar is read in place; one member at a time is staged in data/, de-identified, and appended to the output. The container is sealed in the **enclave manager** (the only holder of the browser's key), driven over loopback (`/internal/upload/<id>/folder-output/{begin,member,finish}`). | Per file, output streamed, sealed in the deploy subprocess under the bundle's per-run output key and written to `outputContainerUrl`. Members downloaded only when reached. A changed, removed or undecryptable member fails **that member**. |
+| Status | `outputs.direct` (`outputBlobUrl`, `filename`, `bytes`, `expires_at`) + `outputs.folder` (`mode`, `files_total`, and `records_in` or `files_succeeded`/`files_failed`). | Tabular: unchanged single-file status, **no** `outputs.folder` (the UI shows it as a normal tabular result). DICOM/image: `outputs.direct` + `outputs.folder`, as for an upload. |
+
+**The streamed output container.** A per-file folder's output never exists whole, as a tar or as ciphertext. Each member's output goes into a tar stream, the stream is cut into 16 MiB chunks, and each chunk is sealed and sent as a staged block (Put Block). The blob is assembled with Put Block List. The bytes are the unchanged `SPIDROU1` format, with two consequences of not knowing the size up front:
+
+- The header (which lists every chunk digest) is uploaded **last** and committed **first** in the block list.
+- `total_chunks` is in every chunk's AAD, so it is fixed before chunk 0 from a bound (2 × the folder cap). Chunks the output doesn't fill are sealed **empty** (a 16-byte tag each).
+
+The browser's `outputDownloadWorker.ts` reads exactly `total_chunks` framed chunks of any length and checks each digest and the root, so no UI change is needed. `tests/test_streamed_output.py` decrypts the output with that worker itself, under Node. Each streamed container gets a fresh random `base_iv`.
+
+**Measured** (`P3DX_SCRATCH_FULL=1`):
+
+| Run | Peak scratch | Peak RSS | Notes |
+|---|---|---|---|
+| DICOM folder upload, 1 GiB (127 × 8 MB), streamed | 1016 MB (the tar itself) | — | output 1016 MB in 128 chunks, decrypted identically by the UI worker |
+| DICOM cloud folder, 1 GiB, streamed | 0 MB | — | same output check |
+| CSV folder, 496 MB, 6.36M records | the tar, released after combining | combine 333 MB; SKALD 3.43 GB | |
+| JSON folder, 496 MB, 3.2M records | the tar, released after combining | combine 190 MB; SKALD **5.0 GB** | |
+| Excel folder, 60 MB, 1.5M rows | — | SKALD 1.75 GB (~29× the `.xlsx` bytes) | then failed writing its one-sheet output: over 1,048,576 rows |
+
+The tabular runs were measured on a 15 GB development machine with ~5 GB available, using the real SKALD binary. SKALD sizes its chunks at 20% of `MemAvailable`, so a 500 MB input should run as one chunk on DC2as_v5 too. That is still not a measurement on the SKU.
+
+- **JSON at 500 MB:** 5.0 GB plus ~1.5 GB of OS and manager is at the ~6.5 GB line.
+- **Excel:** a combined folder is one sheet, so it is refused up front past 1,048,575 rows (`EXCEL_MAX_ROWS`). Memory scales with cell bytes, though, so 500 MB of *wide* workbooks under that row count would want ~14 GB. The 500 MB Excel cap needs lowering (or a larger VM) in all three places.
 
 Known gap: per-file runs share nothing between members. With SKALD-DICOM's default policy the same `PatientID` in two files comes out with **different** hashes, because each run starts with a fresh keystore (recorded by `tests/test_folder_upload.py::DicomConsistency`). Fixing that needs changes in the DICOM and image applications.
 

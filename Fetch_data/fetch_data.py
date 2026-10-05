@@ -233,8 +233,8 @@ def _stage_folder_input(scratch_path, scratch_dir, upload_id, meta, fmt, output_
     dest_path = os.path.join(output_dir, stem.replace(os.sep, "_") + ext)
 
     try:
-        result = folder_bundle.combine_tabular(scratch_path, fmt, section, dest_path,
-                                               spool_dir=output_dir)
+        result = folder_bundle.combine_tabular(folder_bundle.tar_members(scratch_path), fmt,
+                                               section, dest_path, spool_dir=output_dir)
     except folder_bundle.FolderError as e:
         raise ValueError(f"Folder upload rejected: {e}") from None
 
@@ -248,6 +248,54 @@ def _stage_folder_input(scratch_path, scratch_dir, upload_id, meta, fmt, output_
         json.dump(meta, f)
 
     print(f"Folder upload staged: {result.files_total} file(s), {result.records_in} "
+          f"record(s) combined under '{data_type}' -> {dest_path}")
+
+
+def _stage_cloud_folder(dataset_url, keyvault_url, output_dir):
+    """Blob mode, with a folder URL (lib/blob_folder.py): list the prefix once,
+    check every limit from the listing, then
+
+    - csv/json/excel: download, decrypt and load one member at a time into one
+      combined, shuffled input in data/ — after which the run is a single-file
+      blob run in every respect, output included;
+    - dicom/image: stage nothing. The frozen plan and the decrypt function are
+      handed to P3DX_SDK, whose per-file loop downloads each member only when
+      it reaches it.
+    """
+    import P3DX_SDK
+    from lib import blob_folder, folder_bundle
+    from lib.direct_upload import head_matches_format
+    from lib.output_stream import BlobHttp
+
+    application = P3DX_SDK.current_application()
+    if application == "dp":
+        raise ValueError(blob_folder.DP_REJECTION)
+
+    http = BlobHttp(token_provider=lambda: get_mi_token(config.azure.storage_resource))
+    try:
+        plan = blob_folder.list_and_plan(http, dataset_url, application)
+    except folder_bundle.FolderError as e:
+        raise ValueError(f"Cloud folder rejected: {e}") from None
+    print(f"Cloud folder: {plan.files_total} {plan.fmt} file(s) under "
+          f"'{plan.folder.prefix}', ~{plan.estimated_bytes // (1024 * 1024)} MB, mode {plan.mode}")
+
+    cipher = create_fernet_cipher(fetch_fernet_key_from_kv(keyvault_url))
+
+    if plan.mode != folder_bundle.MODE_JOINT:
+        P3DX_SDK.set_cloud_folder({"plan": plan, "http": http, "decrypt": cipher.decrypt})
+        return
+
+    data_type, section = folder_bundle.load_section(config.paths.tee_input_config)
+    ext = {"csv": ".csv", "json": ".json", "excel": ".xlsx"}[plan.fmt]
+    os.makedirs(output_dir, exist_ok=True)
+    dest_path = os.path.join(output_dir, plan.folder.name + ext)
+    try:
+        result = folder_bundle.combine_tabular(
+            blob_folder.members(plan, http, cipher.decrypt, head_matches_format),
+            plan.fmt, section, dest_path, spool_dir=output_dir)
+    except folder_bundle.FolderError as e:
+        raise ValueError(f"Cloud folder rejected: {e}") from None
+    print(f"Cloud folder staged: {result.files_total} file(s), {result.records_in} "
           f"record(s) combined under '{data_type}' -> {dest_path}")
 
 
@@ -334,10 +382,18 @@ def fetch_and_decrypt_tee():
     dataset_url = urls["blobUrl"]
     keyvault_url = urls["keyVaultUrl"]
 
+    import P3DX_SDK
+    P3DX_SDK.reset_folder_state()
+
     if dataset_url.startswith("enclave://upload/"):
         _stage_direct_upload_input(dataset_url, output_dir, output_format)
         print("\nDirect-upload dataset staged from tmpfs scratch; "
               "skipping Azure Blob download and Key Vault fetch entirely")
+        return
+
+    from lib import blob_folder
+    if blob_folder.is_folder_url(dataset_url):
+        _stage_cloud_folder(dataset_url, keyvault_url, output_dir)
         return
 
     print("=" * 60)

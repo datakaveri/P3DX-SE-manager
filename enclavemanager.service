@@ -1,5 +1,7 @@
 [Unit]
 Description=AMD enclave manager systemd service
+# Scratch must be the tmpfs (enclave-scratch.mount), never the disk beneath it.
+RequiresMountsFor=/enclave/scratch
 
 [Service]
 User=kanonTEE

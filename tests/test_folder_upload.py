@@ -28,6 +28,7 @@ import tarfile
 import tempfile
 import types
 import unittest
+import urllib.parse
 from collections import Counter
 from unittest import mock
 
@@ -48,9 +49,11 @@ from lib.config import config  # noqa: E402
 from lib.direct_upload import head_matches_format  # noqa: E402
 from lib.folder_bundle import FolderError, MemberFailure  # noqa: E402
 from enclave.enclave_direct_upload import (  # noqa: E402
-    MAX_FOLDER_BYTES, MAX_FOLDER_FILES, MB, UploadError, UploadManager,
-    chunk_digest_root, encrypt_chunk,
+    MAX_FOLDER_BYTES_BY_FORMAT, MAX_FOLDER_FILES, MB, UploadError, UploadManager,
+    chunk_digest_root, encrypt_chunk, read_output_container,
 )
+from lib.output_stream import BlobHttp  # noqa: E402
+from tests.fake_azure import FakeAzure  # noqa: E402
 
 try:
     import openpyxl
@@ -218,13 +221,25 @@ class InitCap(TempDirCase):
     def test_an_image_folder_is_held_to_the_folder_cap_not_the_image_cap(self):
         self.init("photos.tar", "image", 200 * MB)          # 8x the 25 MB image cap
 
-    def test_the_folder_cap_is_300_mb_whatever_the_format(self):
-        for fmt in ("csv", "excel", "image", "dicom"):
+    def cap(self, fmt, limit):
+        self.init(f"f-{fmt}.tar", fmt, limit)
+        with self.assertRaises(UploadError) as ctx:
+            self.init(f"g-{fmt}.tar", fmt, limit + 1)
+        self.assertEqual(ctx.exception.status, 413)
+
+    def test_a_1_gib_dicom_or_image_folder_is_accepted_and_one_byte_more_refused(self):
+        for fmt in ("dicom", "image"):
             with self.subTest(fmt=fmt):
-                self.init(f"f-{fmt}.tar", fmt, MAX_FOLDER_BYTES)
-                with self.assertRaises(UploadError) as ctx:
-                    self.init(f"g-{fmt}.tar", fmt, MAX_FOLDER_BYTES + 1)
-                self.assertEqual(ctx.exception.status, 413)
+                self.cap(fmt, 1024 * MB)
+
+    def test_a_500_mb_tabular_folder_is_accepted_and_one_byte_more_refused(self):
+        for fmt in ("csv", "json", "excel"):
+            with self.subTest(fmt=fmt):
+                self.cap(fmt, 500 * MB)
+
+    def test_1_gib_is_also_the_transport_ceiling(self):
+        from enclave.enclave_direct_upload import CHUNK_SIZE, MAX_CHUNKS
+        self.assertEqual(MAX_FOLDER_BYTES_BY_FORMAT["dicom"], CHUNK_SIZE * MAX_CHUNKS)
 
     def test_single_files_keep_their_per_format_cap(self):
         with self.assertRaises(UploadError) as ctx:
@@ -237,7 +252,9 @@ class InitCap(TempDirCase):
         self.assertEqual(ctx.exception.status, 400)
 
     def test_constants_match_the_ui(self):
-        self.assertEqual(MAX_FOLDER_BYTES, 300 * MB)
+        self.assertEqual(MAX_FOLDER_BYTES_BY_FORMAT, {
+            "csv": 500 * MB, "json": 500 * MB, "excel": 500 * MB,
+            "dicom": 1024 * MB, "image": 1024 * MB})
         self.assertEqual(MAX_FOLDER_FILES, 10_000)
 
 
@@ -308,7 +325,7 @@ class Validation(TempDirCase):
             self.fails([("a.csv", b"id\n1\n"), ("b.csv", b"id\n" + b"1\n" * 10)], "over the")
 
     def test_sum_over_the_folder_cap(self):
-        with mock.patch.object(folder_bundle, "MAX_FOLDER_BYTES", 20):
+        with mock.patch.dict(folder_bundle.MAX_FOLDER_BYTES_BY_FORMAT, {"csv": 20}):
             self.fails([("a.csv", b"id\n" + b"1\n" * 5), ("b.csv", b"id\n" + b"1\n" * 5)],
                        "add up to more than")
 
@@ -417,7 +434,8 @@ class JointBase(TempDirCase):
         tar = build_tar(self.path("in.tar"), members)
         ext = {"csv": ".csv", "json": ".json", "excel": ".xlsx"}[fmt]
         out = self.path("data", data_type + ext)
-        result = folder_bundle.combine_tabular(tar, fmt, section, out, os.path.dirname(out))
+        result = folder_bundle.combine_tabular(folder_bundle.tar_members(tar), fmt, section,
+                                               out, os.path.dirname(out))
         self.assertFalse(os.path.exists(os.path.join(os.path.dirname(out), ".folder-records.spool")),
                          "the record spool must not outlive the combine")
         return result
@@ -654,6 +672,13 @@ class JointExcel(JointBase):
         with self.assertRaisesRegex(FolderError, r"\['ssn'\]"):
             self.combine(self.members() + [("c.xlsx", buf.getvalue())], "excel", self.SECTION)
 
+    def test_more_rows_than_one_sheet_holds_fails_before_skald(self):
+        # Found on a real run: 1.5M combined rows were written and read, then
+        # SKALD failed writing its one-sheet result. Refuse it up front instead.
+        with mock.patch.object(folder_bundle, "EXCEL_MAX_ROWS", 3):
+            with self.assertRaisesRegex(FolderError, "more than 3 rows.*clinic_b.xlsx"):
+                self.combine(self.members(), "excel", self.SECTION)
+
     @unittest.skipUnless(HAVE_SKALD, "SKALD pipeline binary not available")
     def test_skald_reads_the_combined_workbook(self):
         section = dict(self.SECTION, k_anonymize={"k": 2})
@@ -738,7 +763,9 @@ class PerFile(TempDirCase):
         os.makedirs(work)
         out = self.path("out.tar")
         process, cleanup = fake_dicom_app(work)
-        return folder_bundle.run_per_file(tar, "dicom", out, process, cleanup), out
+        manifest, _ = folder_bundle.run_per_file(folder_bundle.tar_members(tar), "dicom",
+                                                 folder_bundle.LocalTarSink(out), process, cleanup)
+        return manifest, out
 
     def test_output_mirrors_input_paths_and_carries_a_manifest(self):
         manifest, out = self.run_folder()
@@ -771,7 +798,9 @@ class PerFile(TempDirCase):
             with open(p, "wb") as f:
                 f.write(b"ok")
             return p
-        manifest = folder_bundle.run_per_file(tar, "dicom", self.path("out.tar"), process, lambda: None)
+        manifest, _ = folder_bundle.run_per_file(folder_bundle.tar_members(tar), "dicom",
+                                                 folder_bundle.LocalTarSink(self.path("out.tar")),
+                                                 process, lambda: None)
         self.assertEqual(manifest["files"][1]["error"], "processing failed")
 
     def test_no_member_succeeding_fails_the_job(self):
@@ -780,8 +809,37 @@ class PerFile(TempDirCase):
         def process(name, fh):
             raise MemberFailure("unparsable DICOM")
         with self.assertRaisesRegex(FolderError, "none of the 1"):
-            folder_bundle.run_per_file(tar, "dicom", self.path("out.tar"), process, lambda: None)
+            folder_bundle.run_per_file(folder_bundle.tar_members(tar), "dicom",
+                                       folder_bundle.LocalTarSink(self.path("out.tar")),
+                                       process, lambda: None)
         self.assertFalse(os.path.exists(self.path("out.tar")))
+
+    def test_a_sink_failure_stops_the_run_and_aborts_the_output(self):
+        tar = build_tar(self.path("in.tar"), [("a", DICOM), ("b", DICOM), ("c", DICOM)])
+        events = []
+
+        class BrokenSink:
+            def add_file(self, arcname, path):
+                events.append(("add", arcname))
+                if len(events) == 2:
+                    raise RuntimeError("Put Block failed: HTTP 503")
+
+            def close(self, name, body):
+                events.append("close")
+
+            def abort(self):
+                events.append("abort")
+
+        def process(name, fh):
+            p = self.path("o.dcm")
+            with open(p, "wb") as f:
+                f.write(fh.read())
+            return p
+        with self.assertRaisesRegex(RuntimeError, "Put Block failed"):
+            folder_bundle.run_per_file(folder_bundle.tar_members(tar), "dicom", BrokenSink(),
+                                       process, lambda: None)
+        self.assertEqual(events, [("add", "a_anonymised.dcm"), ("add", "b_anonymised.dcm"), "abort"],
+                         "no member after the failure, never closed")
 
     def test_image_output_names(self):
         self.assertEqual(folder_bundle.output_name("a/x.jpeg", "image", "/o/redacted.jpg"),
@@ -789,10 +847,13 @@ class PerFile(TempDirCase):
         self.assertEqual(folder_bundle.output_name("IM1", "dicom", "/o/after.dcm"), "IM1_anonymised.dcm")
 
 
-class PerFileThroughTheSdk(TempDirCase):
-    """P3DX_SDK._run_folder_per_file with the container replaced: staging of
-    each member, workspace clearing, the status check, the handoff to
-    finalize, and release of the bundle."""
+class SdkFolderCase(TempDirCase):
+    """Shared set-up for running the SDK's folder paths with the application
+    container replaced: data/ and output/ redirected, and a fake container
+    that de-identifies a DICOM (or fails an unparsable one, with PHI in its
+    error message that must not travel)."""
+
+    OUTPUT_CONTAINER = "https://acct.blob.core.windows.net/output-data"
 
     def setUp(self):
         super().setUp()
@@ -806,6 +867,9 @@ class PerFileThroughTheSdk(TempDirCase):
             p.start()
             self.addCleanup(p.stop)
         self.staged_names = []
+        self.azure = FakeAzure()
+        self.http = BlobHttp(session=self.azure, token_provider=lambda: "tok")
+        self.addCleanup(self.sdk.reset_folder_state)
 
     def fake_container(self):
         staged = os.listdir(self.data)
@@ -813,7 +877,7 @@ class PerFileThroughTheSdk(TempDirCase):
         assert len(staged) == 1, staged
         with open(os.path.join(self.data, staged[0]), "rb") as f:
             data = f.read()
-        if data[128:132] != b"DICM":
+        if data[128:132] != b"DICM" or b"BROKEN" in data:
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "error", "error": "Unparsable DICOM: PatientName=DOE"}, f)
             return
@@ -825,33 +889,94 @@ class PerFileThroughTheSdk(TempDirCase):
             with open(os.path.join(case, name), "wb") as f:
                 f.write(body)
 
-    def test_per_file_run(self):
-        uid = "0f8fad5b-d9cb-469f-a165-70867728950e"
-        tar = build_tar(os.path.join(self.scratch, f"{uid}.bin"),
-                        [("s1/IM0001", DICOM + b"1"), ("s1/IM0002", b"garbage"), ("s2/IM0003", DICOM + b"3")])
-        meta = {"filename": "scans.tar", "format": "dicom", "folder": {"mode": "per_file", "files_total": 3}}
-        with open(os.path.join(self.scratch, f"{uid}.meta.json"), "w") as f:
-            json.dump(meta, f)
+    def open_output(self, url, key):
+        """Decrypt a committed output blob the way the browser does."""
+        path = urllib.parse.urlsplit(url).path.lstrip("/")
+        container, _, name = path.partition("/")
+        header, plaintext = read_output_container(io.BytesIO(self.azure.read(container, name)), key)
+        return header, tarfile.open(fileobj=io.BytesIO(plaintext))
+
+
+class PerFileUploadThroughTheSdk(SdkFolderCase):
+    """An uploaded DICOM folder end to end: P3DX_SDK's per-member loop in the
+    'subprocess', streaming over (shimmed) loopback into the enclave manager's
+    folder-output functions, sealed under the real upload session's output
+    key, committed to (fake) blob storage, and decrypted back."""
+
+    def setUp(self):
+        super().setUp()
+        self.up = _Uploads(self.scratch)
+        self.loopback = []
+        for name, value in (("get_manager", self.up.manager), ("_scratch_dir", self.scratch),
+                            ("_storage_http", self.http),
+                            ("_output_blob_base_url", self.OUTPUT_CONTAINER)):
+            p = mock.patch.object(direct_upload, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(self.sdk, "load_config_file",
+                              return_value={"enclaveManagerAddress": "http://127.0.0.1:4000"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def post(self, url, json=None, timeout=None):
+        """requests.post to the manager's loopback routes, dispatched in-process."""
+        uid, action = url.rstrip("/").split("/")[-3], url.rstrip("/").split("/")[-1]
+        self.loopback.append(action)
+        try:
+            if action == "begin":
+                body = direct_upload.folder_output_begin(uid, json["filename"], json["format"],
+                                                         json.get("output_key_check"))
+            elif action == "member":
+                body = direct_upload.folder_output_member(uid, json["output_path"], json["arcname"])
+            elif action == "finish":
+                body = direct_upload.folder_output_finish(uid, json["manifest"])
+            else:
+                direct_upload.folder_output_abort(uid)
+                body = {}
+        except UploadError as e:
+            return mock.Mock(status_code=e.status, text=e.description)
+        return mock.Mock(status_code=200, json=lambda: body)
+
+    def test_per_file_run_streams_through_the_manager(self):
+        payload = _read(build_tar(self.path("t.tar"), [
+            ("s1/IM0001", DICOM + b"1"), ("s1/IM0002", DICOM + b"BROKEN PatientName=DOE"),
+            ("s2/IM0003", DICOM + b"3")]))
+        ref = self.up.upload("u1", "scans.tar", "dicom", payload)
+        direct_upload.stage_for_pipeline("u1", ref)
+        uid = ref.rsplit("/", 1)[1]
+        output_key, _ = self.up.manager.output_key_for(uid)
 
         with mock.patch.object(self.sdk, "_run_application_once", self.fake_container), \
                 mock.patch.object(self.sdk, "_direct_upload_id", return_value=uid), \
-                mock.patch.object(direct_upload, "_scratch_dir", return_value=self.scratch):
+                mock.patch.object(self.sdk.requests, "post", self.post):
             self.sdk.run_docker_containers()
+            url = self.sdk._upload_direct_output(self.out, {"blobUrl": ref})
 
         self.assertEqual(self.staged_names, ["input.dcm"] * 3, "each member alone, as .dcm")
-        self.assertFalse(os.path.exists(tar), "bundle released after the loop")
-        self.assertEqual(os.listdir(self.out), [self.sdk.FOLDER_OUTPUT_NAME])
-        with tarfile.open(os.path.join(self.out, self.sdk.FOLDER_OUTPUT_NAME)) as tf:
-            self.assertEqual(sorted(tf.getnames()), ["_manifest.json", "s1/IM0001_anonymised.dcm",
-                                                     "s2/IM0003_anonymised.dcm"])
-            manifest = json.load(tf.extractfile("_manifest.json"))
-            blob = b"".join(tf.extractfile(m).read() for m in tf.getmembers())
+        self.assertEqual(self.loopback, ["begin", "member", "member", "finish"])
+        self.assertFalse(os.path.exists(os.path.join(self.scratch, f"{uid}.bin")),
+                         "bundle released after the last member")
+        self.assertEqual(url, f"{self.OUTPUT_CONTAINER}/{uid}.enc")
+
+        header, tf = self.open_output(url, output_key)
+        self.assertEqual(header["filename"], "scans_anonymised.tar")
+        self.assertEqual(header["content_type"], "application/x-tar")
+        self.assertEqual(sorted(tf.getnames()), ["_manifest.json", "s1/IM0001_anonymised.dcm",
+                                                 "s2/IM0003_anonymised.dcm"])
+        manifest = json.load(tf.extractfile("_manifest.json"))
         self.assertEqual(manifest["files"][1]["error"], "unparsable DICOM")
+        blob = b"".join(tf.extractfile(m).read() for m in tf.getmembers())
         self.assertNotIn(b"DOE", blob)
-        self.assertNotIn(b"garbage", blob)
-        stored = direct_upload.read_staged_meta(self.scratch, uid)
-        self.assertEqual(stored["folder"], {"mode": "per_file", "files_total": 3,
-                                            "files_succeeded": 2, "files_failed": 1})
+        self.assertNotIn(b"BROKEN", blob)
+
+        with open(config.get_path("status")) as f:
+            status = json.load(f)
+        self.assertEqual(status["outputs"]["direct"]["outputBlobUrl"], url)
+        self.assertEqual(status["outputs"]["direct"]["filename"], "scans_anonymised.tar")
+        self.assertEqual(status["outputs"]["direct"]["bytes"], header["total_bytes"])
+        self.assertIn("expires_at", status["outputs"]["direct"])
+        self.assertEqual(status["outputs"]["folder"], {"mode": "per_file", "files_total": 3,
+                                                       "files_succeeded": 2, "files_failed": 1})
 
     def test_a_single_file_run_is_untouched(self):
         called = []
@@ -936,8 +1061,9 @@ class DicomConsistency(unittest.TestCase):
             shutil.copy(found[0], dst)
             return dst
 
-        manifest = folder_bundle.run_per_file(tar, "dicom", os.path.join(self.dir, "out.tar"),
-                                              process, lambda: None)
+        manifest, _ = folder_bundle.run_per_file(
+            folder_bundle.tar_members(tar), "dicom",
+            folder_bundle.LocalTarSink(os.path.join(self.dir, "out.tar")), process, lambda: None)
         self.assertEqual(manifest["files_succeeded"], 2)
         with tarfile.open(os.path.join(self.dir, "out.tar")) as tf:
             return [str(self.pydicom.dcmread(tf.extractfile(m)).PatientID)
@@ -992,47 +1118,14 @@ def _du(path):
     return total
 
 
-class ScratchPeak(TempDirCase):
-    """Only the bundle and (per file) the output tar may live in scratch; each
-    member's input and output go to data/ and output/. At the default size this
-    runs a 30 MB bundle and bounds peak as a multiple of it; set
-    P3DX_SCRATCH_FULL=1 to measure the real 300 MB case."""
+class JointScratchPeak(TempDirCase):
+    """A tabular folder adds nothing to scratch beyond the uploaded bundle: the
+    record spool and the combined input live in data/. (Per-file folders are
+    measured in test_streamed_output.ScratchPeak.) P3DX_SCRATCH_FULL=1 runs it
+    at the 500 MB tabular folder cap."""
 
     FULL = os.environ.get("P3DX_SCRATCH_FULL") == "1"
-    BUNDLE = 290 * MB if FULL else 30 * MB
-    LIMIT = 2 * 1024 * MB
-
-    def test_per_file_peak(self):
-        scratch = os.path.join(self.dir, "scratch")
-        work = os.path.join(self.dir, "output")
-        os.makedirs(scratch)
-        os.makedirs(work)
-        size = 3 * MB
-        n = self.BUNDLE // size
-        members = [(f"d{i // 50}/IM{i:05d}", DICOM + os.urandom(size - len(DICOM))) for i in range(n)]
-        tar = build_tar(os.path.join(scratch, "u.bin"), members)
-        del members
-        bundle = os.path.getsize(tar)
-        peak = [bundle]
-
-        def process(name, fh):
-            out = os.path.join(work, "after_deidentification.dcm")
-            with open(out, "wb") as f:
-                shutil.copyfileobj(fh, f)
-            peak[0] = max(peak[0], _du(scratch))
-            return out
-
-        def cleanup():
-            for x in os.listdir(work):
-                os.unlink(os.path.join(work, x))
-            peak[0] = max(peak[0], _du(scratch))
-
-        folder_bundle.run_per_file(tar, "dicom", os.path.join(scratch, "u.out.tar"), process, cleanup)
-        peak[0] = max(peak[0], _du(scratch))
-        print(f"\n  per-file: bundle {bundle / MB:.0f} MB, peak scratch {peak[0] / MB:.0f} MB", flush=True)
-        self.assertLessEqual(peak[0], 2.1 * bundle)
-        self.assertLess(peak[0] * (300 * MB / bundle), self.LIMIT / 2,
-                        "at 300 MB this would not stay well under 2 GiB")
+    BUNDLE = 495 * MB if FULL else 30 * MB
 
     def test_joint_peak(self):
         scratch = os.path.join(self.dir, "scratch")
@@ -1069,7 +1162,7 @@ class ScratchPeak(TempDirCase):
             real_add(spool, obj)
 
         with mock.patch.object(folder_bundle._Spool, "add", add):
-            result = folder_bundle.combine_tabular(tar, "csv", section,
+            result = folder_bundle.combine_tabular(folder_bundle.tar_members(tar), "csv", section,
                                                    os.path.join(data, "p.csv"), data)
         peak[0] = max(peak[0], _du(scratch))
         print(f"\n  joint: bundle {bundle / MB:.0f} MB, {result.records_in:,} records, "

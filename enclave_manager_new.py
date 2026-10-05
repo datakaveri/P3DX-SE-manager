@@ -1090,6 +1090,45 @@ def upload_finalize_output(upload_id):
         return jsonify({"title": "Error", "description": f"finalize-output failed: {e}"}), 400
 
 
+@app.route("/internal/upload/<upload_id>/folder-output/<action>", methods=["POST"])
+def upload_folder_output(upload_id, action):
+    """
+    The streamed output of a DICOM/image folder upload, driven by the deploy
+    subprocess one member at a time (lib/direct_upload.folder_output_*). Host
+    internal, like finalize-output, and for the same reason: only this process
+    holds the browser's output key, so the container is sealed here while the
+    subprocess only ever names files in the pipeline's output directory.
+    """
+    try:
+        _require_loopback()
+        body = request.get_json(silent=True) or {}
+        if action == "begin":
+            key_check = body.get("output_key_check")
+            result = direct_upload.folder_output_begin(
+                upload_id, filename=str(body.get("filename", "")),
+                fmt=str(body.get("format", "")),
+                output_key_check=str(key_check) if key_check is not None else None,
+            )
+        elif action == "member":
+            result = direct_upload.folder_output_member(
+                upload_id, body.get("output_path"), body.get("arcname"))
+        elif action == "finish":
+            result = direct_upload.folder_output_finish(upload_id, body.get("manifest"))
+        elif action == "abort":
+            direct_upload.folder_output_abort(upload_id)
+            result = {"aborted": True}
+        else:
+            raise UploadError(404, f"unknown folder-output action '{action}'")
+        return jsonify(result), 200
+    except UploadError as e:
+        return _upload_error_response(e)
+    except Exception as e:
+        # The stream is unusable after any failure; drop it so a retry starts clean.
+        direct_upload.folder_output_abort(upload_id)
+        return jsonify({"title": "Error",
+                        "description": f"folder-output {action} failed: {type(e).__name__}: {e}"}), 500
+
+
 # ---------------------------------------------------------------------------
 # Pipeline helpers
 # ---------------------------------------------------------------------------

@@ -116,7 +116,9 @@ TARBALL=$(mktemp /tmp/fleet-XXXX.tgz)
 tar czf "$TARBALL" -C "$HERE" \
   Bundle/decryption.py P3DX_SDK.py config.yml deploy_enclave.py \
   enclave/enclave_direct_upload.py enclave_manager_new.py enclavemanager.service \
+  enclave-scratch.mount Fetch_data/fetch_data.py \
   lib/config.py lib/direct_upload.py lib/sealed_key.py \
+  lib/folder_bundle.py lib/blob_folder.py lib/output_stream.py \
   tools/sealed_key_test.py tools/tpm_seal_check.py
 scp -q -o BatchMode=yes "$TARBALL" "$REPO_USER@$IP:/tmp/fleet.tgz"
 rm -f "$TARBALL"
@@ -125,6 +127,14 @@ set -e
 tar xzf /tmp/fleet.tgz -C $REPO && rm -f /tmp/fleet.tgz
 chown -R $REPO_USER:$REPO_USER $REPO
 cp $REPO/enclavemanager.service /etc/systemd/system/enclavemanager.service
+# Scratch tmpfs at 3 GiB (a 1 GiB folder upload is reassembled there). A unit in
+# /etc/systemd/system overrides an fstab entry for the same path; the reboot in
+# step 7 mounts it at the new size.
+sed -e "s/@UID@/\$(id -u $REPO_USER)/" -e "s/@GID@/\$(id -g $REPO_USER)/" \
+  $REPO/enclave-scratch.mount > /etc/systemd/system/enclave-scratch.mount
+systemctl enable enclave-scratch.mount
+# openpyxl (Excel folders) is the one dependency the folder work added.
+$VENV/pip install -q "openpyxl>=3.1"
 mkdir -p /etc/systemd/system/enclavemanager.service.d
 cat > /etc/systemd/system/enclavemanager.service.d/fleet.conf <<CONF
 [Service]

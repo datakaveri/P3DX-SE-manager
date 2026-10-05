@@ -1,8 +1,14 @@
 """
-Folder uploads: a folder arrives as ONE uncompressed POSIX tar through the
-unchanged direct-upload transport (job -> /upload/init -> chunks -> complete).
-Decryption, AAD, digests and the digest root all apply to the tar bytes exactly
-as to any other file; nothing here touches them.
+Folder inputs. A folder reaches the enclave one of two ways:
+
+- uploaded, as ONE uncompressed POSIX tar through the unchanged direct-upload
+  transport (job -> /upload/init -> chunks -> complete). Decryption, AAD,
+  digests and the digest root all apply to the tar bytes exactly as to any
+  other file; nothing here touches them.
+- in blob mode, as a blob PREFIX (lib/blob_folder.py), each blob encrypted like
+  a single-blob input.
+
+Either way the pipelines below see the same thing: a sequence of `Member`s.
 
 Two modes, chosen by the member format (every member is of `format`):
 
@@ -27,7 +33,8 @@ result is handed to SKALD as a single-sheet workbook, which it reads as-is.
 
 This module has no Flask or docker dependency. lib/direct_upload.py calls the
 validation at bundle-upload time; Fetch_data/fetch_data.py calls the combiner;
-P3DX_SDK.py drives the per-file loop.
+P3DX_SDK.py drives the per-file loop, whose output streams into a sink
+(lib/output_stream.py) rather than being staged.
 """
 
 from __future__ import annotations
@@ -47,7 +54,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO, Callable, Iterator
 
 from enclave.enclave_direct_upload import (
-    MAX_FOLDER_BYTES,
+    MAX_FOLDER_BYTES_BY_FORMAT,
     MAX_FOLDER_FILES,
     MAX_TOTAL_BYTES_BY_FORMAT,
     MB,
@@ -66,6 +73,11 @@ USTAR_OFFSET = 257
 USTAR_MAGIC = b"ustar"
 
 MANIFEST_NAME = "_manifest.json"
+
+#: Data rows one worksheet can hold (1,048,576 rows, less the header). An Excel
+#: folder combines into ONE sheet, and SKALD writes its result as one sheet, so
+#: past this neither the input nor the output can exist.
+EXCEL_MAX_ROWS = 1_048_576 - 1
 DP_REJECTION = "folder upload is not supported for differential privacy yet"
 
 _BLOCK = 512
@@ -85,6 +97,22 @@ class MemberFailure(Exception):
 
 def mode_for(fmt: str) -> str:
     return MODE_JOINT if fmt in JOINT_FORMATS else MODE_PER_FILE
+
+
+@dataclass
+class Member:
+    """One file of a folder. `open()` returns a binary file (usable as a
+    context manager), or raises MemberFailure with a content-free reason when
+    the member cannot be produced — e.g. a blob that changed after listing."""
+    name: str
+    open: Callable[[], BinaryIO]
+
+
+def tar_members(tar_path: str) -> Iterator[Member]:
+    """The members of an uploaded (already validated) folder tar, read in place."""
+    with tarfile.open(tar_path, "r:") as tf:
+        for m in tf:
+            yield Member(m.name, lambda m=m: tf.extractfile(m))
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +222,7 @@ def validate_archive(path: str, fmt: str,
     .head_matches_format), passed in so both paths share one definition."""
     fmt = fmt.lower()
     per_member_cap = MAX_TOTAL_BYTES_BY_FORMAT[fmt]
+    folder_cap = MAX_FOLDER_BYTES_BY_FORMAT[fmt]
     summary = ArchiveSummary(fmt=fmt, mode=mode_for(fmt))
     seen = set()
     file_size = os.path.getsize(path)
@@ -230,9 +259,10 @@ def validate_archive(path: str, fmt: str,
                         f"{per_member_cap // MB} MB limit for {fmt.upper()} files"
                     )
                 summary.total_bytes += member.size
-                if summary.total_bytes > MAX_FOLDER_BYTES:
+                if summary.total_bytes > folder_cap:
                     raise FolderError(
-                        f"the folder's files add up to more than {MAX_FOLDER_BYTES // MB} MB"
+                        f"the folder's files add up to more than the {folder_cap // MB} MB "
+                        f"limit for a {fmt.upper()} folder"
                     )
                 data_end = member.offset_data + member.size
                 if data_end > file_size:
@@ -528,14 +558,17 @@ class JointResult:
     columns: list
 
 
-def combine_tabular(tar_path: str, fmt: str, section: dict, out_path: str,
+def combine_tabular(members, fmt: str, section: dict, out_path: str,
                     spool_dir: str) -> JointResult:
     """Load every member with its format's loader, concatenate over the union
     of columns, and write ONE shuffled input file of the member format.
 
+    `members` is an iterable of Member (tar_members, or a blob listing). Each
+    member's raw bytes are dropped as soon as it is loaded.
+
     Fails the whole job — naming the member — on any member that cannot be
-    loaded: dropping one quietly changes the dataset k is computed over, and
-    with one patient per file a patient would vanish from the release.
+    loaded or produced: dropping one quietly changes the dataset k is computed
+    over, and with one patient per file a patient would vanish from the release.
 
     Rows are shuffled HERE, with secrets.SystemRandom, as they are written for
     SKALD. Input order follows the sorted file paths, and SKALD keeps row
@@ -576,34 +609,44 @@ def combine_tabular(tar_path: str, fmt: str, section: dict, out_path: str,
                     )
 
     try:
-        with tarfile.open(tar_path, "r:") as tf:
-            for member in tf:
-                files += 1
-                name = member.name
-                with tf.extractfile(member) as fh:
-                    if fmt == "json":
-                        for rec in _load_json_member(fh, name):
-                            note_columns(rec.keys())
-                            check_record(name, rec, lambda c, r=rec: _json_scalar_to_string(r[c]))
-                            spool.add(rec)
-                    elif fmt == "csv":
-                        for header, row in _load_csv_member(fh, name):
-                            rec = dict(zip(header, row))
-                            note_columns(header)
-                            check_record(name, rec, rec.__getitem__)
-                            spool.add(rec)
-                    else:
-                        sheet = _load_excel_member(fh, name, sheet_joins)
-                        if len(set(sheet.columns)) != len(sheet.columns):
-                            raise FolderError(
-                                f"folder member '{_printable(name)}' has a repeated column "
-                                f"name after its sheets are joined"
-                            )
-                        note_columns(sheet.columns)
-                        for row in sheet.rows:
-                            rec = dict(zip(sheet.columns, row))
-                            check_record(name, rec, lambda c, r=rec: _cell_str(r[c]))
-                            spool.add(rec)
+        for member in members:
+            files += 1
+            name = member.name
+            try:
+                fh = member.open()
+            except MemberFailure as exc:
+                raise FolderError(f"folder member '{_printable(name)}': {exc}") from None
+            with fh:
+                if fmt == "json":
+                    for rec in _load_json_member(fh, name):
+                        note_columns(rec.keys())
+                        check_record(name, rec, lambda c, r=rec: _json_scalar_to_string(r[c]))
+                        spool.add(rec)
+                elif fmt == "csv":
+                    for header, row in _load_csv_member(fh, name):
+                        rec = dict(zip(header, row))
+                        note_columns(header)
+                        check_record(name, rec, rec.__getitem__)
+                        spool.add(rec)
+                else:
+                    sheet = _load_excel_member(fh, name, sheet_joins)
+                    if len(set(sheet.columns)) != len(sheet.columns):
+                        raise FolderError(
+                            f"folder member '{_printable(name)}' has a repeated column "
+                            f"name after its sheets are joined"
+                        )
+                    note_columns(sheet.columns)
+                    if len(spool) + len(sheet.rows) > EXCEL_MAX_ROWS:
+                        raise FolderError(
+                            f"the folder's workbooks add up to more than {EXCEL_MAX_ROWS:,} "
+                            f"rows (reached at '{_printable(name)}'), the most one Excel "
+                            f"sheet can hold; the combined dataset and its output are each "
+                            f"one sheet"
+                        )
+                    for row in sheet.rows:
+                        rec = dict(zip(sheet.columns, row))
+                        check_record(name, rec, lambda c, r=rec: _cell_str(r[c]))
+                        spool.add(rec)
 
         unknown = [c for c in columns if c not in configured]
         if unknown:
@@ -938,76 +981,112 @@ def output_name(member_name: str, fmt: str, produced_path: str) -> str:
     return posixpath.join(directory, out) if directory else out
 
 
-def run_per_file(tar_path: str, fmt: str, out_tar_path: str,
+def run_per_file(members, fmt: str, sink,
                  process_member: Callable[[str, BinaryIO], str],
-                 cleanup_member: Callable[[], None]) -> dict:
-    """De-identify each member on its own and stream the results into
-    `out_tar_path`, one member on disk at a time.
+                 cleanup_member: Callable[[], None]) -> tuple:
+    """De-identify each member on its own and stream each result into `sink`
+    the moment it exists, one member on disk at a time.
 
-    `process_member(name, fileobj)` runs the existing single-file path and
-    returns the path of the output it produced; `cleanup_member()` removes that
-    member's input and output whatever happened. A member that fails is LEFT
-    OUT of the output — never copied through raw — and listed in the manifest
-    with a fixed, content-free reason. Returns the manifest; raises FolderError
-    if no member succeeded.
+    `members` is an iterable of Member. `process_member(name, fileobj)` runs the
+    existing single-file path and returns the path of the output it produced;
+    `cleanup_member()` removes that member's input and output whatever
+    happened. `sink` takes `add_file(arcname, path)`, `close(manifest_name,
+    manifest_bytes)` and `abort()` (lib/output_stream.StreamingTarSink, or the
+    loopback sink that drives one in the enclave manager).
+
+    A member that fails — including one whose source could not be produced —
+    is LEFT OUT of the output, never copied through raw, and listed in the
+    manifest with a fixed, content-free reason. Returns (manifest, whatever
+    sink.close returned); raises FolderError, after aborting the sink, if no
+    member succeeded.
     """
     results, used = [], set()
-    now = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
     try:
-        with tarfile.open(tar_path, "r:") as src, \
-                tarfile.open(out_tar_path, "w:", format=tarfile.PAX_FORMAT) as dst:
-            os.chmod(out_tar_path, 0o600)
-            for member in src:
-                entry = {"path": member.name}
+        for member in members:
+            entry = {"path": member.name}
+            try:
                 try:
-                    with src.extractfile(member) as fh:
+                    with member.open() as fh:
                         produced = process_member(member.name, fh)
                     arcname = output_name(member.name, fmt, produced)
                     if arcname in used or arcname == MANIFEST_NAME:
                         raise MemberFailure("output name collides with another file's output")
-                    info = tarfile.TarInfo(arcname)
-                    info.size = os.path.getsize(produced)
-                    info.mode, info.mtime = 0o644, now
-                    with open(produced, "rb") as out:
-                        dst.addfile(info, out)
-                    used.add(arcname)
-                    entry.update(status="ok", output=arcname)
                 except MemberFailure as exc:
                     entry.update(status="failed", error=str(exc))
+                except FolderError:
+                    raise
                 except Exception:
                     # Never the exception text: it can quote the member's bytes.
                     entry.update(status="failed", error="processing failed")
-                finally:
-                    cleanup_member()
-                results.append(entry)
+                else:
+                    # Outside the member's own error handling on purpose: a sink
+                    # that fails part-way has a broken stream, so nothing after
+                    # it can be written correctly and the whole run must stop.
+                    sink.add_file(arcname, produced)
+                    used.add(arcname)
+                    entry.update(status="ok", output=arcname)
+            finally:
+                cleanup_member()
+            results.append(entry)
 
-            ok = sum(1 for r in results if r["status"] == "ok")
-            manifest = {
-                "mode": MODE_PER_FILE,
-                "application": _APPLICATION_BY_FORMAT.get(fmt, fmt),
-                "format": fmt,
-                "paths_deidentified": False,
-                "paths_note": "Paths are the uploader's own file and folder names "
-                              "and have not been de-identified.",
-                "files_total": len(results),
-                "files_succeeded": ok,
-                "files_failed": len(results) - ok,
-                "files": results,
-            }
-            body = json.dumps(manifest, indent=2).encode("utf-8")
-            info = tarfile.TarInfo(MANIFEST_NAME)
-            info.size, info.mode, info.mtime = len(body), 0o644, now
-            dst.addfile(info, io.BytesIO(body))
+        ok = sum(1 for r in results if r["status"] == "ok")
+        manifest = {
+            "mode": MODE_PER_FILE,
+            "application": _APPLICATION_BY_FORMAT.get(fmt, fmt),
+            "format": fmt,
+            "paths_deidentified": False,
+            "paths_note": "Paths are the uploader's own file and folder names "
+                          "and have not been de-identified.",
+            "files_total": len(results),
+            "files_succeeded": ok,
+            "files_failed": len(results) - ok,
+            "files": results,
+        }
+        if ok == 0:
+            raise FolderError(
+                f"none of the {len(results)} file(s) in the folder could be de-identified"
+            )
+        closed = sink.close(MANIFEST_NAME, json.dumps(manifest, indent=2).encode("utf-8"))
     except BaseException:
-        _unlink(out_tar_path)
+        sink.abort()
         raise
+    return manifest, closed
 
-    if manifest["files_succeeded"] == 0:
-        _unlink(out_tar_path)
-        raise FolderError(
-            f"none of the {manifest['files_total']} file(s) in the folder could be de-identified"
-        )
-    return manifest
+
+class SinkFailure(Exception):
+    """The output sink itself failed (upload, encryption, size). Fatal to the
+    whole run: unlike one member's failure, nothing after it can be written."""
+
+
+class LocalTarSink:
+    """The sink protocol over a plain tar file. Used where the output does not
+    leave through the streaming container (tests, local tooling)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._tar = tarfile.open(path, "w:", format=tarfile.PAX_FORMAT)
+        os.chmod(path, 0o600)
+        self._now = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
+
+    def _info(self, arcname, size):
+        info = tarfile.TarInfo(arcname)
+        info.size, info.mode, info.mtime = size, 0o644, self._now
+        return info
+
+    def add_file(self, arcname: str, path: str) -> None:
+        with open(path, "rb") as fh:
+            self._tar.addfile(self._info(arcname, os.fstat(fh.fileno()).st_size), fh)
+
+    def close(self, manifest_name: str, manifest: bytes) -> str:
+        self._tar.addfile(self._info(manifest_name, len(manifest)), io.BytesIO(manifest))
+        self._tar.close()
+        return self.path
+
+    def abort(self) -> None:
+        try:
+            self._tar.close()
+        finally:
+            _unlink(self.path)
 
 
 def folder_status(mode: str, files_total: int, **counts) -> dict:
