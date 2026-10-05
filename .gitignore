@@ -32,3 +32,13 @@ AttestationClient
 # Local virtualenv for running the test tools.
 .venv/
 .venv-test/
+
+#Credentials and local configs (never commit: tokens and IUDX client secrets)
+/azure_token_response.json
+/config.json
+/config_file_*.json
+
+#Editor / IDE / test caches
+.mono/
+.vscode/
+.pytest_cache/
