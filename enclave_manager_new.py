@@ -1082,6 +1082,7 @@ def upload_finalize_output(upload_id):
             manifest=body.get("manifest"),
             output_key_check=str(key_check) if key_check is not None else None,
             folder=body.get("folder"),
+            census_path=str(body["census_path"]) if body.get("census_path") else None,
         )
         return jsonify(result), 200
     except UploadError as e:

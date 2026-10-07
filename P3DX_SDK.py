@@ -2198,6 +2198,140 @@ def _select_tabular_output(output_dir, status_path):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Nested-JSON runs (SKALD `nested_json: true`, src/pipeline/nested_json.rs)
+# ---------------------------------------------------------------------------
+#
+# A per-document redaction pass with no k-anonymity. It writes one
+# de-identified document per input into `<output_directory>/<output_path>/`,
+# with `nested_json_census.csv` (every path seen and the rule that decided it;
+# no values) beside them, and its key material — salt, token vault, keys — at
+# the TOP of the output directory. status.json names none of _RESULT_PATH_KEYS;
+# it reports outputs.mode, outputs.output_directory and outputs.key_census, as
+# paths inside SKALD's container.
+
+NESTED_JSON_MODE = "nested_json_deidentification"
+NESTED_JSON_DRY_RUN_MODE = "nested_json_dry_run"
+NESTED_JSON_CENSUS = "nested_json_census.csv"
+
+
+class NestedJsonOutputError(RuntimeError):
+    """A nested-JSON run whose output cannot be returned safely."""
+
+
+class NestedJsonOutputs:
+    def __init__(self, directory, documents, census, skipped):
+        self.directory = directory      # host path of the documents' directory
+        self.documents = documents      # host paths, sorted
+        self.census = census            # host path, or None
+        self.skipped = skipped          # inputs SKALD could not read
+
+
+def _resolve_reported_path(output_dir, raw, want_dir):
+    """Map a path SKALD reported from inside its container ("./output/x",
+    "/app/output/x") onto this side of the output mount.
+
+    Never trusted as given, the same way _select_tabular_output treats a
+    result path: the reported path's trailing components are tried longest
+    first, and only something strictly INSIDE output_dir that exists as the
+    wanted kind is accepted. Returns None otherwise."""
+    if not isinstance(raw, str):
+        return None
+    parts = [p for p in raw.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    base = os.path.realpath(output_dir)
+    for i in range(len(parts)):
+        candidate = os.path.realpath(os.path.join(output_dir, *parts[i:]))
+        if not candidate.startswith(base + os.sep):
+            continue
+        if os.path.isdir(candidate) if want_dir else os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def nested_json_outputs(output_dir, status):
+    """The documents and census of a nested-JSON run, or None when `status`
+    is not one. Raises NestedJsonOutputError when it is one but its output
+    cannot be returned."""
+    outputs = status.get("outputs") if isinstance(status, dict) else None
+    mode = outputs.get("mode") if isinstance(outputs, dict) else None
+    if mode == NESTED_JSON_DRY_RUN_MODE:
+        raise NestedJsonOutputError(
+            "This was a nested-JSON dry run (dry_run: true): SKALD wrote no "
+            "de-identified documents, only its census. Set dry_run to false "
+            "to produce output."
+        )
+    if mode != NESTED_JSON_MODE:
+        return None
+
+    directory = _resolve_reported_path(output_dir, outputs.get("output_directory"), want_dir=True)
+    if directory is None:
+        raise NestedJsonOutputError(
+            "The nested-JSON run reported its documents at "
+            f"{outputs.get('output_directory')!r}, which is not a directory inside "
+            f"{output_dir}."
+        )
+    # The run's key material sits at the top of the output directory. A
+    # documents directory that IS that directory (output_path set to ".")
+    # would put salt and vault among the "documents"; refuse it outright.
+    if directory == os.path.realpath(output_dir):
+        raise NestedJsonOutputError(
+            "The nested-JSON documents were written to the top of the output "
+            "directory, beside the run's key material. Set output_path to a "
+            "subdirectory name."
+        )
+
+    documents = sorted(
+        os.path.join(directory, name) for name in os.listdir(directory)
+        if name.lower().endswith(".json")
+        and name not in _KNOWN_KEY_MATERIAL
+        and not os.path.islink(os.path.join(directory, name))
+        and os.path.isfile(os.path.join(directory, name))
+    )
+    if not documents:
+        raise NestedJsonOutputError(
+            f"The nested-JSON run wrote no documents into {directory}."
+        )
+
+    census = _resolve_reported_path(output_dir, outputs.get("key_census"), want_dir=False)
+    if census is None and os.path.isfile(os.path.join(directory, NESTED_JSON_CENSUS)):
+        census = os.path.join(directory, NESTED_JSON_CENSUS)
+    skipped = outputs.get("documents_skipped")
+    return NestedJsonOutputs(directory, documents, census,
+                             skipped if isinstance(skipped, int) else 0)
+
+
+def nested_json_result(nested, output_dir, stem):
+    """The one file to return for a nested-JSON run: the document itself when
+    there is one, else an archive of all of them with the per-file folder
+    path's `_manifest.json`. The archive is written in output_dir (not
+    scratch) as `<stem>_nested_documents.tar`."""
+    if len(nested.documents) == 1:
+        return nested.documents[0]
+    from lib import folder_bundle
+
+    archive = os.path.join(output_dir, f"{stem}_nested_documents.tar")
+    sink = folder_bundle.LocalTarSink(archive)
+    try:
+        results = []
+        for path in nested.documents:
+            name = os.path.basename(path)
+            sink.add_file(name, path)
+            results.append({"path": name, "status": "ok", "output": name})
+        manifest = folder_bundle.per_file_manifest("json", results, application="skald",
+                                                   failed_unnamed=nested.skipped)
+        sink.close(folder_bundle.MANIFEST_NAME, json.dumps(manifest, indent=2).encode("utf-8"))
+    except BaseException:
+        sink.abort()
+        raise
+    try:
+        os.chmod(archive, 0o644)
+    except OSError:
+        pass
+    return archive
+
+
 #: SKALD's tabular result, before the extension. It always writes the .csv and,
 #: for json/xlsx input, a format-matched sibling next to it.
 _TABULAR_OUTPUT_STEM = "generalized"
@@ -2469,7 +2603,16 @@ def _upload_direct_output(output_dir, urls):
             raise RuntimeError(message)
         return _folder_output_result["outputBlobUrl"]
 
+    nested = None
+    if fmt not in ("dicom", "image"):
+        try:
+            nested = nested_json_outputs(output_dir, existing_status)
+        except NestedJsonOutputError as e:
+            _write_direct_error_status(str(e))
+            raise
+
     manifest = None
+    census_path = None
     if fmt == "dicom":
         deid_files = _find_deidentified_outputs(output_dir)
         if len(deid_files) != 1:
@@ -2498,6 +2641,15 @@ def _upload_direct_output(output_dir, urls):
             _write_direct_error_status(message)
             raise RuntimeError(message)
         output_path = image_files[0]
+    elif nested is not None:
+        # One de-identified document per input, in a subdirectory: the
+        # document itself is the result (an archive if there are several),
+        # and the census travels beside it in its own container.
+        output_path = nested_json_result(nested, output_dir,
+                                         os.path.splitext(original_name)[0] or "dataset")
+        census_path = nested.census
+        print(f"Direct-upload nested-JSON result: {os.path.basename(output_path)} "
+              f"({len(nested.documents)} document(s))", flush=True)
     elif _is_query_only_run(output_dir, status_path, existing_status):
         # The result object in status.json is the whole answer.
         # resolve_tabular_output_path would fail this with "found 0" and, via
@@ -2527,6 +2679,7 @@ def _upload_direct_output(output_dir, urls):
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ".xls": "application/vnd.ms-excel",
             ".dcm": "application/dicom",
+            ".tar": "application/x-tar",
             **_IMAGE_CONTENT_TYPES,
         }.get(ext.lower(), "application/octet-stream")
         if fmt == "image":
@@ -2547,6 +2700,8 @@ def _upload_direct_output(output_dir, urls):
         })
     if manifest is not None:
         payload["manifest"] = manifest
+    if census_path is not None:
+        payload["census_path"] = census_path
     if folder is not None:
         from lib.folder_bundle import folder_status
         payload["folder"] = folder_status(
@@ -2636,7 +2791,22 @@ _DEID_OUTPUT_NAME = "after_deidentification.dcm"
 # file this doesn't name would be uploaded by default. Extend this set (or
 # replace it with a real allow-list) as soon as the container's per-technique
 # output contract is confirmed.
-_KNOWN_KEY_MATERIAL = {"symmetric_keys.json", "fpe_encrypt_keys.json"}
+#
+# Every name below was confirmed against SKALD's source (2026-10-07), all
+# written into the run's output_directory, i.e. this output dir:
+#   tabular (preprocess/mod.rs)   symmetric_keys.json, fpe_encrypt_keys.json,
+#                                 token_vault.json (reverses `tokenization`)
+#   nested JSON (nested_json.rs)  nested_json_salt.json (the HMAC salt behind
+#                                 every `hashing_with_salt` value), the token
+#                                 vault, and the encrypt / FPE keys
+#   FHIR bundles (fhir_bundle.rs) fhir_bundle_salts.json
+# Any one of them makes the matching pseudonyms in a release reversible.
+_KNOWN_KEY_MATERIAL = {
+    "symmetric_keys.json", "fpe_encrypt_keys.json", "token_vault.json",
+    "nested_json_salt.json", "nested_json_token_vault.json",
+    "nested_json_symmetric_keys.json", "nested_json_fpe_encrypt_keys.json",
+    "fhir_bundle_salts.json",
+}
 
 # Separate from _KNOWN_KEY_MATERIAL on purpose: these are anonymisation-run
 # diagnostics (equivalence-class size histogram, OLA-2 search nodes, the
@@ -3119,6 +3289,39 @@ def _upload_image_output(fetch_data, output_dir, container_base_url, urls):
     return blob_url
 
 
+def blob_output_files(output_dir, status_path):
+    """What a blob-mode tabular run uploads, in order; the first is reported
+    as the job's address.
+
+    Every top-level file except key material, skald-fta's intermediates and
+    the k-means plots (uploaded separately), as this flow has always done.
+    A nested-JSON run's documents sit in a subdirectory this listing cannot
+    see, so for one the result — the document, or an archive of several —
+    leads, with the census beside it."""
+    excluded = _KNOWN_KEY_MATERIAL | free_text_artifact_names() | set(_KMEANS_PLOT_FILES)
+    top_level = [
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
+    ]
+
+    try:
+        with open(status_path) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        status = None
+    nested = nested_json_outputs(output_dir, status)
+    if nested is None:
+        return top_level
+
+    stem = os.path.basename(nested.directory) or "nested_json"
+    first = [nested_json_result(nested, output_dir, stem)]
+    if nested.census:
+        first.append(nested.census)
+    seen = {os.path.realpath(p) for p in first}
+    return first + [p for p in top_level if os.path.realpath(p) not in seen]
+
+
 def encrypt_and_upload_output(config_path="DPconfig.json"):
     """Encrypt all files in output folder and upload to Azure Blob Storage.
 
@@ -3193,12 +3396,7 @@ def encrypt_and_upload_output(config_path="DPconfig.json"):
     # The k-means plots are uploaded separately below, each in its own
     # SPIDROU1 container under a fresh IV (see _upload_kmeans_plots) — they
     # must not also go through this loop's shared-Fernet-key path.
-    excluded = _KNOWN_KEY_MATERIAL | free_text_artifact_names() | set(_KMEANS_PLOT_FILES)
-    output_files = [
-        os.path.join(output_dir, f)
-        for f in os.listdir(output_dir)
-        if os.path.isfile(os.path.join(output_dir, f)) and f not in excluded
-    ]
+    output_files = blob_output_files(output_dir, config.get_path('status'))
 
     if not output_files:
         raise FileNotFoundError(f"No files found in output directory: {output_dir}")

@@ -297,7 +297,8 @@ def _read_app_status(status_path):
     return status if isinstance(status, dict) else {}
 
 
-def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=None):
+def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=None,
+                         census=None):
     """Write the direct-upload status contract, KEEPING the application's own
     query result.
 
@@ -326,6 +327,10 @@ def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=N
         # A folder run: how many files went in and, per file, how many came
         # out. Sits beside outputs.direct, which stays exactly as for one file.
         outputs["folder"] = folder
+    if census is not None:
+        # A nested-JSON run's key census: every path seen and the rule that
+        # decided it, no values. For auditing the run; not the result.
+        outputs["census"] = census
     status_payload = {
         "status": "success",
         "application": "direct-upload",
@@ -403,7 +408,7 @@ def _verify_output_key_check(output_key, output_key_check, caller):
 
 
 def finalize_output(upload_id, output_path, filename, content_type, manifest=None,
-                    output_key_check=None, folder=None):
+                    output_key_check=None, folder=None, census_path=None):
     """
     Encrypt the pipeline's result under the browser-held output key and
     upload it — the one operation that MUST happen in this process, since
@@ -449,6 +454,12 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
             raise UploadError(400, "output_path must be inside the pipeline's output directory")
         if not os.path.isfile(resolved):
             raise UploadError(400, f"output_path does not exist: {output_path}")
+    census_resolved = os.path.realpath(census_path) if census_path else ""
+    if census_resolved:
+        if not census_resolved.startswith(output_dir_real + os.sep) or not os.path.isfile(census_resolved):
+            raise UploadError(400, "census_path must be a file inside the pipeline's output directory")
+        if os.path.basename(census_resolved) != "nested_json_census.csv":
+            raise UploadError(400, "census_path must name a nested_json_census.csv")
 
     manager = get_manager()
     output_key, output_base_iv = manager.output_key_for(upload_id)  # raises UploadError(404) if unknown
@@ -496,6 +507,32 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
         run_id=upload_id, output_key=output_key, staging_dir=scratch_dir,
     )
 
+    # A nested-JSON run's census, in a container of its own under a fresh IV
+    # (several containers under one output key must never share a base_iv),
+    # beside the result rather than replacing it.
+    census = None
+    if census_resolved:
+        census_name = os.path.basename(census_resolved)
+        census_container = os.path.join(scratch_dir, f"{upload_id}.census.out.enc")
+        with open(census_container, "wb") as fh:
+            census_header = write_output_container(
+                census_resolved, fh,
+                run_id=f"{upload_id}:census", output_key=output_key,
+                output_base_iv=os.urandom(12),
+                filename=census_name, content_type="text/csv",
+            )
+        os.chmod(census_container, 0o600)
+        census_url = f"{blob_base_url}/{upload_id}/{census_name}.enc"
+        try:
+            fetch_data.upload_blob(census_url, census_container)
+        finally:
+            try:
+                os.unlink(census_container)
+            except OSError:
+                pass
+        census = {"outputBlobUrl": census_url, "filename": census_name,
+                  "bytes": census_header["total_bytes"]}
+
     # The input scratch file is normally already gone (the subprocess deletes
     # it right after staging into tee_input_data — see Fetch_data/fetch_data.py).
     # release() is a safe no-op if so; it exists as a backstop, not the
@@ -513,10 +550,12 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
             "expires_at": expires_at,
         }
     _write_direct_status(result, manifest=manifest, plot_urls=plot_urls,
-                         folder=_sanitise_folder_status(folder))
+                         folder=_sanitise_folder_status(folder), census=census)
 
     response = dict(result) if result else {"expires_at": expires_at}
     response.update(plot_urls)
+    if census is not None:
+        response["census"] = census
     return response
 
 

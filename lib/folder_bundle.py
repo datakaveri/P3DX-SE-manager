@@ -1029,19 +1029,8 @@ def run_per_file(members, fmt: str, sink,
                 cleanup_member()
             results.append(entry)
 
-        ok = sum(1 for r in results if r["status"] == "ok")
-        manifest = {
-            "mode": MODE_PER_FILE,
-            "application": _APPLICATION_BY_FORMAT.get(fmt, fmt),
-            "format": fmt,
-            "paths_deidentified": False,
-            "paths_note": "Paths are the uploader's own file and folder names "
-                          "and have not been de-identified.",
-            "files_total": len(results),
-            "files_succeeded": ok,
-            "files_failed": len(results) - ok,
-            "files": results,
-        }
+        manifest = per_file_manifest(fmt, results)
+        ok = manifest["files_succeeded"]
         if ok == 0:
             raise FolderError(
                 f"none of the {len(results)} file(s) in the folder could be de-identified"
@@ -1051,6 +1040,27 @@ def run_per_file(members, fmt: str, sink,
         sink.abort()
         raise
     return manifest, closed
+
+
+def per_file_manifest(fmt: str, results: list, application: str = None,
+                      failed_unnamed: int = 0) -> dict:
+    """The `_manifest.json` of a per-file output archive. `results` are
+    {"path", "status", "output" | "error"} entries; `failed_unnamed` counts
+    inputs that failed without a name to list (a nested-JSON run reports only
+    how many documents it skipped)."""
+    ok = sum(1 for r in results if r["status"] == "ok")
+    return {
+        "mode": MODE_PER_FILE,
+        "application": application or _APPLICATION_BY_FORMAT.get(fmt, fmt),
+        "format": fmt,
+        "paths_deidentified": False,
+        "paths_note": "Paths are the uploader's own file and folder names "
+                      "and have not been de-identified.",
+        "files_total": len(results) + failed_unnamed,
+        "files_succeeded": ok,
+        "files_failed": len(results) - ok + failed_unnamed,
+        "files": results,
+    }
 
 
 class SinkFailure(Exception):
