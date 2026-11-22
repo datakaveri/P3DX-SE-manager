@@ -182,7 +182,7 @@ cors:
 # attested key (lib/ner_client.py). On any failure the stage runs locally in
 # the k-anon TEE exactly as before, so enabling this can never break a run.
 ner_tee:
-  enabled: false
+  enabled: true
   host: 10.30.1.20
   port: 4443
   # How long to wait for a NER TEE that is still booting before running locally.
