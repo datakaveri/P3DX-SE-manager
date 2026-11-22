@@ -346,6 +346,13 @@ def _bootstrap_ner_key():
     gets its per-run keypair. So it makes one at startup (after PCR15 has been
     measured, which _bootstrap_measurement did at import)."""
     if not _is_ner_node():
+        # Every node: refresh the PCR snapshot tokens carry, so the first token
+        # after a reboot reports this boot's PCR15, not the previous boot's.
+        # (A deploy refreshes it again, as before.)
+        try:
+            P3DX_SDK.snapshot_pcr_values()
+        except Exception as e:
+            print(f"Could not snapshot PCR values at startup: {e}", flush=True)
         return
     cert = os.path.join(config.paths.keys_dir, "tls_cert.pem")
     if not os.path.exists(cert):
