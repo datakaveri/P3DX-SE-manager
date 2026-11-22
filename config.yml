@@ -104,6 +104,9 @@ free_text_anonymization:
   # Hard wall-clock cap on the container. A hung NER model would otherwise
   # block the run forever, since the enclave waits on this stage.
   timeout_seconds: 3600
+  # skald-fta's FHIR mode (fhir_bundle in the app config) declares its cleaned
+  # bundles in this manifest in output/; each replaces its data/ bundle in place.
+  default_manifest_name: free_text_artifacts.json
   # Default staged/audit filenames, used only to seed the upload exclusion set
   # when the config omits the corresponding field. The authoritative exclusion
   # list is the set of files skald-fta actually created (see

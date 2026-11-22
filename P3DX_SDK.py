@@ -1059,7 +1059,52 @@ def _fta_declared_artifacts(block):
             _fta_setting("default_audit_name", "free_text_audit.json"),
             "audit_output_path",
         ),
+        "artifact_manifest_path": _fta_output_basename(
+            block.get("artifact_manifest_path"),
+            _fta_setting("default_manifest_name", _FTA_DEFAULT_MANIFEST),
+            "artifact_manifest_path",
+        ),
     }
+
+
+# skald-fta's FHIR mode (fhir_bundle in the app config) cleans the free text of
+# FHIR Bundles and writes each bundle back as JSON, under its own file name, in
+# output/. Which output file replaces which data/ file is declared in this
+# manifest, never guessed:
+#   {"version": 1, "mode": "fhir_bundle",
+#    "staged": [{"output": "output/b.json", "replaces": "data/b.json",
+#                "sha256": "<hex>", "changed": true}, ...],
+#    "audit": "output/free_text_audit.json"}
+_FTA_DEFAULT_MANIFEST = "free_text_artifacts.json"
+_FTA_FHIR_MODE = "fhir_bundle"
+
+
+def _read_fta_manifest(block):
+    """The artifact manifest skald-fta wrote this run, or None if it wrote none."""
+    try:
+        name = _fta_declared_artifacts(block)["artifact_manifest_path"]
+    except RuntimeError:
+        return None
+    path = os.path.join(config.paths.tee_output, name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as exc:
+        _fail_free_text(f"skald-fta wrote an unreadable artifact manifest output/{name}: {exc}")
+    if not isinstance(manifest, dict):
+        _fail_free_text(f"skald-fta's artifact manifest output/{name} is not a JSON object")
+    return manifest
+
+
+def _manifest_staged_names(manifest):
+    """Basenames in output/ that a manifest lists as staged bundles."""
+    names = set()
+    for entry in (manifest or {}).get("staged") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("output"), str):
+            names.add(os.path.basename(entry["output"]))
+    return names
 
 
 def _output_snapshot():
@@ -1115,6 +1160,14 @@ def clear_free_text_artifacts():
             stale_names.update(_fta_declared_artifacts(block).values())
         except RuntimeError:
             pass  # invalid paths are reported by the stage itself
+        # A previous FHIR run's cleaned bundles: listed in its manifest, which is
+        # read before it is itself removed below.
+        try:
+            manifest_name = _fta_declared_artifacts(block)["artifact_manifest_path"]
+            with open(os.path.join(config.paths.tee_output, manifest_name)) as f:
+                stale_names.update(_manifest_staged_names(json.load(f)))
+        except (RuntimeError, OSError, ValueError):
+            pass
 
     for name in sorted(n for n in stale_names
                        if n and n not in _FTA_RESERVED_OUTPUT_NAMES):
@@ -1179,6 +1232,15 @@ def free_text_artifact_names():
         except RuntimeError:
             # An invalid path config already failed the run in
             # run_free_text_anonymization(); nothing to exclude here.
+            pass
+        # FHIR mode: the cleaned bundles in output/ have not been through SKALD
+        # yet. A bundle that overwrote a same-named file is not "created", so
+        # the ledger alone could miss it.
+        try:
+            manifest_name = _fta_declared_artifacts(block)["artifact_manifest_path"]
+            with open(os.path.join(config.paths.tee_output, manifest_name)) as f:
+                names.update(_manifest_staged_names(json.load(f)))
+        except (RuntimeError, OSError, ValueError):
             pass
 
     return {n for n in names if n not in _FTA_RESERVED_OUTPUT_NAMES}
@@ -1451,6 +1513,81 @@ def _swap_staged_input_into_data(staged_path):
           flush=True)
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _swap_fhir_bundles_into_data(manifest):
+    """Replace each raw bundle in data/ by its cleaned copy, in place, as the manifest says.
+
+    The FHIR counterpart of _swap_staged_input_into_data, with the same
+    structural guarantee: afterwards, every bundle SKALD can discover in data/
+    is byte-identical to what skald-fta produced. Differences from the CSV swap:
+      * the cleaned file keeps the input's name and format (data/<bundle>.json
+        is overwritten, never data/<stem>.csv), because SKALD's fhir_bundle flow
+        reads JSON bundles;
+      * there may be several bundles, so the pairing comes from the manifest,
+        each entry checked: both paths are plain names directly in output/ and
+        data/, the staged file's sha256 matches, and the raw file exists;
+      * any .json left in data/ that the manifest does not cover fails the run:
+        it would reach SKALD unscanned (fhir_bundle_salts.json excepted, which
+        SKALD itself skips as input).
+    """
+    data_dir = config.paths.tee_input_data
+    out_dir = config.paths.tee_output
+    entries = manifest.get("staged")
+    if not isinstance(entries, list) or not entries:
+        _fail_free_text("skald-fta's FHIR manifest lists no staged bundles. Refusing to start SKALD.")
+
+    replaced = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            _fail_free_text("skald-fta's FHIR manifest has a malformed entry. Refusing to start SKALD.")
+        out_rel, raw_rel, digest = entry.get("output"), entry.get("replaces"), entry.get("sha256")
+        for rel, top in ((out_rel, "output"), (raw_rel, "data")):
+            parts = [p for p in os.path.normpath(str(rel)).split(os.sep) if p not in ("", ".")]
+            if not isinstance(rel, str) or len(parts) != 2 or parts[0] != top or not parts[1].lower().endswith(".json"):
+                _fail_free_text(
+                    f"skald-fta's FHIR manifest names {rel!r}; expected a .json file directly in {top}/. "
+                    f"Refusing to start SKALD."
+                )
+        staged = os.path.join(out_dir, os.path.basename(out_rel))
+        target = os.path.join(data_dir, os.path.basename(raw_rel))
+        if not os.path.isfile(staged):
+            _fail_free_text(f"skald-fta's cleaned bundle {out_rel} is missing. Refusing to start SKALD.")
+        if not os.path.isfile(target):
+            _fail_free_text(f"skald-fta's manifest says {out_rel} replaces {raw_rel}, which does not exist.")
+        if not isinstance(digest, str) or _sha256_file(staged) != digest.lower():
+            _fail_free_text(f"{out_rel} does not match the sha256 in skald-fta's manifest. Refusing to start SKALD.")
+        try:
+            shutil.copy2(staged, target)
+            os.chmod(target, 0o600)
+        except OSError as exc:
+            _fail_free_text(
+                f"Could not stage the cleaned bundle {out_rel} into data/: {exc}. Refusing to start "
+                f"SKALD, which would otherwise read the raw bundle."
+            )
+        if _sha256_file(target) != digest.lower():
+            _fail_free_text(f"data/{os.path.basename(target)} does not match skald-fta's {out_rel} after copying.")
+        replaced.add(os.path.basename(target))
+
+    leftover = sorted(
+        n for n in os.listdir(data_dir)
+        if n.lower().endswith(".json") and n not in replaced and n != "fhir_bundle_salts.json"
+        and os.path.isfile(os.path.join(data_dir, n))
+    )
+    if leftover:
+        _fail_free_text(
+            f"data/ still holds bundle(s) skald-fta did not clean: {leftover}. Refusing to start SKALD."
+        )
+    print(f"Cleaned FHIR bundle(s) staged in place in data/: {sorted(replaced)} "
+          f"(raw free text no longer readable by SKALD).", flush=True)
+
+
 def _resolve_fta_image():
     """Return (image_ref, provenance) for skald-fta.
 
@@ -1575,20 +1712,6 @@ def run_free_text_anonymization():
               "SKALD directly.", flush=True)
         return False
 
-    # skald-fta reads CSV columns and writes a CSV, which
-    # _swap_staged_input_into_data would put in data/ in place of the Bundle:
-    # SKALD's fhir_bundle mode would then find no Bundle and return nothing,
-    # or worse, a run "succeeds" on the wrong input. Refuse it until skald-fta
-    # has a FHIR mode. (The Anamika UI never sends this combination; a
-    # hand-written config could.)
-    if is_fhir_bundle_run():
-        raise RuntimeError(
-            "free_text_anonymization is not supported for FHIR Bundles yet: skald-fta "
-            "only reads CSV columns. Remove the free_text_anonymization block (or set "
-            "enabled to false); SKALD's fhir_bundle free_text bucket releases those "
-            "fields as they are, so suppress them instead if they were not cleaned."
-        )
-
     print("="*60, flush=True)
     print("Pipeline stage: free-text anonymisation (skald-fta)", flush=True)
     print("="*60, flush=True)
@@ -1676,6 +1799,25 @@ def run_free_text_anonymization():
             f"Free-text anonymisation (skald-fta) failed with exit code "
             f"{returncode} (on_failure={on_failure}). No staged input was "
             f"produced, so SKALD was not started and no output is available."
+        )
+
+    manifest = _read_fta_manifest(block)
+    if manifest is not None and manifest.get("mode") == _FTA_FHIR_MODE:
+        _swap_fhir_bundles_into_data(manifest)
+        print(f"\nFree-text anonymisation complete (FHIR). SKALD will read the "
+              f"cleaned bundle(s) from data/.", flush=True)
+        print("="*60, flush=True)
+        return True
+    # A fhir_bundle config whose skald-fta run did NOT declare FHIR mode (an
+    # image older than v1.3, say): the CSV swap below would replace the Bundle
+    # with data/<stem>.csv, and SKALD's fhir_bundle flow would then find no
+    # Bundle, or run on the wrong input. Fail it plainly instead. (2026-11-22,
+    # replaces the blanket refusal of free text on FHIR runs from ec0cac5.)
+    if is_fhir_bundle_run():
+        _fail_free_text(
+            "This is a FHIR Bundle run, but skald-fta wrote no FHIR artifact manifest "
+            "(mode fhir_bundle). The skald-fta image is probably older than v1.3. "
+            "SKALD was not started."
         )
 
     staged_path = os.path.join(config.paths.tee_output, staged_name)

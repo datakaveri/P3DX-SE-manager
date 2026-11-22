@@ -165,25 +165,84 @@ class DirectModeUpload(FhirOutputCase):
             direct_upload.finalize_output("x", "", "f", "t", census_path=bad)
 
 
-class FreeTextStageRefused(TempDirCase):
-    def write_config(self, section):
-        cfg_dir = os.path.join(self.dir, "config")
-        os.makedirs(cfg_dir, exist_ok=True)
-        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
-            json.dump({"data_type": "nha", "nha": section}, f)
-        p = mock.patch.object(config.paths, "tee_input_config", cfg_dir)
-        p.start()
-        self.addCleanup(p.stop)
+class FreeTextFhirSwap(TempDirCase):
+    """skald-fta's FHIR mode (v1.3): the cleaned bundles replace data/ in place,
+    as its artifact manifest declares, each checked by sha256."""
 
-    def test_fhir_with_free_text_enabled_fails_before_skald_fta_runs(self):
+    def setUp(self):
+        super().setUp()
+        self.data = os.path.join(self.dir, "data")
+        self.out = os.path.join(self.dir, "output")
+        cfg_dir = os.path.join(self.dir, "config")
+        for d in (self.data, self.out, cfg_dir):
+            os.makedirs(d)
+        self.cfg_dir = cfg_dir
+        for attr, val in (("tee_input_data", self.data), ("tee_output", self.out), ("tee_input_config", cfg_dir)):
+            p = mock.patch.object(config.paths, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        status = mock.patch.object(config, "get_path", side_effect=lambda k: os.path.join(self.out, "status.json")
+                                   if k == "status" else config.__class__.get_path(config, k))
+        status.start()
+        self.addCleanup(status.stop)
+
+    def write_config(self, section):
+        with open(os.path.join(self.cfg_dir, "config.json"), "w") as f:
+            json.dump({"data_type": "nha", "nha": section}, f)
+
+    def stage(self, names=("A.json",), cleaned=b'{"resourceType":"Bundle","cleaned":true}'):
+        import hashlib
+        entries = []
+        for n in names:
+            with open(os.path.join(self.data, n), "w") as f:
+                f.write('{"resourceType":"Bundle","note":"Ramesh"}')
+            with open(os.path.join(self.out, n), "wb") as f:
+                f.write(cleaned)
+            entries.append({"output": f"output/{n}", "replaces": f"data/{n}",
+                            "sha256": hashlib.sha256(cleaned).hexdigest(), "changed": True})
+        return {"version": 1, "mode": "fhir_bundle", "staged": entries}
+
+    def test_cleaned_bundles_replace_the_raw_ones_in_place(self):
+        P3DX_SDK._swap_fhir_bundles_into_data(self.stage(("A.json", "B.json")))
+        for n in ("A.json", "B.json"):
+            with open(os.path.join(self.data, n)) as f:
+                self.assertNotIn("Ramesh", f.read())
+
+    def test_a_bundle_the_manifest_does_not_cover_stops_the_run(self):
+        manifest = self.stage(("A.json",))
+        with open(os.path.join(self.data, "UNSCANNED.json"), "w") as f:
+            f.write("{}")
+        with self.assertRaises(RuntimeError):
+            P3DX_SDK._swap_fhir_bundles_into_data(manifest)
+
+    def test_a_sha256_mismatch_stops_the_run(self):
+        manifest = self.stage(("A.json",))
+        manifest["staged"][0]["sha256"] = "0" * 64
+        with self.assertRaises(RuntimeError):
+            P3DX_SDK._swap_fhir_bundles_into_data(manifest)
+        with open(os.path.join(self.data, "A.json")) as f:
+            self.assertIn("Ramesh", f.read(), "nothing copied")
+
+    def test_a_path_outside_output_is_refused(self):
+        manifest = self.stage(("A.json",))
+        manifest["staged"][0]["output"] = "../../etc/passwd.json"
+        with self.assertRaises(RuntimeError):
+            P3DX_SDK._swap_fhir_bundles_into_data(manifest)
+
+    def test_cleaned_bundles_and_manifest_never_upload(self):
         self.write_config({"fhir_bundle": True, "input_path": "data", "keep": ["Bundle.type"],
-                           "free_text_anonymization": {"enabled": True, "columns": ["x"]}})
-        self.assertTrue(P3DX_SDK.is_fhir_bundle_run())
-        with self.assertRaisesRegex(RuntimeError, "not supported for FHIR Bundles"):
-            P3DX_SDK.run_free_text_anonymization()
+                           "free_text_anonymization": {"enabled": True, "paths": ["Condition.note[].text"],
+                                                       "columns": ["Condition.note[].text"]}})
+        manifest = self.stage(("A.json",))
+        with open(os.path.join(self.out, "free_text_artifacts.json"), "w") as f:
+            json.dump(manifest, f)
+        names = P3DX_SDK.free_text_artifact_names()
+        self.assertIn("A.json", names)
+        self.assertIn("free_text_artifacts.json", names)
 
     def test_fhir_without_free_text_goes_straight_to_skald(self):
         self.write_config({"fhir_bundle": True, "input_path": "data", "keep": ["Bundle.type"]})
+        self.assertTrue(P3DX_SDK.is_fhir_bundle_run())
         self.assertFalse(P3DX_SDK.run_free_text_anonymization())
 
     def test_a_tabular_config_is_not_fhir(self):
