@@ -227,6 +227,19 @@ def _stage_folder_input(scratch_path, scratch_dir, upload_id, meta, fmt, output_
         return
 
     data_type, section = folder_bundle.load_section(config.paths.tee_input_config)
+    if fmt == "json" and folder_bundle.is_fhir_section(section):
+        # A folder of FHIR Bundles: one file per Bundle, not one combined file.
+        try:
+            staged = folder_bundle.stage_fhir_bundles(folder_bundle.tar_members(scratch_path), output_dir)
+        except folder_bundle.FolderError as e:
+            raise ValueError(f"Folder upload rejected: {e}") from None
+        os.remove(scratch_path)
+        folder.update(files_total=staged.files_total)
+        with open(_du_meta_path(scratch_dir, upload_id), "w") as f:
+            json.dump(meta, f)
+        print(f"Folder upload staged: {staged.files_total} FHIR Bundle file(s) under "
+              f"'{data_type}' -> {output_dir}")
+        return
     stem = os.path.splitext(meta.get("filename") or "folder")[0] or "folder"
     ext = {"csv": ".csv", "json": ".json", "excel": ".xlsx"}[fmt]
     os.makedirs(output_dir, exist_ok=True)
@@ -286,6 +299,16 @@ def _stage_cloud_folder(dataset_url, keyvault_url, output_dir):
         return
 
     data_type, section = folder_bundle.load_section(config.paths.tee_input_config)
+    if plan.fmt == "json" and folder_bundle.is_fhir_section(section):
+        # A folder of FHIR Bundles: one file per Bundle, not one combined file.
+        try:
+            staged = folder_bundle.stage_fhir_bundles(
+                blob_folder.members(plan, http, cipher.decrypt, head_matches_format), output_dir)
+        except folder_bundle.FolderError as e:
+            raise ValueError(f"Cloud folder rejected: {e}") from None
+        print(f"Cloud folder staged: {staged.files_total} FHIR Bundle file(s) under "
+              f"'{data_type}' -> {output_dir}")
+        return
     ext = {"csv": ".csv", "json": ".json", "excel": ".xlsx"}[plan.fmt]
     os.makedirs(output_dir, exist_ok=True)
     dest_path = os.path.join(output_dir, plan.folder.name + ext)

@@ -47,6 +47,7 @@ import math
 import os
 import posixpath
 import secrets
+import shutil
 import tarfile
 from array import array
 from collections import defaultdict
@@ -294,6 +295,55 @@ def validate_archive(path: str, fmt: str,
     if not summary.members:
         raise FolderError("the folder archive is empty")
     return summary
+
+
+# --------------------------------------------------------------------------- #
+# FHIR Bundles: a JSON folder that must NOT be combined (2026-11-22)
+# --------------------------------------------------------------------------- #
+#
+# SKALD's fhir_bundle mode takes a directory and processes each file whose top
+# level is a FHIR Bundle, one Bundle in, one anonymised Bundle out, with salts
+# shared across the folder. combine_tabular would read each Bundle as one
+# record and write them all into one JSON array, which SKALD then skips as
+# "not a Bundle". So a fhir_bundle config stages every member as it is.
+
+
+@dataclass
+class FhirStageResult:
+    files_total: int
+    written: list
+
+
+def is_fhir_section(section) -> bool:
+    return isinstance(section, dict) and section.get("fhir_bundle") is True
+
+
+def stage_fhir_bundles(members, dest_dir: str) -> FhirStageResult:
+    """Copy each .json member into dest_dir unchanged, under a flat, unique
+    name. Raises FolderError when there is nothing to stage. Contents are
+    neither parsed nor checked here: SKALD reports a file that is not a Bundle
+    as skipped, and parsing a large Bundle here would only cost memory."""
+    os.makedirs(dest_dir, exist_ok=True)
+    written, used = [], set()
+    for member in members:
+        base = os.path.basename(member.name.rstrip("/"))
+        if not base.lower().endswith(".json"):
+            continue
+        name, n = base, 1
+        while name.lower() in used:
+            stem, ext = os.path.splitext(base)
+            name, n = f"{stem}_{n}{ext}", n + 1
+        used.add(name.lower())
+        path = os.path.join(dest_dir, name)
+        try:
+            with member.open() as src, open(path, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+        except MemberFailure as exc:
+            raise FolderError(f"{_printable(member.name)}: {exc}") from None
+        written.append(path)
+    if not written:
+        raise FolderError("the folder holds no .json file to read as a FHIR Bundle")
+    return FhirStageResult(files_total=len(written), written=written)
 
 
 # --------------------------------------------------------------------------- #

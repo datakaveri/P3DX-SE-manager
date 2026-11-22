@@ -297,6 +297,14 @@ def _read_app_status(status_path):
     return status if isinstance(status, dict) else {}
 
 
+#: Counts a nested-JSON / FHIR Bundle run reports, carried into the
+#: direct-upload status (see _write_direct_status).
+_DOCUMENT_COUNT_KEYS = (
+    "documents_examined", "documents_written", "documents_skipped", "paths_seen",
+    "paths_kept", "resources_dropped", "propagation_suppressed",
+)
+
+
 def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=None,
                          census=None):
     """Write the direct-upload status contract, KEEPING the application's own
@@ -341,6 +349,20 @@ def _write_direct_status(outputs_direct, manifest=None, plot_urls=None, folder=N
     for key in P3DX_SDK.APP_RESULT_KEYS:
         if key in app_status:
             status_payload[key] = app_status[key]
+
+    # A nested-JSON or FHIR Bundle run reports what it did as counts in its own
+    # outputs block, which this write replaces. The Anamika output page shows
+    # them (documents written/skipped, fields seen/kept, resources dropped,
+    # values the propagation sweep removed), so carry the counts and the mode
+    # across. Integers only: output_directory and key_census are paths inside
+    # SKALD's container and mean nothing outside it.
+    app_outputs = app_status.get("outputs")
+    if isinstance(app_outputs, dict) and app_outputs.get("mode") in P3DX_SDK._DOCUMENT_MODES:  # noqa: SLF001
+        outputs["mode"] = app_outputs["mode"]
+        for key in _DOCUMENT_COUNT_KEYS:
+            value = app_outputs.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                outputs[key] = value
 
     if plot_urls:
         target = P3DX_SDK._find_kmeans_query_result(status_payload)  # noqa: SLF001
@@ -458,8 +480,10 @@ def finalize_output(upload_id, output_path, filename, content_type, manifest=Non
     if census_resolved:
         if not census_resolved.startswith(output_dir_real + os.sep) or not os.path.isfile(census_resolved):
             raise UploadError(400, "census_path must be a file inside the pipeline's output directory")
-        if os.path.basename(census_resolved) != "nested_json_census.csv":
-            raise UploadError(400, "census_path must name a nested_json_census.csv")
+        # A FHIR Bundle run (SKALD fhir_bundle mode) writes its own census
+        # name; both carry paths and rule names, never a suppressed value.
+        if os.path.basename(census_resolved) not in ("nested_json_census.csv", "fhir_bundle_census.csv"):
+            raise UploadError(400, "census_path must name a nested_json_census.csv or fhir_bundle_census.csv")
 
     manager = get_manager()
     output_key, output_base_iv = manager.output_key_for(upload_id)  # raises UploadError(404) if unknown

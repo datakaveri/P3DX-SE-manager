@@ -971,6 +971,21 @@ def read_free_text_config():
     return None, None
 
 
+def is_fhir_bundle_run():
+    """True when this run's app config is a SKALD fhir_bundle section.
+
+    Read from the same app configs the free-text gate reads, so the two can't
+    disagree about which config the run is using."""
+    for _name, cfg in _iter_app_configs():
+        if not isinstance(cfg, dict):
+            continue
+        data_type = cfg.get("data_type")
+        section = cfg.get(data_type) if isinstance(data_type, str) else None
+        if isinstance(section, dict) and _as_bool(section.get("fhir_bundle")):
+            return True
+    return False
+
+
 def _as_bool(value):
     """Coerce a JSON-ish flag to bool, tolerating "true"/1 from hand-edited configs."""
     if isinstance(value, bool):
@@ -1559,6 +1574,20 @@ def run_free_text_anonymization():
         print(f"Free-text anonymisation: disabled at {provenance} — running "
               "SKALD directly.", flush=True)
         return False
+
+    # skald-fta reads CSV columns and writes a CSV, which
+    # _swap_staged_input_into_data would put in data/ in place of the Bundle:
+    # SKALD's fhir_bundle mode would then find no Bundle and return nothing,
+    # or worse, a run "succeeds" on the wrong input. Refuse it until skald-fta
+    # has a FHIR mode. (The Anamika UI never sends this combination; a
+    # hand-written config could.)
+    if is_fhir_bundle_run():
+        raise RuntimeError(
+            "free_text_anonymization is not supported for FHIR Bundles yet: skald-fta "
+            "only reads CSV columns. Remove the free_text_anonymization block (or set "
+            "enabled to false); SKALD's fhir_bundle free_text bucket releases those "
+            "fields as they are, so suppress them instead if they were not cleaned."
+        )
 
     print("="*60, flush=True)
     print("Pipeline stage: free-text anonymisation (skald-fta)", flush=True)
@@ -2214,17 +2243,41 @@ NESTED_JSON_MODE = "nested_json_deidentification"
 NESTED_JSON_DRY_RUN_MODE = "nested_json_dry_run"
 NESTED_JSON_CENSUS = "nested_json_census.csv"
 
+# FHIR Bundle runs (SKALD `fhir_bundle: true`, src/pipeline/fhir_bundle.rs;
+# added 2026-11-22 for the Anamika FHIR levels page). The same shape as a
+# nested run, one level over: one `<input stem>_anonymised.fhir.json` per input
+# Bundle in `<output_directory>/<output_path>/`, `fhir_bundle_census.csv`
+# beside them, and status.json outputs.mode "fhir_bundle_deidentification"
+# ("fhir_bundle_dry_run" for a dry run). Its salts go to the KEYS directory
+# (fhir_bundle_salts.json), never output/, and stay on _KNOWN_KEY_MATERIAL in
+# case a misconfigured run puts them there. Before this, the enclave did not
+# recognise the mode: the run succeeded and its result was never returned.
+FHIR_BUNDLE_MODE = "fhir_bundle_deidentification"
+FHIR_BUNDLE_DRY_RUN_MODE = "fhir_bundle_dry_run"
+FHIR_BUNDLE_CENSUS = "fhir_bundle_census.csv"
+
+#: mode -> (label for messages, census file name, archive suffix for several documents)
+_DOCUMENT_MODES = {
+    NESTED_JSON_MODE: ("nested-JSON", NESTED_JSON_CENSUS, "_nested_documents.tar"),
+    FHIR_BUNDLE_MODE: ("FHIR Bundle", FHIR_BUNDLE_CENSUS, "_fhir_bundles.tar"),
+}
+_DRY_RUN_MODES = {
+    NESTED_JSON_DRY_RUN_MODE: "nested-JSON",
+    FHIR_BUNDLE_DRY_RUN_MODE: "FHIR Bundle",
+}
+
 
 class NestedJsonOutputError(RuntimeError):
     """A nested-JSON run whose output cannot be returned safely."""
 
 
 class NestedJsonOutputs:
-    def __init__(self, directory, documents, census, skipped):
+    def __init__(self, directory, documents, census, skipped, mode=NESTED_JSON_MODE):
         self.directory = directory      # host path of the documents' directory
         self.documents = documents      # host paths, sorted
         self.census = census            # host path, or None
         self.skipped = skipped          # inputs SKALD could not read
+        self.mode = mode                # NESTED_JSON_MODE or FHIR_BUNDLE_MODE
 
 
 def _resolve_reported_path(output_dir, raw, want_dir):
@@ -2251,24 +2304,29 @@ def _resolve_reported_path(output_dir, raw, want_dir):
 
 
 def nested_json_outputs(output_dir, status):
-    """The documents and census of a nested-JSON run, or None when `status`
-    is not one. Raises NestedJsonOutputError when it is one but its output
-    cannot be returned."""
+    """The documents and census of a nested-JSON or FHIR Bundle run, or None
+    when `status` is neither. Raises NestedJsonOutputError when it is one but
+    its output cannot be returned.
+
+    Both modes write the same shape (documents in a subdirectory, census
+    beside them, nothing SKALD reports as a tabular result), so one function
+    serves both; `.mode` on the result says which it was."""
     outputs = status.get("outputs") if isinstance(status, dict) else None
     mode = outputs.get("mode") if isinstance(outputs, dict) else None
-    if mode == NESTED_JSON_DRY_RUN_MODE:
+    if mode in _DRY_RUN_MODES:
         raise NestedJsonOutputError(
-            "This was a nested-JSON dry run (dry_run: true): SKALD wrote no "
+            f"This was a {_DRY_RUN_MODES[mode]} dry run (dry_run: true): SKALD wrote no "
             "de-identified documents, only its census. Set dry_run to false "
             "to produce output."
         )
-    if mode != NESTED_JSON_MODE:
+    if mode not in _DOCUMENT_MODES:
         return None
+    label, census_name, _ = _DOCUMENT_MODES[mode]
 
     directory = _resolve_reported_path(output_dir, outputs.get("output_directory"), want_dir=True)
     if directory is None:
         raise NestedJsonOutputError(
-            "The nested-JSON run reported its documents at "
+            f"The {label} run reported its documents at "
             f"{outputs.get('output_directory')!r}, which is not a directory inside "
             f"{output_dir}."
         )
@@ -2277,7 +2335,7 @@ def nested_json_outputs(output_dir, status):
     # would put salt and vault among the "documents"; refuse it outright.
     if directory == os.path.realpath(output_dir):
         raise NestedJsonOutputError(
-            "The nested-JSON documents were written to the top of the output "
+            f"The {label} documents were written to the top of the output "
             "directory, beside the run's key material. Set output_path to a "
             "subdirectory name."
         )
@@ -2291,27 +2349,29 @@ def nested_json_outputs(output_dir, status):
     )
     if not documents:
         raise NestedJsonOutputError(
-            f"The nested-JSON run wrote no documents into {directory}."
+            f"The {label} run wrote no documents into {directory}."
         )
 
     census = _resolve_reported_path(output_dir, outputs.get("key_census"), want_dir=False)
-    if census is None and os.path.isfile(os.path.join(directory, NESTED_JSON_CENSUS)):
-        census = os.path.join(directory, NESTED_JSON_CENSUS)
+    if census is None and os.path.isfile(os.path.join(directory, census_name)):
+        census = os.path.join(directory, census_name)
     skipped = outputs.get("documents_skipped")
     return NestedJsonOutputs(directory, documents, census,
-                             skipped if isinstance(skipped, int) else 0)
+                             skipped if isinstance(skipped, int) else 0, mode=mode)
 
 
 def nested_json_result(nested, output_dir, stem):
     """The one file to return for a nested-JSON run: the document itself when
     there is one, else an archive of all of them with the per-file folder
     path's `_manifest.json`. The archive is written in output_dir (not
-    scratch) as `<stem>_nested_documents.tar`."""
+    scratch) as `<stem>_nested_documents.tar` (`<stem>_fhir_bundles.tar` for a
+    FHIR Bundle run)."""
     if len(nested.documents) == 1:
         return nested.documents[0]
     from lib import folder_bundle
 
-    archive = os.path.join(output_dir, f"{stem}_nested_documents.tar")
+    suffix = _DOCUMENT_MODES.get(getattr(nested, "mode", NESTED_JSON_MODE), _DOCUMENT_MODES[NESTED_JSON_MODE])[2]
+    archive = os.path.join(output_dir, f"{stem}{suffix}")
     sink = folder_bundle.LocalTarSink(archive)
     try:
         results = []
@@ -2648,8 +2708,8 @@ def _upload_direct_output(output_dir, urls):
         output_path = nested_json_result(nested, output_dir,
                                          os.path.splitext(original_name)[0] or "dataset")
         census_path = nested.census
-        print(f"Direct-upload nested-JSON result: {os.path.basename(output_path)} "
-              f"({len(nested.documents)} document(s))", flush=True)
+        print(f"Direct-upload {_DOCUMENT_MODES[nested.mode][0]} result: "
+              f"{os.path.basename(output_path)} ({len(nested.documents)} document(s))", flush=True)
     elif _is_query_only_run(output_dir, status_path, existing_status):
         # The result object in status.json is the whole answer.
         # resolve_tabular_output_path would fail this with "found 0" and, via
