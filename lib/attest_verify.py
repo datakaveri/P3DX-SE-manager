@@ -84,8 +84,14 @@ def _b64(s: str, what: str) -> bytes:
         raise AttestationError(f"{what} is not valid base64: {e}") from e
 
 
+def _hex(v: str) -> str:
+    """PCR values come as "0xABC…" in tokens and bare "abc…" from tpm2 reads."""
+    v = v.strip().lower()
+    return v[2:] if v.startswith("0x") else v
+
+
 def _same(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.strip().lower(), b.strip().lower())
+    return hmac.compare_digest(_hex(a), _hex(b))
 
 
 def _jwks(issuer: str) -> list:

@@ -130,6 +130,9 @@ class VerifierTests(unittest.TestCase):
             attest_verify.verify(token, "n" * 32, attest_verify.Policy(pcr15="ab" * 32, mode="enforce"))
         ok = attest_verify.verify(token, "n" * 32, attest_verify.Policy(pcr15="cd" * 32, mode="enforce"))
         self.assertFalse(any("PCR15" in w for w in ok.warnings))
+        # Tokens say "0xCD…", tpm2_pcrread and tools/expected_pcr15.py say "cd…".
+        prefixed = self.maa.token("n" * 32, self.spki, pcr15="0x" + "CD" * 32)
+        attest_verify.verify(prefixed, "n" * 32, attest_verify.Policy(pcr15="cd" * 32, mode="enforce"))
 
 
 def _free_port() -> int:
