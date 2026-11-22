@@ -60,6 +60,11 @@ def _bootstrap_measurement():
 _bootstrap_measurement()
 
 
+def _bootstrap_ner_then_ratls():
+    _bootstrap_ner_key()
+    _bootstrap_ratls()
+
+
 def _bootstrap_ratls():
     """Bring the RA-TLS listener up at startup if a certificate survived.
 
@@ -74,7 +79,7 @@ def _bootstrap_ratls():
         print(f"RA-TLS listener could not start at boot: {e}", flush=True)
 
 
-threading.Timer(0.5, _bootstrap_ratls).start()
+threading.Timer(0.5, _bootstrap_ner_then_ratls).start()
 
 
 state = {
@@ -322,6 +327,35 @@ _ratls_server = None
 _ratls_lock = threading.Lock()
 
 
+def _is_ner_node():
+    """The NER TEE (2026-11-22) runs this same code with NODE_ROLE=ner set in
+    its systemd unit. k-anon nodes leave it unset and behave exactly as before."""
+    return os.getenv("NODE_ROLE", "").strip().lower() == "ner"
+
+
+def _ner_hooks():
+    if not _is_ner_node():
+        return {}
+    from lib import ner_runner
+    return {"ner_run": ner_runner.run,
+            "scratch_dir": getattr(config.paths, "scratch_dir", None)}
+
+
+def _bootstrap_ner_key():
+    """A NER node never receives a job dispatch, which is where a k-anon node
+    gets its per-run keypair. So it makes one at startup (after PCR15 has been
+    measured, which _bootstrap_measurement did at import)."""
+    if not _is_ner_node():
+        return
+    cert = os.path.join(config.paths.keys_dir, "tls_cert.pem")
+    if not os.path.exists(cert):
+        try:
+            P3DX_SDK.generate_and_save_key_pair()
+            print("NER node: generated its per-run keypair and certificate", flush=True)
+        except Exception as e:
+            print(f"NER node: could not generate a keypair: {e}", flush=True)
+
+
 def ratls_server_port():
     return ratls_server_module_port() if _ratls_server else 0
 
@@ -357,7 +391,8 @@ def start_ratls_listener():
             _ratls_server = None
         try:
             _ratls_server = ratls_server.serve(
-                cert, key, _ratls_attest, _ratls_receive_key
+                cert, key, _ratls_attest, _ratls_receive_key,
+                **_ner_hooks(),
             )
         except OSError as e:
             # Worth being loud: without this listener the node cannot receive a

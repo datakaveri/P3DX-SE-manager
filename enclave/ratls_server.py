@@ -51,6 +51,8 @@ PORT = int(os.getenv("RATLS_PORT", "4443"))
 _HOOKS: dict = {}
 
 MAX_BODY_BYTES = 64 * 1024
+#: /ner/run (NER TEE only): a tar.gz of free-text columns or FHIR Bundles.
+MAX_NER_BYTES = int(os.getenv("NER_MAX_BYTES", str(1536 * 1024 * 1024)))
 
 
 class RaTlsHandler(BaseHTTPRequestHandler):
@@ -87,6 +89,8 @@ class RaTlsHandler(BaseHTTPRequestHandler):
                 self._attest()
             elif self.path == "/enclave/key":
                 self._receive_key()
+            elif self.path == "/ner/run" and "ner_run" in _HOOKS:
+                self._ner_run()
             else:
                 self._reply(404, {"error": "no such endpoint"})
         except ValueError as e:
@@ -130,6 +134,52 @@ class RaTlsHandler(BaseHTTPRequestHandler):
         self._reply(200, {"status": "accepted"})
 
 
+    def _ner_run(self):
+        """NER TEE only (2026-11-22): run skald-fta over the posted tar.gz and
+        reply with a tar.gz of its output and its exit code. The caller has
+        attested this enclave on this very connection before sending."""
+        import shutil
+        import tempfile
+
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_NER_BYTES:
+            raise ValueError("missing or oversized NER payload")
+        scratch = _HOOKS.get("scratch_dir")
+        fd, payload = tempfile.mkstemp(prefix="nerin-", suffix=".tgz",
+                                       dir=scratch if scratch and os.path.isdir(scratch) else None)
+        result = None
+        try:
+            with os.fdopen(fd, "wb") as f:
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        raise ValueError("NER payload ended early")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            try:
+                code, result = _HOOKS["ner_run"](payload)
+            except Exception as e:
+                if type(e).__name__ == "NerBusy":
+                    self._reply(503, {"error": "busy"})
+                    return
+                if type(e).__name__ == "NerBadRequest":
+                    raise ValueError(str(e)) from e
+                raise
+            size = os.path.getsize(result)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("X-NER-Exit-Code", str(code))
+            self.end_headers()
+            with open(result, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        finally:
+            for path in (payload, result):
+                if path and os.path.exists(path):
+                    os.remove(path)
+
+
 class _ThreadingHTTPSServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     # Without this a restart inside the TIME_WAIT window fails to bind, and the
@@ -138,7 +188,8 @@ class _ThreadingHTTPSServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
 
 
-def serve(cert_path: str, key_path: str, attest, receive_key, port: int = PORT):
+def serve(cert_path: str, key_path: str, attest, receive_key, port: int = PORT, ner_run=None,
+          scratch_dir: str | None = None):
     """Start the listener on a daemon thread. Returns the server.
 
     `attest(nonce) -> jwt` and `receive_key(job_id, data_key, output_key)` are
@@ -146,6 +197,12 @@ def serve(cert_path: str, key_path: str, attest, receive_key, port: int = PORT):
     """
     _HOOKS["attest"] = attest
     _HOOKS["receive_key"] = receive_key
+    # Only the NER TEE serves /ner/run; on every k-anon node the route 404s.
+    if ner_run is not None:
+        _HOOKS["ner_run"] = ner_run
+        _HOOKS["scratch_dir"] = scratch_dir
+    else:
+        _HOOKS.pop("ner_run", None)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # TLS 1.2 is the floor, but 1.3 is what will actually be negotiated with the

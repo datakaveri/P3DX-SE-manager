@@ -415,6 +415,31 @@ def hash_docker_image(image):
     return hashlib.sha256(json.dumps(json.loads(result.stdout)[0], sort_keys=True).encode()).hexdigest()
 
 
+def check_image_policy(image_ref, digest):
+    """Compare a pulled application image with config.yml image_policy.
+
+    Added 2026-11-22. In "warn" mode (the rollout default) a digest that is not
+    on the approved list is logged and the run continues, so a republished
+    image can't break the current flow. In "enforce" mode it raises, and the
+    job fails before the image runs. Returns True when the digest is approved.
+    """
+    policy = getattr(config, "image_policy", None)
+    allowed = getattr(policy, "allowed", None) or {}
+    mode = str(getattr(policy, "mode", "warn")).lower()
+    repo = image_ref.split("@", 1)[0]
+    if ":" in repo.rsplit("/", 1)[-1]:
+        repo = repo.rsplit(":", 1)[0]
+    approved = [str(d).replace("sha256:", "").lower() for d in (allowed.get(repo) or [])]
+    ok = digest.replace("sha256:", "").lower() in approved
+    if not ok:
+        message = (f"Image policy: {repo} digest {digest[:16]}… is not on the approved list "
+                   f"in config.yml image_policy ({mode} mode)")
+        if mode == "enforce":
+            raise RuntimeError(message + ". Refusing to run it.")
+        print(f"WARNING: {message}; continuing.", flush=True)
+    return ok
+
+
 def save_image_hash(image_hash, path=None):
     if path is None:
         path = config.get_path('image_hash')
@@ -422,13 +447,57 @@ def save_image_hash(image_hash, path=None):
         f.write(image_hash)
 
 
+#: File types the code measurement covers (unchanged from the original walk).
+CODE_MEASURE_SUFFIXES = (".py", ".sh", ".json", ".service", ".md", ".txt", ".yaml", ".yml")
+
+
+def _tracked_code_files(base_dir):
+    """Files git tracks in the code directory, measured types only, sorted.
+
+    Why (2026-11-22): the old walk hashed EVERY .py/.json/.md/... under the
+    folder, including files a run leaves behind (tee/, tee-snapshot/,
+    Bundle/encrypted.json). So PCR15 differed from node to node and from run
+    to run, and no single published reference value could ever match it.
+    Measuring only what git tracks at the deployed commit makes PCR15 a
+    function of the commit, computable off-node (tools/expected_pcr15.py).
+
+    Returns None when git can't answer, and the caller uses the old walk.
+    `safe.directory` because deploy_enclave.py runs as root over a checkout
+    kanonTEE owns, and git refuses that by default.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-c", f"safe.directory={base_dir}", "-C", base_dir, "ls-files", "-z"],
+            capture_output=True, check=True, timeout=30,
+        ).stdout.decode("utf-8")
+    except Exception as exc:
+        print(f"Code measurement: git ls-files unavailable ({exc}); using the folder walk", flush=True)
+        return None
+    names = sorted(n for n in out.split("\0") if n and n.endswith(CODE_MEASURE_SUFFIXES))
+    return [n for n in names if os.path.isfile(os.path.join(base_dir, n))]
+
+
 def hash_enclave_manager_code(base_dir=None):
     """
     Deterministically hash enclave manager code directory.
+
+    The tracked files of the checkout when git is available (see
+    _tracked_code_files), each as relative path + content, in sorted order;
+    otherwise the original walk below.
     """
     if base_dir is None:
         base_dir = config.base_dir
-    
+
+    tracked = _tracked_code_files(base_dir)
+    if tracked is not None:
+        digest = hashlib.sha256()
+        for rel in tracked:
+            with open(os.path.join(base_dir, rel), "rb") as f:
+                content = f.read()
+            digest.update(rel.encode("utf-8"))
+            digest.update(content)
+        return digest.hexdigest()
+
     sha256_digest = hashlib.sha256()
 
     # Files to include in hash (deterministic order)
@@ -1677,6 +1746,72 @@ def _assert_image_available(image, source):
     )
 
 
+def _run_fta_local(provenance):
+    """Run skald-fta in this enclave: the original stage, moved here unchanged
+    (2026-11-22) so the NER TEE path can fall back to it. Returns the exit code."""
+    image, image_src = _resolve_fta_image()
+    print(f"skald-fta image: {image}  (from {image_src})", flush=True)
+
+    pull_docker_image(image)
+    _assert_image_available(image, image_src)
+
+    try:
+        digest = hash_docker_image(image)
+        with open(config.get_path('fta_image_hash'), "w") as f:
+            f.write(digest)
+        print(f"skald-fta image digest: {digest}", flush=True)
+        check_image_policy(image, digest)
+    except Exception as exc:
+        # Auditing aid, not a gate — the image is already pulled and the run
+        # can proceed without the digest on file.
+        print(f"Warning: could not record skald-fta image digest: {exc}", flush=True)
+
+    container_name = "skald-fta"
+    # A leftover container of this name (previous run killed mid-flight) would
+    # fail `docker run` with a name conflict, so clear it first.
+    subprocess.run(["docker", "rm", "-f", container_name],
+                   capture_output=True, text=True, check=False)
+
+    # The same three mounts SKALD gets, pointing at the same host locations.
+    # output/ being the identical directory is the entire handoff mechanism.
+    fta_config_dir = _prepare_fta_config_dir(provenance.split(":", 1)[0])
+
+    cmd = [
+        "docker", "run", "--rm", "--name", container_name,
+        "-v", f"{fta_config_dir}:/app/config:ro",
+        "-v", f"{config.paths.tee_input_data}:/app/data",
+        "-v", f"{config.paths.tee_output}:/app/output",
+        image,
+    ]
+    print(f"Running: {' '.join(cmd)}", flush=True)
+    print("="*60, flush=True)
+    print("skald-fta LOGS (live):", flush=True)
+    print("="*60, flush=True)
+
+    before = _output_snapshot()
+    timeout = _fta_setting("timeout_seconds", 3600)
+    try:
+        result = subprocess.run(
+            cmd, stdout=sys.stdout, stderr=sys.stderr, timeout=timeout, check=False
+        )
+        returncode = result.returncode
+    except subprocess.TimeoutExpired:
+        # subprocess kills the docker *client*; the container itself keeps
+        # running and holding the output mount unless it is removed too.
+        subprocess.run(["docker", "rm", "-f", container_name],
+                       capture_output=True, text=True, check=False)
+        _fail_free_text(
+            f"Free-text anonymisation (skald-fta) exceeded its {timeout}s limit "
+            f"and was terminated. SKALD was not started."
+        )
+
+    created = _output_snapshot() - before
+    if created:
+        _record_free_text_artifacts(created)
+        print(f"\nskald-fta wrote: {sorted(created)}", flush=True)
+    return returncode
+
+
 def run_free_text_anonymization():
     """Run the skald-fta stage if this run's config asks for it.
 
@@ -1734,65 +1869,31 @@ def run_free_text_anonymization():
     # downstream DATA_MISSING.
     _verify_shared_output_mount(_fta_setting("compose_service", "skald-fta"))
 
-    image, image_src = _resolve_fta_image()
-    print(f"skald-fta image: {image}  (from {image_src})", flush=True)
-
-    pull_docker_image(image)
-    _assert_image_available(image, image_src)
-
-    try:
-        digest = hash_docker_image(image)
-        with open(config.get_path('fta_image_hash'), "w") as f:
-            f.write(digest)
-        print(f"skald-fta image digest: {digest}", flush=True)
-    except Exception as exc:
-        # Auditing aid, not a gate — the image is already pulled and the run
-        # can proceed without the digest on file.
-        print(f"Warning: could not record skald-fta image digest: {exc}", flush=True)
-
-    container_name = "skald-fta"
-    # A leftover container of this name (previous run killed mid-flight) would
-    # fail `docker run` with a name conflict, so clear it first.
-    subprocess.run(["docker", "rm", "-f", container_name],
-                   capture_output=True, text=True, check=False)
-
-    # The same three mounts SKALD gets, pointing at the same host locations.
-    # output/ being the identical directory is the entire handoff mechanism.
-    fta_config_dir = _prepare_fta_config_dir(provenance.split(":", 1)[0])
-
-    cmd = [
-        "docker", "run", "--rm", "--name", container_name,
-        "-v", f"{fta_config_dir}:/app/config:ro",
-        "-v", f"{config.paths.tee_input_data}:/app/data",
-        "-v", f"{config.paths.tee_output}:/app/output",
-        image,
-    ]
-    print(f"Running: {' '.join(cmd)}", flush=True)
-    print("="*60, flush=True)
-    print("skald-fta LOGS (live):", flush=True)
-    print("="*60, flush=True)
-
-    before = _output_snapshot()
-    timeout = _fta_setting("timeout_seconds", 3600)
-    try:
-        result = subprocess.run(
-            cmd, stdout=sys.stdout, stderr=sys.stderr, timeout=timeout, check=False
-        )
-        returncode = result.returncode
-    except subprocess.TimeoutExpired:
-        # subprocess kills the docker *client*; the container itself keeps
-        # running and holding the output mount unless it is removed too.
-        subprocess.run(["docker", "rm", "-f", container_name],
-                       capture_output=True, text=True, check=False)
-        _fail_free_text(
-            f"Free-text anonymisation (skald-fta) exceeded its {timeout}s limit "
-            f"and was terminated. SKALD was not started."
-        )
-
-    created = _output_snapshot() - before
-    if created:
-        _record_free_text_artifacts(created)
-        print(f"\nskald-fta wrote: {sorted(created)}", flush=True)
+    # NER TEE first (2026-11-22). When config.yml enables ner_tee, the stage
+    # runs on the separate NER confidential VM, after this enclave has
+    # attested it (lib/ner_client). On ANY failure the remote path writes
+    # nothing and raises NerUnavailable, and the stage runs locally below
+    # exactly as before; the text then never left this enclave.
+    returncode = None
+    from lib import ner_client
+    if ner_client.remote_enabled():
+        fta_config_dir = _prepare_fta_config_dir(provenance.split(":", 1)[0])
+        before = _output_snapshot()
+        try:
+            returncode = ner_client.run_remote(
+                fta_config_dir, config.paths.tee_input_data, config.paths.tee_output,
+                block, staged_name, _fta_setting("timeout_seconds", 3600),
+            )
+        except ner_client.NerUnavailable as exc:
+            print(f"NER TEE not used ({exc}); running skald-fta locally in this enclave.", flush=True)
+            returncode = None
+        if returncode is not None:
+            created = _output_snapshot() - before
+            if created:
+                _record_free_text_artifacts(created)
+                print(f"\nNER TEE wrote: {sorted(created)}", flush=True)
+    if returncode is None:
+        returncode = _run_fta_local(provenance)
 
     if returncode != 0:
         _fail_free_text(

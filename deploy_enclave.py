@@ -126,6 +126,8 @@ def main():
     print("Docker image pulled", flush=True)
     image_hash = P3DX_SDK.hash_docker_image(link)
     P3DX_SDK.save_image_hash(image_hash)
+    # 2026-11-22: logged in warn mode, refused in enforce mode (config.yml).
+    P3DX_SDK.check_image_policy(link, image_hash)
 
     # Step 4 - Measuring enclave manager code into PCR 15 
     print("\n" + "="*60, flush=True)

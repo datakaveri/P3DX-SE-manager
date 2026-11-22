@@ -124,6 +124,19 @@ class Config:
         for key, value in fta_config.items():
             setattr(self.free_text_anonymization, key, value)
 
+        # NER TEE (2026-11-22): a separate confidential VM that runs the
+        # skald-fta stage for k-anon TEEs over attested RA-TLS. Absent or
+        # enabled: false means the stage runs locally, exactly as before.
+        ner_config = self._config.get('ner_tee', {})
+        self.ner_tee = PathNamespace()
+        for key, value in ner_config.items():
+            setattr(self.ner_tee, key, value)
+
+        # Image policy (2026-11-22): approved digests per application image.
+        self.image_policy = PathNamespace()
+        for key, value in self._config.get('image_policy', {}).items():
+            setattr(self.image_policy, key, value)
+
         # Direct dataset upload configuration
         direct_upload_config = self._config.get('direct_upload', {})
         self.direct_upload = PathNamespace()

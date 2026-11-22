@@ -174,3 +174,39 @@ cors:
     - Authorization
   supports_credentials: true
   max_age: 3600
+
+# NER TEE (2026-11-22). A separate confidential VM that runs the skald-fta
+# (NER) stage for k-anon TEEs. Booted by the middleware only for jobs that need
+# NER, at a fixed private IP. Before sending anything, the k-anon TEE attests
+# it (genuine non-debuggable SEV-SNP, our code) and pins its TLS key to the
+# attested key (lib/ner_client.py). On any failure the stage runs locally in
+# the k-anon TEE exactly as before, so enabling this can never break a run.
+ner_tee:
+  enabled: false
+  host: 10.30.1.20
+  port: 4443
+  # How long to wait for a NER TEE that is still booting before running locally.
+  wait_seconds: 180
+  # "warn" logs a code-measurement mismatch; "enforce" refuses the NER TEE
+  # (and the stage then runs locally). Platform values are only ever logged.
+  attestation_mode: warn
+  reference:
+    pcr15: ""
+
+# Image policy (2026-11-22). Approved digest per application image. config.yml
+# is part of the measured code (PCR15), so attesting the code also attests this
+# list. "warn" logs an image whose digest is not listed; "enforce" refuses to run
+# it. Update this list whenever an image is deliberately republished.
+image_policy:
+  mode: warn
+  allowed:
+    ghcr.io/datakaveri/skald:
+      - 1af1853d66482b8ffac7ff62d78389b08264f56a3c2673097e5687eb15f48eb4  # v4.1.0
+    ghcr.io/datakaveri/skald-dicom:
+      - e1e70788dfd0037e796a8e7120756a757994f155a467e5d98a42aa203a459c6a
+    ghcr.io/datakaveri/skald-image:
+      - 9570cfb69d87a1ddbd0b1c825db4b0abd3e2d0ba33fbd175c60639b6a2160a52
+    ghcr.io/datakaveri/skald-fta:
+      - e0844308e62350d86b12e9a926088bb1f37642e2dab1f6ccbc1ceb1dede20c78  # v1.3
+    ghcr.io/kailash-reddy/differential-privacy:
+      - fbdb13cc8ba63652c08fd9423f24aa73a769ae8a90c0925779d646b4aca6bf8a
