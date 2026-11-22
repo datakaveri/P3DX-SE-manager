@@ -195,7 +195,10 @@ class RaTlsEndToEnd(TempDirCase):
         with open(os.path.join(self.cfg, "config.json"), "w") as f:
             json.dump({"data_type": "t"}, f)
         self.settings = {"enabled": True, "host": "127.0.0.1", "port": self.port, "wait_seconds": 2,
-                         "attestation_mode": "warn", "reference": {"pcr15": ""}}
+                         "attestation_mode": "warn", "reference": {"pcr15": "self"}}
+        p = mock.patch.object(ner_client, "_own_pcr15", return_value="ab" * 32)  # same code as the peer
+        p.start()
+        self.addCleanup(p.stop)
 
     def run_remote(self, **override):
         settings = dict(self.settings, **override)
@@ -224,6 +227,9 @@ class RaTlsEndToEnd(TempDirCase):
             self.run_remote(attestation_mode="enforce", reference={"pcr15": "00" * 32})
         self.assertNotIn("data", self.seen)
         self.assertEqual(os.listdir(self.out), [])
+
+    def test_enforced_self_reference_accepts_the_same_code(self):
+        self.assertEqual(self.run_remote(attestation_mode="enforce"), 0)
 
     def test_unreachable_or_disabled_writes_nothing(self):
         with self.assertRaises(ner_client.NerUnavailable):

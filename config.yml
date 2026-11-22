@@ -190,8 +190,10 @@ ner_tee:
   # "warn" logs a code-measurement mismatch; "enforce" refuses the NER TEE
   # (and the stage then runs locally). Platform values are only ever logged.
   attestation_mode: warn
+  # "self": the NER TEE must report the same PCR15 (code measurement) as this
+  # enclave, i.e. run the same commit. A hex value pins a specific one.
   reference:
-    pcr15: ""
+    pcr15: self
 
 # Image policy (2026-11-22). Approved digest per application image. config.yml
 # is part of the measured code (PCR15), so attesting the code also attests this

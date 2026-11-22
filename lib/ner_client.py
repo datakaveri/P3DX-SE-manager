@@ -62,10 +62,28 @@ def remote_enabled() -> bool:
     return bool(_setting("enabled", False)) and bool(_setting("host"))
 
 
+def _own_pcr15() -> str:
+    """This enclave's own PCR15, read from its vTPM. Empty if unreadable."""
+    try:
+        import P3DX_SDK
+        return P3DX_SDK._read_pcr15() or ""
+    except Exception:
+        return ""
+
+
 def _policy() -> attest_verify.Policy:
+    """The NER TEE must run the code this enclave runs.
+
+    `reference.pcr15: self` (the default) compares the NER TEE's PCR15 with this
+    enclave's own. Both are deployed from the same commit, and the expected
+    value can't be written into config.yml itself, because config.yml is part
+    of what PCR15 measures. A literal hex value overrides it."""
     ref = _setting("reference", {}) or {}
+    want = str(ref.get("pcr15") or "self")
+    if want.lower() == "self":
+        want = _own_pcr15()
     return attest_verify.Policy(
-        pcr15=str(ref.get("pcr15") or ""),
+        pcr15=want,
         launch_measurement=str(ref.get("launch_measurement") or ""),
         pcrs=dict(ref.get("pcrs") or {}),
         mode=str(_setting("attestation_mode", "warn")),
