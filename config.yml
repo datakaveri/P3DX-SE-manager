@@ -96,7 +96,9 @@ free_text_anonymization:
   #   image: ghcr.io/datakaveri/skald-fta@sha256:<digest>
   # A mutable tag can be repushed and breaks the trust model, exactly as noted
   # for the SKALD image in docker-compose.yml.
-  image: ghcr.io/datakaveri/skald-fta:latest
+  # v1.3 (2026-11-22): FHIR mode, built on python:3.10-slim-bookworm with the NER
+  # stack pinned (transformers 5.17.0); IndicNER and XLM-RoBERTa cached in the image.
+  image: ghcr.io/datakaveri/skald-fta@sha256:e0844308e62350d86b12e9a926088bb1f37642e2dab1f6ccbc1ceb1dede20c78
   # If the client-supplied docker-compose.yml declares a service with this
   # name, its `image:` wins over the pin above — that is how the forthcoming
   # skald-fta compose entry gets honoured without a code change.
