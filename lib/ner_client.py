@@ -241,8 +241,9 @@ def run_remote(fta_config_dir: str, data_dir: str, out_dir: str, block: dict, st
     if not remote_enabled():
         raise NerUnavailable("ner_tee is not enabled")
     host, port = str(_setting("host")), int(_setting("port", 4443))
-    scratch = getattr(config.paths, "scratch_dir", None) or tempfile.gettempdir()
-    work = tempfile.mkdtemp(prefix="ner-", dir=scratch if os.path.isdir(scratch) else None)
+    # Plaintext stays in memory: the scratch tmpfs, else /dev/shm.
+    scratch = next((d for d in (getattr(config.paths, "scratch_dir", None), "/dev/shm") if d and os.path.isdir(d)), None)
+    work = tempfile.mkdtemp(prefix="ner-", dir=scratch)
     try:
         payload, reduced_from = _build_payload(fta_config_dir, data_dir, block, work)
         conn = _connect(host, port, float(_setting("wait_seconds", 180)), float(timeout) + 120)

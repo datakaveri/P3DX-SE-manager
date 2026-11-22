@@ -354,6 +354,12 @@ def _bootstrap_ner_key():
             print("NER node: generated its per-run keypair and certificate", flush=True)
         except Exception as e:
             print(f"NER node: could not generate a keypair: {e}", flush=True)
+    # The PCR snapshot (with PCR15, the code measurement) that tokens carry.
+    # A k-anon node writes it during a deploy; a NER node never deploys.
+    try:
+        P3DX_SDK.snapshot_pcr_values()
+    except Exception as e:
+        print(f"NER node: could not snapshot PCR values: {e}", flush=True)
 
 
 def ratls_server_port():

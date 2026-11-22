@@ -640,6 +640,16 @@ def extend_nonce_to_pcr8(nonce, pcr_file_path=None):
         err = extend_result.stderr.strip() or extend_result.stdout.strip() or "Unknown error"
         print(f"Warning: Failed to extend nonce to PCR 8: {err}")
 
+    snapshot_pcr_values(pcr_file_path)
+
+
+def snapshot_pcr_values(pcr_file_path=None):
+    """Write the PCR snapshot the attestation client puts in a token
+    (tpm_values: PCRs 0-8, 11, 15). Split out of extend_nonce_to_pcr8 on
+    2026-11-22 so the NER node, which never runs a deploy, can publish its
+    PCR15 too. Unchanged behaviour for k-anon nodes."""
+    if pcr_file_path is None:
+        pcr_file_path = config.get_path('pcr_values')
     pcr_values = {}
     try:
         result = subprocess.run(

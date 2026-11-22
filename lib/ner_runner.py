@@ -60,6 +60,14 @@ def _extract(payload: str, work: str) -> None:
                 shutil.copyfileobj(src, out)
 
 
+def _ram_dir() -> str | None:
+    """Plaintext stays in memory: the scratch tmpfs, else /dev/shm."""
+    for d in (getattr(config.paths, "scratch_dir", None), "/dev/shm"):
+        if d and os.path.isdir(d):
+            return d
+    return None
+
+
 def _remove(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
     if os.path.exists(path):  # files the root container wrote
@@ -71,8 +79,8 @@ def run(payload_path: str, timeout: float | None = None) -> tuple[int, str]:
     everything it wrote to output/). The caller deletes the tar.gz."""
     if not _lock.acquire(blocking=False):
         raise NerBusy("a NER job is already running")
-    scratch = getattr(config.paths, "scratch_dir", None)
-    work = tempfile.mkdtemp(prefix="nerjob-", dir=scratch if scratch and os.path.isdir(scratch) else None)
+    scratch = _ram_dir()
+    work = tempfile.mkdtemp(prefix="nerjob-", dir=scratch)
     name = f"ner-fta-{uuid.uuid4().hex[:12]}"
     try:
         for d in ("config", "data", "output"):
@@ -95,8 +103,11 @@ def run(payload_path: str, timeout: float | None = None) -> tuple[int, str]:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
             code = 124
         out = os.path.join(work, "output")
-        fd, result = tempfile.mkstemp(prefix="nerresult-", suffix=".tgz",
-                                      dir=scratch if scratch and os.path.isdir(scratch) else None)
+        # The container runs as root and leaves root-owned 0600 files; this
+        # process (kanonTEE) has to read them to send them back.
+        subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", out],
+                       check=False, capture_output=True)
+        fd, result = tempfile.mkstemp(prefix="nerresult-", suffix=".tgz", dir=scratch)
         os.close(fd)
         with tarfile.open(result, "w:gz") as tf:
             for f in sorted(os.listdir(out)):

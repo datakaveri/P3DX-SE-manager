@@ -144,9 +144,8 @@ class RaTlsHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_NER_BYTES:
             raise ValueError("missing or oversized NER payload")
-        scratch = _HOOKS.get("scratch_dir")
-        fd, payload = tempfile.mkstemp(prefix="nerin-", suffix=".tgz",
-                                       dir=scratch if scratch and os.path.isdir(scratch) else None)
+        scratch = next((d for d in (_HOOKS.get("scratch_dir"), "/dev/shm") if d and os.path.isdir(d)), None)
+        fd, payload = tempfile.mkstemp(prefix="nerin-", suffix=".tgz", dir=scratch)
         result = None
         try:
             with os.fdopen(fd, "wb") as f:
