@@ -63,6 +63,20 @@ _bootstrap_measurement()
 def _bootstrap_ner_then_ratls():
     _bootstrap_ner_key()
     _bootstrap_ratls()
+    _bootstrap_ner_local_socket()
+
+
+def _bootstrap_ner_local_socket():
+    """k-anon nodes (2026-11-23): the Unix socket through which the DICOM
+    container reaches the NER TEE (lib/ner_local_socket.py). Never raises; if
+    it doesn't open, DICOM runs without shared NER, as before."""
+    if _is_ner_node():
+        return
+    try:
+        from lib import ner_local_socket
+        ner_local_socket.start()
+    except Exception as e:
+        print(f"NER local socket could not start: {e}", flush=True)
 
 
 def _bootstrap_ratls():
@@ -338,6 +352,7 @@ def _ner_hooks():
         return {}
     from lib import ner_runner
     return {"ner_run": ner_runner.run,
+            "ner_spans": ner_runner.spans,  # 2026-11-23: DICOM span requests
             "scratch_dir": getattr(config.paths, "scratch_dir", None)}
 
 

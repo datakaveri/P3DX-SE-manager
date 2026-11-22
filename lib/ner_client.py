@@ -287,3 +287,58 @@ def run_remote(fta_config_dir: str, data_dir: str, out_dir: str, block: dict, st
         raise NerUnavailable(f"{type(e).__name__}: {e}") from e
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ── spans for the DICOM application (added 2026-11-23) ───────────────────────
+#
+# The DICOM container asks for spans once per file, so a full attestation per
+# request (an MAA round trip) would dominate. The first request attests the NER
+# TEE exactly as run_remote does; later connections are accepted only if they
+# present the SAME TLS key, until the token's expiry. That is as strong as
+# re-attesting: the key is generated inside the attested enclave and never
+# leaves it, so only that enclave can complete a handshake with it.
+#
+# After a failure, requests fail fast for SPANS_RETRY_AFTER seconds instead of
+# each waiting out the boot timeout; the DICOM side then takes its fallback
+# (its own classifier for burned-in text, blanking for free-text tags).
+
+import threading as _threading
+
+SPANS_RETRY_AFTER = 120
+_spans_state = {"key": None, "expires": 0.0, "down_until": 0.0}
+_spans_lock = _threading.Lock()
+
+
+def spans_remote(body: bytes) -> bytes:
+    """POST /ner/spans on the attested NER TEE; returns its JSON reply.
+    Raises NerUnavailable whenever it can't."""
+    if not remote_enabled():
+        raise NerUnavailable("ner_tee is not enabled")
+    if time.monotonic() < _spans_state["down_until"]:
+        raise NerUnavailable("the NER TEE failed recently; not retrying yet")
+    host, port = str(_setting("host")), int(_setting("port", 4443))
+    with _spans_lock:
+        conn = None
+        try:
+            conn = _connect(host, port, float(_setting("wait_seconds", 180)), 600)
+            presented = attest_verify.spki_b64_from_der_cert(conn.sock.getpeercert(binary_form=True))
+            if not (_spans_state["key"] == presented and time.time() < _spans_state["expires"] - 60):
+                verified = _attest(conn)
+                _spans_state.update(key=verified.public_key, expires=float(verified.expires_at))
+                print(f"NER TEE {host}:{port} attested for span requests (PCR15 {verified.pcr15[:16]}…)", flush=True)
+            conn.request("POST", "/ner/spans", body=body,
+                         headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+            resp = conn.getresponse()
+            reply = resp.read()
+            if resp.status != 200:
+                raise NerUnavailable(f"NER TEE span request failed: HTTP {resp.status}")
+            return reply
+        except NerUnavailable:
+            _spans_state["down_until"] = time.monotonic() + SPANS_RETRY_AFTER
+            raise
+        except Exception as e:
+            _spans_state["down_until"] = time.monotonic() + SPANS_RETRY_AFTER
+            raise NerUnavailable(f"{type(e).__name__}: {e}") from e
+        finally:
+            if conn is not None:
+                conn.close()

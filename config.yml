@@ -194,6 +194,10 @@ ner_tee:
   # enclave, i.e. run the same commit. A hex value pins a specific one.
   reference:
     pcr15: self
+  # 2026-11-23: Unix socket through which the skald-dicom container reaches the
+  # NER TEE (lib/ner_local_socket.py). Its compose file mounts this directory
+  # at /run/anamika-ner. k-anon nodes only; absent = DICOM without shared NER.
+  dicom_socket: /tmp/tee_ner/ner.sock
 
 # Image policy (2026-11-22). Approved digest per application image. config.yml
 # is part of the measured code (PCR15), so attesting the code also attests this
@@ -205,7 +209,8 @@ image_policy:
     ghcr.io/datakaveri/skald:
       - 1af1853d66482b8ffac7ff62d78389b08264f56a3c2673097e5687eb15f48eb4  # v4.1.0
     ghcr.io/datakaveri/skald-dicom:
-      - e1e70788dfd0037e796a8e7120756a757994f155a467e5d98a42aa203a459c6a
+      - e1e70788dfd0037e796a8e7120756a757994f155a467e5d98a42aa203a459c6a  # v2.0.0
+      - 91249ecc778676dade5b58587a8c832b97ab8852215074257a621d1630987f24  # 2.0.0-ner.1 (v2.0.0 + shared NER, 2026-11-23)
     ghcr.io/datakaveri/skald-image:
       - 9570cfb69d87a1ddbd0b1c825db4b0abd3e2d0ba33fbd175c60639b6a2160a52
     ghcr.io/datakaveri/skald-fta:

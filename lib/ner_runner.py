@@ -119,3 +119,113 @@ def run(payload_path: str, timeout: float | None = None) -> tuple[int, str]:
     finally:
         _remove(work)
         _lock.release()
+
+
+# ── /ner/spans: the span service for DICOM (added 2026-11-23) ────────────────
+#
+# Kailash: DICOM should use the shared NER too, "on extracted text + if there
+# are any remarks tags which need NER". The DICOM container masks text itself
+# (boxes on the image, values in tags), so it needs WHERE the personal data
+# is, not a rewritten file, and it asks once per DICOM file, so a model load
+# per request (~8 s) would cost minutes per folder. One warm container
+# therefore serves it: the same pinned skald-fta image, running
+# lib/ner_service.py (measured into PCR15 with the rest of the code, mounted
+# read-only), with --network none and only a Unix socket, on the scratch tmpfs,
+# as its way in or out. It starts on the first request and lives as long as the
+# VM (which the middleware deallocates after 15 idle minutes).
+#
+# It does not take the /ner/run lock: the two use separate containers and the
+# VM has room for both, and a long FHIR job must not stall a DICOM batch.
+
+import http.client
+import json
+import socket
+import time
+
+SPANS_CONTAINER = "ner-spans"
+SPANS_READY_SECONDS = 240  # first start: container up + models loaded (~10 s measured)
+MAX_SPANS_BYTES = 64 * 1024 * 1024
+_spans_lock = threading.Lock()
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._path)
+        self.sock = sock
+
+
+def _unix_request(path: str, method: str, url: str, body: bytes | None, timeout: float):
+    conn = _UnixHTTPConnection(path, timeout)
+    try:
+        conn.request(method, url, body=body, headers={"Content-Type": "application/json"} if body else {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _spans_socket() -> str:
+    base = _ram_dir() or "/dev/shm"
+    return os.path.join(base, "ner-spans", "ner.sock")
+
+
+def _spans_ready(sock_path: str) -> bool:
+    try:
+        status, raw = _unix_request(sock_path, "GET", "/health", None, 5)
+        return status == 200 and bool(json.loads(raw).get("ready"))
+    except Exception:
+        return False
+
+
+def _ensure_spans_service() -> str:
+    """The socket of a running, model-loaded span service; started if needed."""
+    sock_path = _spans_socket()
+    if _spans_ready(sock_path):
+        return sock_path
+    with _spans_lock:
+        if _spans_ready(sock_path):
+            return sock_path
+        sock_dir = os.path.dirname(sock_path)
+        subprocess.run(["docker", "rm", "-f", SPANS_CONTAINER], capture_output=True, check=False)
+        _remove(sock_dir)
+        os.makedirs(sock_dir, mode=0o700)
+        service = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ner_service.py")
+        cmd = [
+            "docker", "run", "-d", "--rm", "--name", SPANS_CONTAINER, "--network", "none",
+            "-v", f"{sock_dir}:/sock",
+            "-v", f"{service}:/svc/ner_service.py:ro",
+            "--entrypoint", "python", _image(),
+            "/svc/ner_service.py", "--serve-unix", "/sock/ner.sock",
+        ]
+        started = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if started.returncode != 0:
+            raise RuntimeError(f"could not start the span service: {started.stderr.strip()[:300]}")
+        print("NER span service: starting (models loading)", flush=True)
+        deadline = time.monotonic() + SPANS_READY_SECONDS
+        while time.monotonic() < deadline:
+            if _spans_ready(sock_path):
+                print("NER span service: ready", flush=True)
+                return sock_path
+            time.sleep(2)
+        subprocess.run(["docker", "rm", "-f", SPANS_CONTAINER], capture_output=True, check=False)
+        raise RuntimeError("the span service did not become ready")
+
+
+def spans(body: bytes) -> tuple[int, bytes]:
+    """Forward one POST /spans request (JSON, see lib/ner_service.py) to the
+    span service. Returns (HTTP status, response body). The text is never
+    logged or written to disk here."""
+    if not body or len(body) > MAX_SPANS_BYTES:
+        raise NerBadRequest("missing or oversized span request")
+    try:
+        json.loads(body)
+    except ValueError as e:
+        raise NerBadRequest(f"span request is not JSON: {e}") from e
+    sock_path = _ensure_spans_service()
+    return _unix_request(sock_path, "POST", "/spans", body, timeout=600)

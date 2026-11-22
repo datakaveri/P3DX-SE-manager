@@ -53,6 +53,8 @@ _HOOKS: dict = {}
 MAX_BODY_BYTES = 64 * 1024
 #: /ner/run (NER TEE only): a tar.gz of free-text columns or FHIR Bundles.
 MAX_NER_BYTES = int(os.getenv("NER_MAX_BYTES", str(1536 * 1024 * 1024)))
+#: /ner/spans (NER TEE only, 2026-11-23): a JSON list of texts from a DICOM file.
+MAX_SPANS_BYTES = 64 * 1024 * 1024
 
 
 class RaTlsHandler(BaseHTTPRequestHandler):
@@ -91,6 +93,8 @@ class RaTlsHandler(BaseHTTPRequestHandler):
                 self._receive_key()
             elif self.path == "/ner/run" and "ner_run" in _HOOKS:
                 self._ner_run()
+            elif self.path == "/ner/spans" and "ner_spans" in _HOOKS:
+                self._ner_spans()
             else:
                 self._reply(404, {"error": "no such endpoint"})
         except ValueError as e:
@@ -179,6 +183,27 @@ class RaTlsHandler(BaseHTTPRequestHandler):
                     os.remove(path)
 
 
+    def _ner_spans(self):
+        """NER TEE only (2026-11-23): character spans of personal data in the
+        posted texts, for the DICOM application (lib/ner_runner.spans). As with
+        /ner/run, the caller attested this enclave and pinned its key first."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_SPANS_BYTES:
+            raise ValueError("missing or oversized span request")
+        body = self.rfile.read(length)
+        try:
+            status, reply = _HOOKS["ner_spans"](body)
+        except Exception as e:
+            if type(e).__name__ == "NerBadRequest":
+                raise ValueError(str(e)) from e
+            raise
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+
 class _ThreadingHTTPSServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     # Without this a restart inside the TIME_WAIT window fails to bind, and the
@@ -188,7 +213,7 @@ class _ThreadingHTTPSServer(ThreadingMixIn, HTTPServer):
 
 
 def serve(cert_path: str, key_path: str, attest, receive_key, port: int = PORT, ner_run=None,
-          scratch_dir: str | None = None):
+          scratch_dir: str | None = None, ner_spans=None):
     """Start the listener on a daemon thread. Returns the server.
 
     `attest(nonce) -> jwt` and `receive_key(job_id, data_key, output_key)` are
@@ -202,6 +227,11 @@ def serve(cert_path: str, key_path: str, attest, receive_key, port: int = PORT, 
         _HOOKS["scratch_dir"] = scratch_dir
     else:
         _HOOKS.pop("ner_run", None)
+    # Likewise /ner/spans (2026-11-23).
+    if ner_spans is not None:
+        _HOOKS["ner_spans"] = ner_spans
+    else:
+        _HOOKS.pop("ner_spans", None)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # TLS 1.2 is the floor, but 1.3 is what will actually be negotiated with the
